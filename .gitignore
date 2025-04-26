@@ -1,0 +1,7 @@
+.env
+logs/
+frontend/
+docs/
+static/
+README.md
+__pycache__/
