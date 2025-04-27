@@ -6,12 +6,14 @@ import operator
 from pydantic import BaseModel, Field
 import functools
 from pydantic_core import ValidationError # Import for specific error handling
+import uuid # Import for UUID validation
 
 # LangChain & LangGraph Imports
 from langchain_core.messages import BaseMessage, FunctionMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import AzureChatOpenAI
 from langchain_core.output_parsers.openai_tools import PydanticToolsParser, JsonOutputToolsParser
+from langchain_core.runnables import RunnableConfig # Import for config
 from langgraph.graph import StateGraph, END
 
 # Local Imports
@@ -92,7 +94,7 @@ Tool Use and Response Guidelines:
     *   Avoid multiple `sql_query` calls if one grouped query suffices.
 7.  **SQL Output Format:** `sql_query` returns JSON (`{{"table": ..., "text": ...}}`). Added to state.
 8.  **Chart Generation (`chart_renderer` tool - CRITICAL STEPS):**
-    *   **Step 8a: Identify Need & Exercise Judgment:** Call this tool ONLY when the user explicitly asks for a chart/graph/visualization OR when presenting complex comparisons/trends (e.g., many entities, time-series data) that would **significantly benefit** from visual representation. **For simple comparisons (e.g., 2-3 entities across 2-3 metrics), prefer presenting data in a table (Guideline #12) unless a chart is explicitly requested**, as a chart may not add significant value.
+    *   **Step 8a: Identify Need & Exercise Judgment:** Call this tool ONLY when the user explicitly asks for a chart/graph/visualization OR when presenting complex comparisons/trends (e.g., many entities, time-series data) that would **significantly benefit** from visual representation. **For simple comparisons (e.g., 2-3 entities across 2-3 metrics where the absolute numbers are easy to grasp), strongly prefer presenting the data in a text summary (see Guideline #12), as a chart adds little value and incurs overhead. Only override this preference if a chart is explicitly requested by the user.**
     *   **Step 8b: Check Data:** Ensure relevant data exists in the `state['tables']` list (usually from a preceding `sql_query` call).
     *   **Step 8c: Data Reformatting & Transformation (Mandatory if Calling):**
         *   **Input Format:** Recall `sql_query` returns data in a table structure (`{{"table": {{"columns": [...], "rows": [...]}} }}`). Extract this `table` data.
@@ -140,62 +142,64 @@ Tool Use and Response Guidelines:
     *   When formulating a direct `sql_query` call (especially for comparisons as per Guideline #9), if comparing simple metrics for multiple entities over the *same* period, make it a *single* call covering the entire comparison.
     *   Example: For comparing borrows for Branch A and Branch B last week, the description should be like "Compare total successful borrows for hierarchy ID 'id-a' and hierarchy ID 'id-b' last week, grouped by branch name/id".
 
-12. **Including Tables/Visualizations & Concise Text (Final Response):** 
+12. **Prioritize Text for Simple Comparisons:** When comparing just a few specific metrics for a small number of entities (e.g., comparing borrows and renewals for two branches), generate a concise text summary highlighting the key figures and differences. **DO NOT** generate a chart for such simple cases unless the user has explicitly asked for one. Use Guideline #13 (previously #12) to decide whether to include the raw data table.
+
+13. **Including Tables/Visualizations & Concise Text (Final Response):** 
     *   **Source Check:** Tables/Visualizations in the state primarily come from direct `sql_query` or `chart_renderer` calls.
     *   **Check State:** Before calling `FinalApiResponseStructure`, examine the `tables` and `visualizations` lists.
     *   **Usefulness Test:** Determine if any table or visualization provides useful, detailed information that directly supports the user's request (especially for comparisons or breakdowns).
     *   **Inclusion Decision:** If a useful table/visualization exists:
         *   Set the corresponding flag in `include_tables` or `include_visualizations` to `[True]` (or e.g., `[True, False]`).
         *   Ensure the `text` field is **CONCISE**, focuses on insights/anomalies, and **REFERENCES** the included item(s). **DO NOT** repeat the detailed data from the table/viz.
-    *   **No Inclusion:** If no useful tables/visualizations exist (or came from the tools used), set flags to `[False]` and provide the full answer in the `text`.
+    *   **No Inclusion:** If no useful tables/visualizations exist (or came from the tools used), set flags to `[False]` and provide the full answer in the `text` field.
     *   **Summarizer Text:** If the `summary_synthesizer` was used (for open-ended queries), its output is text. Use that text directly in the `FinalApiResponseStructure`'s `text` field (set include flags to `[False]` unless other tools *also* ran and produced useful tables/viz).
     *   **Accuracy:** Ensure the final `text` accurately reflects and correctly references any included items.
 
-13. **Handling Analytical/Comparative Queries (e.g., 'is it busy?'):** 
+14. **Handling Analytical/Comparative Queries (e.g., 'is it busy?'):** 
     *   Your primary goal is providing factual data.
     *   For queries asking for analysis or comparison (like "is branch X busy?", "is Y popular?"), first retrieve the relevant factual data for the specified entity using `sql_query`. The `sql_query` tool has been instructed to attempt to include a simple organization-wide benchmark (like an average) in its results for such queries.
     *   When formulating the final response:
         *   Check the table returned by `sql_query`. If it contains both the specific entity's value AND a benchmark value (e.g., columns like "Total Entries" and "Org Average Entries"), use both to provide context in the `text` field. Example: "Branch X had 1500 entries, which is above the organizational average of 1200."
         *   If the benchmark value is missing (the SQL tool couldn't easily include it), simply state the facts retrieved for the specific entity in the `text` field and explain that assessing relative terms like "busy" or "popular" requires additional context or comparison data not readily available.
-        *   Decide whether to include the table based on Guideline #12 .
+        *   Decide whether to include the table based on Guideline #13 .
     *   Do NOT delegate these interpretations to `summary_synthesizer`.
 
-14. **Out-of-Scope Refusal:** Your function is limited to library data. You MUST refuse requests completely unrelated to library data or operations (e.g., general knowledge, coding, football, recipes, opinions on non-library topics).
+15. **Out-of-Scope Refusal:** Your function is limited to library data. You MUST refuse requests completely unrelated to library data or operations (e.g., general knowledge, coding, football, recipes, opinions on non-library topics).
 
-15. **Invoke `FinalApiResponseStructure` (CRITICAL FINAL STEP):** You **MUST ALWAYS** conclude your response by invoking the `FinalApiResponseStructure` tool. This applies in **ALL** situations, including:
+16. **Invoke `FinalApiResponseStructure` (CRITICAL FINAL STEP):** You **MUST ALWAYS** conclude your response by invoking the `FinalApiResponseStructure` tool. This applies in **ALL** situations, including:
     *   Successfully answering the query using tool results.
     *   Reporting errors encountered during tool execution (e.g., name resolution failure).
     *   Refusing out-of-scope or inappropriate requests (like the example below).
     *   Providing simple greetings or capability descriptions.
-    Populate the arguments based on your analysis and the preceding guidelines (especially #12 for table inclusion and accuracy). **Failure to call `FinalApiResponseStructure` as the final step is an error.**
+    Populate the arguments based on your analysis and the preceding guidelines (especially #13 for table inclusion and accuracy). **Failure to call `FinalApiResponseStructure` as the final step is an error.**
 
-16. **Example (Name Resolution Failure):**
+17. **Example (Name Resolution Failure):**
     *   User Query: "Borrows for Main Lib last week"
     *   `hierarchy_name_resolver` runs, returns `status: 'not_found'` for "Main Lib".
     *   Analysis: Name resolution failed.
     *   Your Response: Invoke `FinalApiResponseStructure(text="I couldn't find a hierarchy entity named 'Main Lib'. Please check the name.", include_tables=[], include_visualizations=[])`
-17. **Example (Name Resolution Success -> Query -> Summarization):**
+18. **Example (Name Resolution Success -> Query -> Summarization):**
     *   User Query: "Compare borrows for Main Library and Argyle Branch last week"
     *   `hierarchy_name_resolver` runs, returns `status: 'found'` with IDs for both.
     *   `sql_query` runs using the resolved IDs and time filter. Adds table data to state.
     *   `summary_synthesizer` runs on the table data. Adds summary text to state (or directly prepares it).
     *   Analysis: Summarization complete based on resolved names.
-    *   Your Response: Invoke `FinalApiResponseStructure(text="Over the last week, Main Library (Main) had X borrows, while Argyle Branch (AYL) had Y borrows.", include_tables=[True], include_visualizations=[])` # Table useful for comparison
-18. **Example (Greeting/Capability):**
+    *   Your Response: Invoke `FinalApiResponseStructure(text="Over the last week, Main Library (Main) had X borrows, while Argyle Branch (AYL) had Y borrows.", include_tables=[False], include_visualizations=[False])` # Note: Visualization False based on Guideline #12
+19. **Example (Greeting/Capability):**
     *   User Query: "Hi" or "What can you do?"
     *   Analysis: No tools needed.
     *   Your Response: Invoke `FinalApiResponseStructure(text="Hello! How can I assist you today?", include_tables=[], include_visualizations=[])`
-19. **Example (Out-of-Scope Refusal - Full Query):**
+20. **Example (Out-of-Scope Refusal - Full Query):**
     *   User Query: "Tell me about Rishabh Pant"
     *   Analysis: Out of scope (general knowledge).
     *   Your Response: Invoke `FinalApiResponseStructure(text="I cannot provide information about Rishabh Pant. My function is limited to answering questions about library data.", include_tables=[], include_visualizations=[])` # Note: Still uses the structure!
-20. **Example (Combined Factual Answer + Analytical Interpretation With Benchmark - Simple Result):**
+21. **Example (Combined Factual Answer + Analytical Interpretation With Benchmark - Simple Result):**
     *   User Query: "What was the footfall for Main Library last month, and is it busy?"
     *   `hierarchy_name_resolver` resolves "Main Library".
     *   `sql_query` gets footfall data AND org average. Returns table like: `'[{{"Location Name": "Main Library", "Total Entries": 5000, "Org Average Entries": 4500, "Total Exits": 4950, "Org Average Exits": 4400}}]'`
     *   Analysis: Got factual data + benchmark. Result is simple (one location).
     *   Your Response: Invoke `FinalApiResponseStructure(text="Main Library had 5000 entries and 4950 exits last month. This is slightly above the organizational average of 4500 entries and 4400 exits.", include_tables=[False], include_visualizations=[])` # Note: include_tables is [False]
-21. **Example (Combined Factual Answer + Analytical Interpretation Without Benchmark - Simple Result):**
+22. **Example (Combined Factual Answer + Analytical Interpretation Without Benchmark - Simple Result):**
     *   User Query: "What was the footfall for the Annex last month, and is it busy?"
     *   `hierarchy_name_resolver` resolves "Annex".
     *   `sql_query` gets footfall data (e.g., 10 entries, 5 exits). Benchmark calculation was maybe too complex or skipped by LLM.
@@ -268,88 +272,94 @@ def create_llm_with_tools_and_final_response_structure(organization_id: str):
     logger.debug(f"Created LLM bound with tools and FinalApiResponseStructure for org: {organization_id}")
     return prompt | llm_with_tools
 
-# --- Graph Nodes ---
-
-# Agent Node: Decides action - call a tool or invoke FinalApiResponseStructure
+# --- Agent Node: Decides action - call a tool or invoke FinalApiResponseStructure ---
 def agent_node(state: AgentState, llm_with_structured_output):
-    """Invokes the LLM to decide the next action or final response structure."""
+    """Invokes the LLM to decide the next action or final response structure.
+       Includes a single retry attempt if the initial LLM response is invalid.
+    """
     logger.debug(f"Agent node executing. Current state messages: {len(state['messages'])} messages.")
     logger.debug(f"Agent node state: Tables={len(state.get('tables',[]))}, Visualizations={len(state.get('visualizations',[]))}")
 
-    # Invoke the LLM. It will either return tool calls for sql/chart/summary
-    # OR a tool call for FinalApiResponseStructure
-    response = llm_with_structured_output.invoke(state)
-    logger.debug(f"Agent node generated raw response: {response}")
-
-    # Initialize parser for potential FinalApiResponseStructure tool call
+    response = None
+    final_structure = None
     parser = PydanticToolsParser(tools=[FinalApiResponseStructure])
 
-    final_structure = None
-    if isinstance(response, AIMessage) and response.tool_calls:
-        # Check if the *first* tool called is FinalApiResponseStructure
-        # We assume the LLM is either calling operational tools OR the final structure, not both.
-        first_tool_call = response.tool_calls[0]
-        if first_tool_call.get("name") == FinalApiResponseStructure.__name__:
-            logger.info(f"Agent decided on final response structure. Attempting to parse AIMessage.")
-            try:
-                # Attempt to parse the AIMessage to extract the structured object
-                parsed_objects = parser.invoke(response) # Pass the whole AIMessage
-                if parsed_objects: # Should be a list with one item
-                    final_structure = parsed_objects[0]
-                    logger.info(f"Successfully parsed FinalApiResponseStructure: {final_structure}")
-                else:
-                    logger.warning("PydanticToolsParser invoked but returned empty list.")
-            except ValidationError as e:
-                logger.warning(f"Initial parsing failed with ValidationError: {e}. Checking for correctable list errors...")
-                # Check if it's the specific boolean-instead-of-list error
-                is_correctable_error = False
-                correctable_fields = ['include_tables', 'include_visualizations']
-                error_details = e.errors()
-                
-                # Simple check: if all errors are list_type for the correctable fields
-                if all(err.get('type') == 'list_type' and err.get('loc', [None])[0] in correctable_fields for err in error_details):
-                    is_correctable_error = True
-                
-                if is_correctable_error:
-                    logger.info("Identified correctable boolean-as-list error. Attempting manual correction...")
-                    try:
-                        raw_args = first_tool_call.get("args", {})
-                        corrected_args = raw_args.copy()
-                        needs_correction = False
-                        for field in correctable_fields:
-                            if field in corrected_args and isinstance(corrected_args[field], bool):
-                                corrected_args[field] = [corrected_args[field]] # Wrap boolean in list
-                                needs_correction = True
+    for attempt in range(2): # Try up to 2 times (initial + 1 retry)
+        logger.debug(f"Invoking LLM (Attempt {attempt + 1}/2)")
+        # Invoke the LLM. It will either return tool calls for sql/chart/summary
+        # OR a tool call for FinalApiResponseStructure
+        response = llm_with_structured_output.invoke(state)
+        logger.debug(f"Agent node generated raw response (Attempt {attempt + 1}): {response}")
+
+        is_valid_response = False
+        if isinstance(response, AIMessage) and response.tool_calls:
+            # Check if it's an operational tool call OR a parsable FinalApiResponseStructure call
+            first_tool_call = response.tool_calls[0]
+            if first_tool_call.get("name") != FinalApiResponseStructure.__name__:
+                is_valid_response = True # It's calling an operational tool
+            else:
+                # Try parsing FinalApiResponseStructure
+                try:
+                    # Use a temporary variable to avoid setting state prematurely on first pass
+                    parsed_objects = parser.invoke(response)
+                    if parsed_objects: # Should be a list with one item
+                        potential_final_structure = parsed_objects[0]
+                        final_structure = potential_final_structure # Assign if successfully parsed
+                        is_valid_response = True
+                        logger.info(f"Successfully parsed FinalApiResponseStructure (Attempt {attempt + 1})")
+                    else:
+                        logger.warning(f"PydanticToolsParser invoked but returned empty list (Attempt {attempt + 1}).")
+                except ValidationError as e:
+                    # Handle correctable errors ONLY if it's the final attempt, otherwise just log
+                    if attempt == 1: # Final attempt
+                        logger.warning(f"Initial parsing failed (Attempt {attempt + 1}): {e}. Checking for correctable list errors...")
+                        # Check if it's the specific boolean-instead-of-list error
+                        is_correctable_error = False
+                        correctable_fields = ['include_tables', 'include_visualizations']
+                        error_details = e.errors()
+                        if all(err.get('type') == 'list_type' and err.get('loc', [None])[0] in correctable_fields for err in error_details):
+                            is_correctable_error = True
                         
-                        if needs_correction:
-                             final_structure = FinalApiResponseStructure(**corrected_args)
-                             logger.warning(f"Successfully corrected LLM arguments and parsed FinalApiResponseStructure: {final_structure}")
+                        if is_correctable_error:
+                            logger.info("Identified correctable boolean-as-list error. Attempting manual correction...")
+                            try:
+                                raw_args = first_tool_call.get("args", {})
+                                corrected_args = raw_args.copy()
+                                needs_correction = False
+                                for field in correctable_fields:
+                                    if field in corrected_args and isinstance(corrected_args[field], bool):
+                                        corrected_args[field] = [corrected_args[field]]
+                                        needs_correction = True
+                                
+                                if needs_correction:
+                                     final_structure = FinalApiResponseStructure(**corrected_args)
+                                     logger.warning(f"Successfully corrected LLM arguments and parsed FinalApiResponseStructure: {final_structure}")
+                                     is_valid_response = True # Now it's valid after correction
+                                else:
+                                     logger.error(f"Caught list_type ValidationError, but no boolean found to correct. Raw args: {raw_args}. Original Error: {e}")
+                            except Exception as correction_err:
+                                 logger.error(f"Error during manual correction of FinalApiResponseStructure args: {correction_err}", exc_info=True)
                         else:
-                             # If no field needed correction despite the error type, log original error
-                             logger.error(f"Caught list_type ValidationError, but no boolean found to correct. Raw args: {raw_args}. Original Error: {e}")
+                             logger.error(f"Uncorrectable ValidationError parsing FinalApiResponseStructure: {e}", exc_info=True)
+                    else: # Log validation error on first attempt but don't correct yet
+                        logger.warning(f"Parsing FinalApiResponseStructure failed on attempt {attempt + 1}: {e}")
+                except Exception as e:
+                    logger.error(f"Unexpected error parsing FinalApiResponseStructure (Attempt {attempt + 1}): {e}", exc_info=True)
+        
+        if is_valid_response:
+            break # Exit loop if response is valid (operational tool call or successfully parsed final structure)
+        else:
+            logger.warning(f"LLM response invalid on attempt {attempt + 1}. Retrying if possible...")
+            # Optional: sleep briefly before retry?
+            # await asyncio.sleep(0.5)
 
-                    except Exception as correction_err:
-                         logger.error(f"Error during manual correction of FinalApiResponseStructure args: {correction_err}", exc_info=True)
-                         # Let final_structure remain None if correction fails
-                else:
-                     logger.error(f"Uncorrectable ValidationError parsing FinalApiResponseStructure: {e}", exc_info=True)
-
-            except Exception as e:
-                # Catch any other unexpected errors during parsing
-                logger.error(f"Unexpected error parsing FinalApiResponseStructure from AIMessage tool calls: {e}", exc_info=True)
-                # Let final_structure remain None
-
-    # Return the AIMessage (containing tool calls or the final structure call)
-    # Add the parsed final structure (potentially corrected) to the state if available
+    # Return the (last) AIMessage and the successfully parsed final structure (if any)
     return {
-        "messages": [response],
-        "final_response_structure": final_structure # Add parsed structure here
+        "messages": [response] if response else [],
+        "final_response_structure": final_structure # Add parsed/corrected structure here
     }
 
-
-# Tool Node Handler (async_tools_node_handler) - Needs slight adjustment
-# It should NOT process the FinalApiResponseStructure call if the agent generates it.
-# That call signals the end of the graph execution flow handled by should_continue.
+# --- Tool Node Handler ---
 async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[str, Any]:
     """
     Enhanced asynchronous tools node handler. Executes operational tools (Resolver, SQL, Chart, Summary).
@@ -409,7 +419,8 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
             "retries_left": 2
         })
 
-    sem = asyncio.Semaphore(10) # Limit concurrency
+    sem = asyncio.Semaphore(settings.MAX_CONCURRENT_TOOLS) # Limit concurrency based on settings
+    
     async def execute_with_retry(execution_details):
         # Check if it's an error placeholder first
         if "error" in execution_details:
@@ -554,7 +565,6 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
 
     logger.debug(f"Tool handler returning updates: { {k: len(v) if isinstance(v, list) else v for k, v in update_dict.items()} }")
     return update_dict
-
 
 def _is_retryable_error(error: Exception) -> bool:
     """Determine if an error should be retried."""
@@ -737,207 +747,131 @@ async def process_chat_message(
     Processes a user chat message using the refactored LangGraph agent.
     Extracts the final response structure directly from the agent's output.
     """
-    logger.info(f"Processing chat message for org {organization_id}, session {session_id}. Original message: '{message}'")
+    logger.info(f"Processing chat message for org {organization_id}, session {session_id}. Original message: '{message[:100]}...'")
+
+    # ---> Organization ID Validation <--- 
     try:
-        app = create_graph_app(organization_id)
+        uuid.UUID(organization_id)
+        logger.debug(f"Organization ID {organization_id} is valid UUID.")
+    except ValueError:
+        logger.error(f"Invalid organization_id format: {organization_id}")
+        return {"status": "error", "error": "Invalid organization identifier.", "data": None}
 
-        # Format chat history (Improved robustness for ToolMessages)
-        history_messages: List[BaseMessage] = []
-        if chat_history:
-            logger.debug(f"Formatting {len(chat_history)} provided history messages.")
-            for msg_data in chat_history:
-                role = msg_data.get("role")
-                content = msg_data.get("content")
-                tool_call_id = msg_data.get("tool_call_id") # For ToolMessage
-                tool_name = msg_data.get("name") # For ToolMessage
-
-                if not content: # Skip messages without content
-                     logger.warning(f"Skipping history message due to missing content: {msg_data}")
-                     continue
-
-                try:
-                    if role == "user":
-                        history_messages.append(HumanMessage(content=str(content)))
-                    elif role == "assistant":
-                        # Represent past AI responses, including potential tool calls
-                        tool_calls = msg_data.get("tool_calls") # Assuming stored if assistant made calls
-                        if tool_calls and isinstance(tool_calls, list):
-                             # Reconstruct ToolCall objects if possible, otherwise keep as dicts
-                             # Note: LangChain BaseMessage tool_calls expect ToolCall objects or dicts with 'id', 'name', 'args'
-                             rehydrated_tool_calls = []
-                             for tc in tool_calls:
-                                 if isinstance(tc, dict) and 'id' in tc and 'name' in tc and 'args' in tc:
-                                     rehydrated_tool_calls.append(tc) # Keep as dict if structure matches
-                                 else:
-                                     logger.warning(f"Could not fully rehydrate tool call from history: {tc}")
-                             history_messages.append(AIMessage(content=str(content), tool_calls=rehydrated_tool_calls))
-                        else:
-                             history_messages.append(AIMessage(content=str(content)))
-                    elif role == "tool": # Handle tool results
-                        if tool_call_id:
-                            # Include name if available in history
-                            if tool_name:
-                                history_messages.append(ToolMessage(content=str(content), tool_call_id=tool_call_id, name=tool_name))
-                            else:
-                                # Older history might not have name, add a default or log warning
-                                logger.warning(f"Tool history message missing name, using tool_call_id: {tool_call_id}")
-                                history_messages.append(ToolMessage(content=str(content), tool_call_id=tool_call_id))
-                        else:
-                            logger.warning(f"Skipping tool history message due to missing tool_call_id: {msg_data}")
-                    # Add other roles (system, function) if necessary
-                except Exception as hist_err:
-                    logger.error(f"Error formatting history message: {msg_data}. Error: {hist_err}", exc_info=True)
-                    # Append a placeholder or skip? Skipping for now.
-
-        else:
-            logger.debug("No chat history provided.")
-
-        # Prepare the initial state
-        initial_state: AgentState = {
-            "messages": history_messages + [HumanMessage(content=message)],
-            "tables": [],
-            "visualizations": [],
-            "final_response_structure": None # Initialize as None
-        }
-        logger.debug(f"Initial graph state prepared with {len(initial_state['messages'])} messages.")
-
-        # Invoke the graph asynchronously
-        config = {"configurable": {"session_id": session_id}}
-        logger.debug(f"Invoking graph with config: {config}")
-        final_state = await app.ainvoke(initial_state, config=config)
-        logger.debug(f"Graph invocation complete. Final state keys: {list(final_state.keys())}")
-
-        # --- Extract Final Response Structure ---
-        structured_response: Optional[FinalApiResponseStructure] = final_state.get("final_response_structure")
-
-        if not structured_response:
-             # Fallback: Try to parse from the last message if state field is missing
-             logger.warning("Final response structure not found in state field, attempting to parse last message.")
-             last_msg = final_state.get("messages", [])[-1] if final_state.get("messages") else None
-             if isinstance(last_msg, AIMessage) and last_msg.tool_calls:
-                  # Check if the message contains the specific tool call we expect
-                  is_final_structure_call_present = any(
-                      tc.get("name") == FinalApiResponseStructure.__name__ for tc in last_msg.tool_calls
-                  )
-                  if is_final_structure_call_present:
-                      parser = PydanticToolsParser(tools=[FinalApiResponseStructure])
-                      try:
-                           parsed_list = parser.invoke(last_msg) # Pass the whole AIMessage
-                           if parsed_list:
-                                structured_response = parsed_list[0]
-                                logger.info("Successfully parsed final structure from last message tool call.")
-                           else:
-                                logger.warning("Fallback parser invoked but returned empty list.")
-                      except Exception as parse_err:
-                           logger.error(f"Fallback parsing failed: {parse_err}", exc_info=True)
-                  else:
-                      logger.warning("Last AIMessage had tool calls, but not for FinalApiResponseStructure.")
-
-        # --- Handle missing or invalid final structure ---
-        if not structured_response or not isinstance(structured_response, FinalApiResponseStructure):
-            logger.warning(f"Graph finished, but FinalApiResponseStructure is missing or invalid. Checking last AI message.")
-            # Check if the last message is an AIMessage with content
-            last_ai_msg_content = None
-            if final_state.get("messages"):
-                 last_msg = final_state["messages"][-1]
-                 if isinstance(last_msg, AIMessage) and isinstance(last_msg.content, str) and last_msg.content.strip():
-                      last_ai_msg_content = last_msg.content.strip()
-                      logger.info(f"Using content from last AIMessage as fallback text: '{last_ai_msg_content[:100]}...'")
-
-            # If we have fallback content, use it for a success response, otherwise return error
-            if last_ai_msg_content:
-                final_chat_data = ChatData(text=last_ai_msg_content, tables=None, visualizations=None)
-                logger.warning("Returning success response using fallback text due to missing FinalApiResponseStructure tool call.")
-                return {
-                    "status": "success",
-                    "data": final_chat_data.dict(exclude_none=True),
-                    "error": None, # No functional error, just formatting failure by LLM
-                 }
+    # ---> Chat History Validation & Initial State Construction <--- 
+    initial_messages = []
+    validated_history = []
+    if chat_history:
+        logger.debug(f"Processing provided chat history ({len(chat_history)} items)...")
+        for i, item in enumerate(chat_history):
+            if isinstance(item, dict) and "role" in item and "content" in item:
+                role = item["role"].lower()
+                content = item["content"]
+                if role == "user" or role == "human":
+                    validated_history.append(HumanMessage(content=content))
+                elif role == "assistant" or role == "ai":
+                    # Basic handling - assumes simple text assistant messages for history
+                    validated_history.append(AIMessage(content=content))
+                else:
+                    logger.warning(f"Skipping chat history item {i} with unknown role: {item.get('role')}")
             else:
-                # If no structure AND no usable last AI message, return error
-                logger.error(f"CRITICAL: No FinalApiResponseStructure and no usable final AIMessage. State: {final_state}")
-                error_text = "I encountered an issue generating the final response structure and couldn't recover a message."
-                final_chat_data = ChatData(text=error_text)
-                return {
-                    "status": "error",
-                    "data": final_chat_data.dict(exclude_none=True),
-                    "error": {"code": "AGENT_STRUCTURE_ERROR", "message": "Agent failed to produce FinalApiResponseStructure or usable message."},
-                 }
+                logger.warning(f"Skipping invalid chat history item {i}: {item}")
+        logger.debug(f"Validated chat history contains {len(validated_history)} messages.")
+        initial_messages.extend(validated_history)
+    else:
+        logger.debug("No chat history provided.")
+        
+    # Add the current user message
+    initial_messages.append(HumanMessage(content=message))
 
-        # --- Process valid final structure ---
-        # Standardized log format using actual attribute names
-        logger.info(f"Successfully obtained FinalApiResponseStructure: text='{structured_response.text}', include_tables={structured_response.include_tables}, include_visualizations={structured_response.include_visualizations}")
+    # ---> State Pruning <--- 
+    if len(initial_messages) > settings.MAX_STATE_MESSAGES:
+        logger.warning(f"Initial message count ({len(initial_messages)}) exceeds limit ({settings.MAX_STATE_MESSAGES}). Pruning history...")
+        # Keep the last N messages
+        initial_messages = initial_messages[-settings.MAX_STATE_MESSAGES:]
+        logger.info(f"Pruned message history to {len(initial_messages)} messages.")
 
-        # Get all accumulated tables and visualizations from the state
-        all_tables = final_state.get('tables', [])
-        all_visualizations = final_state.get('visualizations', [])
+    initial_state = AgentState(
+        messages=initial_messages,
+        tables=[],
+        visualizations=[],
+        final_response_structure=None
+    )
 
-        # Validate and filter tables/visualizations based on the structure's flags
-        # Ensure boolean list lengths match data lengths provided by the LLM
-        num_tables_state = len(all_tables)
-        num_viz_state = len(all_visualizations)
-        num_include_tables = len(structured_response.include_tables)
-        num_include_viz = len(structured_response.include_visualizations)
+    try:
+        graph_app = create_graph_app(organization_id)
+        # Ensure the graph app is awaited if it's an async compilation
+        if asyncio.iscoroutine(graph_app):
+            graph_app = await graph_app
+            
+        logger.info("Invoking LangGraph workflow...")
+        # ---> Apply Recursion Limit <--- 
+        final_state = await graph_app.ainvoke(
+            initial_state,
+            config=RunnableConfig(
+                 recursion_limit=settings.MAX_GRAPH_ITERATIONS,
+                 configurable={})
+        )
+        logger.info("LangGraph workflow invocation complete.")
 
-        if num_include_tables != num_tables_state:
-            # Log the actual flags received vs state length
-            logger.warning(
-                f"Mismatch: LLM provided {num_include_tables} include_tables flags "
-                f"({structured_response.include_tables}), but state has {num_tables_state} tables. "
-                f"Defaulting to include all."
-            )
-            structured_response.include_tables = [True] * num_tables_state
-        if num_include_viz != num_viz_state:
-            # Log the actual flags received vs state length
-             logger.warning(
-                 f"Mismatch: LLM provided {num_include_viz} include_visualizations flags "
-                 f"({structured_response.include_visualizations}), but state has {num_viz_state} visualizations. "
-                 f"Defaulting to include all."
-            )
-             structured_response.include_visualizations = [True] * num_viz_state
+        # Extract final response
+        if final_state.get("final_response_structure"):
+            structured_response = final_state["final_response_structure"]
+            logger.info(f"Successfully obtained FinalApiResponseStructure: {structured_response}")
+            
+            # Filter tables/visualizations based on include flags
+            final_tables = [
+                table for i, table in enumerate(final_state.get('tables', []))
+                if i < len(structured_response.include_tables) and structured_response.include_tables[i]
+            ]
+            final_visualizations = [
+                viz for i, viz in enumerate(final_state.get('visualizations', []))
+                if i < len(structured_response.include_visualizations) and structured_response.include_visualizations[i]
+            ]
 
-        included_tables = [
-            table for i, table in enumerate(all_tables)
-            if i < len(structured_response.include_tables) and structured_response.include_tables[i]
-        ]
-        included_visualizations = [
-            viz for i, viz in enumerate(all_visualizations)
-            if i < len(structured_response.include_visualizations) and structured_response.include_visualizations[i]
-        ]
-
-        logger.info(f"Final response includes {len(included_tables)} tables and {len(included_visualizations)} visualizations.")
-
-        # Construct the final data payload using the API schema (ChatData)
-        try:
-            final_chat_data = ChatData(
+            # --- Mismatch Check --- 
+            state_table_count = len(final_state.get('tables', []))
+            state_viz_count = len(final_state.get('visualizations', []))
+            llm_table_flags = len(structured_response.include_tables)
+            llm_viz_flags = len(structured_response.include_visualizations)
+            
+            if llm_table_flags != state_table_count:
+                logger.warning(f"Mismatch: LLM provided {llm_table_flags} include_tables flags ({structured_response.include_tables}), but state has {state_table_count} tables. Recalculating inclusion based on flags.")
+                # Recalculate based on available flags
+                final_tables = [
+                    table for i, table in enumerate(final_state.get('tables', []))
+                    if i < llm_table_flags and structured_response.include_tables[i]
+                ]
+            if llm_viz_flags != state_viz_count:
+                logger.warning(f"Mismatch: LLM provided {llm_viz_flags} include_visualizations flags ({structured_response.include_visualizations}), but state has {state_viz_count} visualizations. Recalculating inclusion based on flags.")
+                final_visualizations = [
+                    viz for i, viz in enumerate(final_state.get('visualizations', []))
+                    if i < llm_viz_flags and structured_response.include_visualizations[i]
+                ]
+            
+            logger.info(f"Final response includes {len(final_tables)} tables and {len(final_visualizations)} visualizations.")
+            
+            response_data = ChatData(
                 text=structured_response.text,
-                tables=included_tables if included_tables else None,
-                visualizations=included_visualizations if included_visualizations else None
+                tables=final_tables if final_tables else None, # Return None if empty list
+                visualizations=final_visualizations if final_visualizations else None # Return None if empty list
             )
-            logger.debug("Successfully validated response data against ChatData schema.")
-        except Exception as validation_err:
-            logger.error(f"Error validating final ChatData: {validation_err}", exc_info=True)
-            # Fallback to simpler format
-            final_chat_data = ChatData(
-                text=structured_response.text or "Error formatting validated response data."
-            )
-            logger.warning("Using text-only response due to final validation error.")
-
-        logger.info(f"Successfully processed chat message. Response keys: {list(final_chat_data.dict(exclude_none=True).keys())}")
-        return {
-            "status": "success",
-            "data": final_chat_data.dict(exclude_none=True),
-            "error": None,
-        }
+            response_keys = [k for k, v in response_data.model_dump().items() if v is not None]
+            logger.info(f"Successfully processed chat message. Response keys: {response_keys}")
+            return {"status": "success", "data": response_data.model_dump(exclude_none=True), "error": None}
+        else:
+            # Fallback if final structure is missing (e.g., graph ended unexpectedly)
+            logger.error("Graph execution finished, but FinalApiResponseStructure was not found in the final state.")
+            # Check last message for potential error clues
+            last_msg_content = str(final_state['messages'][-1].content) if final_state['messages'] else "No messages."
+            fallback_text = f"An unexpected error occurred. Could not generate a final response. Last known state: {last_msg_content[:200]}..."
+            return {"status": "error", "error": fallback_text, "data": None}
 
     except Exception as e:
-        logger.exception(f"Critical error in process_chat_message for org {organization_id}: {e}", exc_info=True)
-        # Ensure consistent error structure
-        return {
-            "status": "error",
-            "data": ChatData(text="An unexpected critical error occurred processing your request.").dict(exclude_none=True),
-            "error": {"code": "CRITICAL_PROCESSING_ERROR", "message": str(e)},
-        }
+        logger.error(f"Unhandled exception during chat processing for org {organization_id}: {str(e)}", exc_info=True)
+        # Check if it's a recursion limit error
+        if "recursion limit" in str(e).lower():
+             return {"status": "error", "error": f"Processing aborted due to exceeding complexity limit ({settings.MAX_GRAPH_ITERATIONS} iterations). Please simplify your request.", "data": None}
+        return {"status": "error", "error": f"An internal error occurred: {str(e)}", "data": None}
 
 
 # --- test_azure_openai_connection() remains the same ---

@@ -1,6 +1,6 @@
 import os
 from typing import Any, Dict, List, Optional, Union
-from pydantic import AnyHttpUrl, PostgresDsn, field_validator
+from pydantic import AnyHttpUrl, PostgresDsn, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     POSTGRES_SERVERS: List[Dict[str, Any]] = []  # Will be populated from DATABASE_URLS
     DATABASE_URLS: str = ""  # Format: "db1=postgresql://user:pass@host:port/db1,db2=postgresql://user:pass@host:port/db2"
     VALIDATE_SCHEMA_ON_STARTUP: bool = True  # Whether to validate schema definitions against actual DB
+    DB_POOL_SIZE: int = 10 # Default pool size for database connections
     
     # Azure OpenAI settings
     AZURE_OPENAI_API_KEY: str = ""
@@ -26,6 +27,11 @@ class Settings(BaseSettings):
     # LangChain settings
     LLM_MODEL_NAME: str = "gpt-4o"
     VERBOSE_LLM: bool = False
+    
+    # Agent & Graph settings
+    MAX_CONCURRENT_TOOLS: int = 10 # Max concurrent tool executions (Semaphore limit)
+    MAX_STATE_MESSAGES: int = 50 # Max messages to keep in AgentState history
+    MAX_GRAPH_ITERATIONS: int = 10 # Max recursion depth for the LangGraph agent
     
     # Security
     SECRET_KEY: str = ""
@@ -50,33 +56,40 @@ class Settings(BaseSettings):
             return v
         raise ValueError(v)
     
-    @field_validator("DATABASE_URLS")
-    def parse_database_urls(cls, v: str) -> str:
-        if not v:
-            return v
+    @model_validator(mode='after')
+    def check_required_settings(cls, values):
+        # Check critical settings like API keys after loading
+        api_key = values.AZURE_OPENAI_API_KEY
+        endpoint = values.AZURE_OPENAI_ENDPOINT
+        deployment = values.AZURE_OPENAI_DEPLOYMENT_NAME
         
-        # Parse the database URLs and populate POSTGRES_SERVERS
-        db_configs = []
-        for db_config in v.split(","):
-            if "=" not in db_config:
-                continue
-                
-            db_name, db_url = db_config.split("=", 1)
-            db_configs.append({
-                "name": db_name.strip(),
-                "url": db_url.strip()
-            })
-        
-        # Instead of trying to access settings, return both values
-        return {"url_string": v, "servers": db_configs}
+        if not api_key:
+            raise ValueError("AZURE_OPENAI_API_KEY environment variable is missing or empty.")
+        if not endpoint:
+             raise ValueError("AZURE_OPENAI_ENDPOINT environment variable is missing or empty.")
+        if not deployment:
+            raise ValueError("AZURE_OPENAI_DEPLOYMENT_NAME environment variable is missing or empty.")
+            
+        # Re-process DATABASE_URLS to populate POSTGRES_SERVERS
+        # This needs to happen here because the field validator runs before this model validator
+        db_urls = values.DATABASE_URLS
+        if db_urls:
+            db_configs = []
+            for db_config in db_urls.split(","):
+                if "=" not in db_config:
+                    continue
+                db_name, db_url = db_config.split("=", 1)
+                db_configs.append({
+                    "name": db_name.strip(),
+                    "url": db_url.strip()
+                })
+            # Assign directly to the attribute on the instance
+            values.POSTGRES_SERVERS = db_configs
+            
+        return values
 
 # Create global settings object
 settings = Settings()
-
-# Process the database URLs result
-if settings.DATABASE_URLS and isinstance(settings.DATABASE_URLS, dict):
-    settings.POSTGRES_SERVERS = settings.DATABASE_URLS.get("servers", [])
-    settings.DATABASE_URLS = settings.DATABASE_URLS.get("url_string", "")
 
 # Ensure chart directory exists
 os.makedirs(settings.CHART_DIR, exist_ok=True)

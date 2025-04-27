@@ -140,13 +140,14 @@ Query description: {query_description}
 Important Guidelines:
 1. Use parameter placeholders (e.g., :filter_value, :hierarchy_id) for ALL dynamic values derived from the query description (like names, IDs, specific filter values) EXCEPT for the mandatory :organization_id and time-related values. DO NOT use parameters for date/time calculations.
 2. Generate a valid JSON dictionary mapping placeholder names (without the colon) to their actual values. This MUST include `organization_id`.
-3. Quote table and column names with double quotes (e.g., "hierarcyCaches", "createdAt").
+3. Quote table and column names with double quotes (e.g., "hierarcyCaches", "createdAt"). Use the actual table names from the schema (e.g., '5', '8') when writing the SQL, even though logical names ('events', 'footfall') are used in the schema description itself.
 4. **Mandatory Organization Filtering:** ALWAYS filter results by the organization ID. Use the parameter `:organization_id`. Add the appropriate WHERE clause:
-    *   If querying table '5' (event data), add `"organizationId" = :organization_id` to your WHERE clause (using AND if other conditions exist).
-    *   If querying `hierarcyCaches` directly for the organization's details, filter using `"id" = :organization_id`.
-    *   If querying `hierarcyCaches` for specific locations *within* an organization, ensure the data relates back to the `:organization_id` (e.g., via JOIN or direct filter on `parentId` if appropriate).
+    *   If querying table '5' (event data), add `"5"."organizationId" = :organization_id` to your WHERE clause (using AND if other conditions exist).
+    *   If querying `hierarchyCaches` directly for the organization's details, filter using `"id" = :organization_id`.
+    *   If querying `hierarchyCaches` for specific locations *within* an organization, ensure the data relates back to the `:organization_id` (e.g., via JOIN or direct filter on `parentId` if appropriate).
+    *   If querying table '8' (footfall data), add `"8"."organizationId" = :organization_id` to your WHERE clause.
     *   You MUST include `:organization_id` as a key in the `params` dictionary with the correct value. **Use the exact `organization_id` value provided to you in the context (e.g., '{organization_id}'), do NOT use example UUIDs or placeholders like 'your-organization-uuid'.**
-5. **JOINs for Related Data:** When joining table '5' and `hierarcyCaches`, use appropriate keys like `"5"."hierarchyId" = hc."id"` (for location-specific events) or `"5"."organizationId" = hc."id"` (for organization details). Remember to apply the organization filter (Guideline #4).
+5. **JOINs for Related Data:** When joining table '5' or '8' and `hierarchyCaches`, use appropriate keys like `"5"."hierarchyId" = hc."id"` or `"8"."hierarchyId" = hc."id"`. Remember to apply the organization filter (Guideline #4).
 6. **Case Sensitivity:** PostgreSQL is case-sensitive; respect exact table/column capitalization.
 7. **Column Selection:** Use specific column selection instead of SELECT *.
 8. **Sorting:** Add ORDER BY clauses for meaningful sorting, especially when LIMIT is used.

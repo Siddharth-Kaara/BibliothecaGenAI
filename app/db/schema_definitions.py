@@ -7,7 +7,8 @@ SCHEMA_DEFINITIONS = {
     "report_management": {
         "description": "Database for storing event logs, usage statistics, and associated library hierarchy information.",
         "tables": {
-            "5": {
+            "events": {
+                "name": "5",
                 "description": "Stores aggregated event counts for a library system or location at specific timestamps.",
                 "columns": [
                     {"name": "id", "type": "bigint", "primary_key": False, "description": "Unique identifier for the log entry"},
@@ -32,6 +33,7 @@ SCHEMA_DEFINITIONS = {
                 "example_queries": []
             },
             "hierarchyCaches": {
+                "name": "hierarchyCaches",
                 "description": "Stores cached organizational hierarchy data (Library Systems, Libraries, Sub-Locations). Provides IDs, names, parentage, and path information. Used for joining event data (table '5') with hierarchy context.",
                 "columns": [
                     {"name": "id", "type": "uuid", "primary_key": True, "description": "Unique identifier for the hierarchy (library system, library, or sub-location)"},
@@ -50,7 +52,8 @@ SCHEMA_DEFINITIONS = {
                     "SELECT hc.\"name\" FROM \"hierarchyCaches\" hc WHERE hc.\"parentId\" IS NULL AND hc.\"deletedAt\" IS NULL"
                 ]
             },
-            "8": {
+            "footfall": {
+                "name": "8",
                 "description": "Stores footfall data (people entering/leaving) associated with specific device parts (e.g., gates) within a library location. Queries about general 'footfall' or 'visitors' should typically involve summing both column \"39\" (entries) and column \"40\" (exits).",
                 "columns": [
                     {"name": "id", "type": "bigint", "primary_key": True, "description": "Unique identifier for the footfall log entry (Primary Key)"},

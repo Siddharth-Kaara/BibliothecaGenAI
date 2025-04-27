@@ -37,43 +37,41 @@ class HierarchyNameResolverTool(BaseTool):
     min_score_threshold: int = 85
     db_name: str = "report_management" # Assume we always use this DB for hierarchy
 
-    def _run(self, name_candidates: List[str], **kwargs: Any) -> Dict[str, Any]: # Removed organization_id param
+    def _run(self, name_candidates: List[str], **kwargs: Any) -> Dict[str, Any]:
         """Synchronous execution. Mirrors the pattern in SQLQueryTool."""
         logger.warning("Running HierarchyNameResolverTool synchronously.")
-        # Use self.organization_id from the tool's context
         org_id_to_use = self.organization_id
         engine = get_db_engine(self.db_name)
         if not engine:
-            logger.error(f"Database engine for '{self.db_name}' not found for sync execution.")
-            return self._format_error_output(f"Database engine '{self.db_name}' not configured.", name_candidates)
+            error_msg = f"Database engine '{self.db_name}' not configured."
+            logger.error(error_msg)
+            raise ValueError(error_msg)
 
         try:
-            # Get connection using context manager, same as sql_tool
             with engine.connect() as connection:
-                 # Pass the organization_id from the tool's internal state
                  return self._execute_logic(connection, name_candidates, org_id_to_use)
         except Exception as e:
+            error_msg = f"Failed during sync execution: {str(e)}"
             logger.error(f"Error during synchronous hierarchy resolution: {e}", exc_info=True)
-            return self._format_error_output(f"Failed during sync execution: {str(e)}", name_candidates)
+            raise ValueError(error_msg)
 
-    async def _arun(self, name_candidates: List[str], **kwargs: Any) -> Dict[str, Any]: # Removed organization_id param
+    async def _arun(self, name_candidates: List[str], **kwargs: Any) -> Dict[str, Any]:
         """Resolve names asynchronously. Mirrors the pattern in SQLQueryTool's _run method structure."""
-        # Use self.organization_id from the tool's context for logging and execution
         org_id_to_use = self.organization_id
         logger.info(f"Executing Hierarchy Name Resolver for org {org_id_to_use} with candidates: {name_candidates}")
         engine = get_db_engine(self.db_name)
         if not engine:
-            logger.error(f"Database engine for '{self.db_name}' not found.")
-            return self._format_error_output(f"Database engine '{self.db_name}' not configured.", name_candidates)
+            error_msg = f"Database engine '{self.db_name}' not configured."
+            logger.error(error_msg)
+            raise ValueError(error_msg)
 
         try:
-            # Use engine.connect() within context manager - works with asyncpg driver
             with engine.connect() as connection:
-                # Pass the connection object and the organization_id from the tool's internal state
                 return self._execute_logic(connection, name_candidates, org_id_to_use)
         except Exception as e:
+            error_msg = f"Failed during async execution: {str(e)}"
             logger.error(f"Error during async hierarchy resolution: {e}", exc_info=True)
-            return self._format_error_output(f"Failed during async execution: {str(e)}", name_candidates)
+            raise ValueError(error_msg)
 
     # Renamed helper function for clarity, now takes the Connection object
     # Signature remains the same, it receives the org_id from _run/_arun
@@ -171,11 +169,3 @@ class HierarchyNameResolverTool(BaseTool):
         logger.debug(f"Hierarchy name resolution completed. Result map: {resolved_map}")
         # Final successful return structure
         return {"resolution_results": resolved_map}
-
-    # Helper to format error outputs consistently
-    def _format_error_output(self, error_message: str, name_candidates: List[str]) -> Dict[str, Any]:
-        """Formats the error output to match the expected structure."""
-        resolved_map = {}
-        for name in name_candidates:
-             resolved_map[name] = {"status": "error", "error_message": error_message, "resolved_name": None, "id": None, "score": 0}
-        return {"resolution_results": resolved_map, "error": error_message} 
