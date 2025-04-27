@@ -20,7 +20,11 @@ class SummarySynthesizerTool(BaseTool):
     """Tool for synthesizing high-level summaries from data, optimized for concurrent data retrieval."""
     
     name: str = "summary_synthesizer"
-    description: str = """
+    description: str = """\
+    **WARNING:** Use this tool ONLY for open-ended, qualitative summaries (e.g., 'summarize activity'). 
+    For specific, quantifiable metric comparisons or retrievals (e.g., 'compare borrows for Branch A and B', 'get total renewals last month'), 
+    you MUST use the 'sql_query' tool instead.
+    
     Creates high-level summaries and insights from data by intelligently decomposing the request and fetching data concurrently.
     Use this tool for complex queries requiring analysis across multiple dimensions or when a narrative summary is preferred.
     Input should be a description of the summary or analysis needed.
