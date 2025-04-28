@@ -3,9 +3,9 @@ import time
 from fastapi import APIRouter, Response, status
 from pydantic import BaseModel
 from typing import Dict, Optional
+from sqlalchemy import text
 
 from app.core.config import settings
-from app.db.connection import db_engines
 from app.langchain.agent import test_azure_openai_connection
 
 logger = logging.getLogger(__name__)
@@ -27,19 +27,29 @@ async def health_check(response: Response):
     """Health check endpoint."""
     logger.debug("Health check requested")
 
-    # Check database connections
-    db_status = "connected" if db_engines else "disconnected"
-    if db_engines:
-        # Check if any database is connected
-        db_status = "disconnected"
-        for db_name, engine in db_engines.items():
+    # Check database connections using async connections
+    db_status = "disconnected"
+    
+    # Import async db functionality
+    from app.db.connection import get_async_db_connection, async_db_engines
+    
+    if async_db_engines:
+        for db_name in async_db_engines:
             try:
-                with engine.connect() as conn:
-                    conn.execute("SELECT 1")
-                db_status = "connected"
-                break
+                async with get_async_db_connection(db_name) as conn:
+                    result = await conn.execute(text("SELECT 1"))
+
+                    row = result.fetchone()
+                    if row and row[0] == 1:
+                        db_status = "connected"
+                        logger.debug(f"Async database connection check successful for {db_name}")
+                        break
+                    else:
+                        logger.warning(f"Database connection check failed for {db_name}: Unexpected result {row}")
             except Exception as e:
-                logger.warning(f"Database connection check failed: {str(e)}")
+                logger.warning(f"Async database connection check failed for {db_name}: {str(e)}")
+    else:
+        logger.warning("No async database engines configured")
 
     # Check Azure OpenAI connection
     azure_openai_status = "unknown"

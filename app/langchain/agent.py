@@ -47,6 +47,8 @@ class AgentState(TypedDict):
     visualizations: Annotated[List[Dict[str, Any]], operator.add] # List of visualizations from chart_renderer tool calls
     # Add a field to hold the final structured response once generated
     final_response_structure: Optional[FinalApiResponseStructure]
+    # Add request_id for logging context
+    request_id: Optional[str] = None
 
 
 # --- System Prompt ---
@@ -54,6 +56,13 @@ SYSTEM_PROMPT_TEMPLATE = """You are a professional data assistant for the Biblio
 
 Your primary responsibility is to analyze organizational data and provide accurate insights to users based on the request's context.
 **Key Context:** The necessary `organization_id` for data scoping is always provided implicitly through the tool context; **NEVER ask the user for it or use placeholders like 'your-organization-id'.**
+
+# --- CRITICAL FINAL STEP --- #
+**MANDATORY:** You **MUST ALWAYS** conclude your response by invoking the `FinalApiResponseStructure` tool. 
+*   This applies in **ALL** situations: successful answers, reporting errors, refusing requests, simple greetings.
+*   **DO NOT** provide the final answer as plain text in the message content. Your final output MUST be a call to `FinalApiResponseStructure`.
+*   Failure to call `FinalApiResponseStructure` as the absolute final step is an error.
+# --- END CRITICAL FINAL STEP --- #
 
 You have access to a single database: **report_management**.
 This database contains:
@@ -166,12 +175,7 @@ Tool Use and Response Guidelines:
 
 15. **Out-of-Scope Refusal:** Your function is limited to library data. You MUST refuse requests completely unrelated to library data or operations (e.g., general knowledge, coding, football, recipes, opinions on non-library topics).
 
-16. **Invoke `FinalApiResponseStructure` (CRITICAL FINAL STEP):** You **MUST ALWAYS** conclude your response by invoking the `FinalApiResponseStructure` tool. This applies in **ALL** situations, including:
-    *   Successfully answering the query using tool results.
-    *   Reporting errors encountered during tool execution (e.g., name resolution failure).
-    *   Refusing out-of-scope or inappropriate requests (like the example below).
-    *   Providing simple greetings or capability descriptions.
-    Populate the arguments based on your analysis and the preceding guidelines (especially #13 for table inclusion and accuracy). **Failure to call `FinalApiResponseStructure` as the final step is an error.**
+16. **Invoke `FinalApiResponseStructure` (MANDATORY FINAL STEP - REITERATED):** As stated above, you **MUST ALWAYS** conclude your response by invoking the `FinalApiResponseStructure` tool. Populate its arguments based on your analysis and the preceding guidelines (especially #13 for table inclusion and accuracy). **DO NOT output plain text. Your final action MUST be this tool call.**
 
 17. **Example (Name Resolution Failure):**
     *   User Query: "Borrows for Main Lib last week"
@@ -190,9 +194,9 @@ Tool Use and Response Guidelines:
     *   Analysis: No tools needed.
     *   Your Response: Invoke `FinalApiResponseStructure(text="Hello! How can I assist you today?", include_tables=[], include_visualizations=[])`
 20. **Example (Out-of-Scope Refusal - Full Query):**
-    *   User Query: "Tell me about Rishabh Pant"
+    *   User Query: "Tell me about quantum physics"
     *   Analysis: Out of scope (general knowledge).
-    *   Your Response: Invoke `FinalApiResponseStructure(text="I cannot provide information about Rishabh Pant. My function is limited to answering questions about library data.", include_tables=[], include_visualizations=[])` # Note: Still uses the structure!
+    *   Your Response: Invoke `FinalApiResponseStructure(text="I cannot provide information about quantum physics. My function is limited to answering questions about library data.", include_tables=[], include_visualizations=[])` # Note: Still uses the structure!
 21. **Example (Combined Factual Answer + Analytical Interpretation With Benchmark - Simple Result):**
     *   User Query: "What was the footfall for Main Library last month, and is it busy?"
     *   `hierarchy_name_resolver` resolves "Main Library".
@@ -277,87 +281,148 @@ def agent_node(state: AgentState, llm_with_structured_output):
     """Invokes the LLM to decide the next action or final response structure.
        Includes a single retry attempt if the initial LLM response is invalid.
     """
-    logger.debug(f"Agent node executing. Current state messages: {len(state['messages'])} messages.")
-    logger.debug(f"Agent node state: Tables={len(state.get('tables',[]))}, Visualizations={len(state.get('visualizations',[]))}")
+    request_id = state.get("request_id")
+    logger.debug(f"[AgentNode] Entering agent node...")
 
     response = None
     final_structure = None
     parser = PydanticToolsParser(tools=[FinalApiResponseStructure])
+    preprocessed_state = _preprocess_state_for_llm(state)
+    failures = []
 
-    for attempt in range(2): # Try up to 2 times (initial + 1 retry)
-        logger.debug(f"Invoking LLM (Attempt {attempt + 1}/2)")
-        # Invoke the LLM. It will either return tool calls for sql/chart/summary
-        # OR a tool call for FinalApiResponseStructure
-        response = llm_with_structured_output.invoke(state)
-        logger.debug(f"Agent node generated raw response (Attempt {attempt + 1}): {response}")
+    for attempt in range(3):
+        try:
+            response = llm_with_structured_output.invoke(preprocessed_state)
+            # CRITICAL DEBUG LOG:
+            logger.debug(f"[AgentNode] Raw LLM response (Attempt {attempt + 1}): {response.pretty_repr() if isinstance(response, BaseMessage) else response}")
 
-        is_valid_response = False
-        if isinstance(response, AIMessage) and response.tool_calls:
-            # Check if it's an operational tool call OR a parsable FinalApiResponseStructure call
-            first_tool_call = response.tool_calls[0]
-            if first_tool_call.get("name") != FinalApiResponseStructure.__name__:
-                is_valid_response = True # It's calling an operational tool
-            else:
-                # Try parsing FinalApiResponseStructure
-                try:
-                    # Use a temporary variable to avoid setting state prematurely on first pass
-                    parsed_objects = parser.invoke(response)
-                    if parsed_objects: # Should be a list with one item
-                        potential_final_structure = parsed_objects[0]
-                        final_structure = potential_final_structure # Assign if successfully parsed
-                        is_valid_response = True
-                        logger.info(f"Successfully parsed FinalApiResponseStructure (Attempt {attempt + 1})")
-                    else:
-                        logger.warning(f"PydanticToolsParser invoked but returned empty list (Attempt {attempt + 1}).")
-                except ValidationError as e:
-                    # Handle correctable errors ONLY if it's the final attempt, otherwise just log
-                    if attempt == 1: # Final attempt
-                        logger.warning(f"Initial parsing failed (Attempt {attempt + 1}): {e}. Checking for correctable list errors...")
-                        # Check if it's the specific boolean-instead-of-list error
-                        is_correctable_error = False
-                        correctable_fields = ['include_tables', 'include_visualizations']
-                        error_details = e.errors()
-                        if all(err.get('type') == 'list_type' and err.get('loc', [None])[0] in correctable_fields for err in error_details):
-                            is_correctable_error = True
-                        
-                        if is_correctable_error:
-                            logger.info("Identified correctable boolean-as-list error. Attempting manual correction...")
-                            try:
-                                raw_args = first_tool_call.get("args", {})
-                                corrected_args = raw_args.copy()
-                                needs_correction = False
-                                for field in correctable_fields:
-                                    if field in corrected_args and isinstance(corrected_args[field], bool):
-                                        corrected_args[field] = [corrected_args[field]]
-                                        needs_correction = True
-                                
-                                if needs_correction:
-                                     final_structure = FinalApiResponseStructure(**corrected_args)
-                                     logger.warning(f"Successfully corrected LLM arguments and parsed FinalApiResponseStructure: {final_structure}")
-                                     is_valid_response = True # Now it's valid after correction
-                                else:
-                                     logger.error(f"Caught list_type ValidationError, but no boolean found to correct. Raw args: {raw_args}. Original Error: {e}")
-                            except Exception as correction_err:
-                                 logger.error(f"Error during manual correction of FinalApiResponseStructure args: {correction_err}", exc_info=True)
-                        else:
-                             logger.error(f"Uncorrectable ValidationError parsing FinalApiResponseStructure: {e}", exc_info=True)
-                    else: # Log validation error on first attempt but don't correct yet
-                        logger.warning(f"Parsing FinalApiResponseStructure failed on attempt {attempt + 1}: {e}")
-                except Exception as e:
-                    logger.error(f"Unexpected error parsing FinalApiResponseStructure (Attempt {attempt + 1}): {e}", exc_info=True)
+            is_valid_response = False
+            if isinstance(response, AIMessage) and response.tool_calls:
+                first_tool_call = response.tool_calls[0]
+                if first_tool_call.get("name") != FinalApiResponseStructure.__name__:
+                    is_valid_response = True # Operational tool call
+                else:
+                    # Attempt to parse FinalApiResponseStructure
+                    try:
+                        args = first_tool_call.get("args", {})
+                        # Add defaults *before* parsing
+                        if "include_tables" not in args: args["include_tables"] = [False] * len(state.get('tables', []))
+                        if "include_visualizations" not in args: args["include_visualizations"] = [False] * len(state.get('visualizations', []))
+                        for field in ['include_tables', 'include_visualizations']:
+                            if field in args and isinstance(args[field], bool): args[field] = [args[field]] * max(1, len(state.get(field.replace('include_', ''), [])))
+
+                        parsed_objects = parser.invoke(response)
+                        if parsed_objects:
+                            final_structure = parsed_objects[0]
+                            is_valid_response = True
+                            logger.debug(f"[AgentNode] LLM returned valid FinalApiResponseStructure.")
+                        else: failures.append(f"Attempt {attempt + 1}: Parser returned empty list")
+                    except ValidationError as e:
+                        failures.append(f"Attempt {attempt+1}: FinalAPIStructure validation fail: {e}")
+                        logger.warning(f"[AgentNode] FinalAPIStructure validation failed (attempt {attempt+1}). Trying direct init.")
+                        try: # Fallback direct init
+                            final_structure = FinalApiResponseStructure(**args)
+                            is_valid_response = True
+                            logger.debug(f"[AgentNode] Created FinalAPIStructure via direct init (attempt {attempt+1}).")
+                        except Exception as direct_err: failures.append(f"Attempt {attempt+1}: Direct init failed: {direct_err}")
+                    except Exception as e: failures.append(f"Attempt {attempt + 1}: Error parsing FinalAPIStructure: {e}")
+            else: failures.append(f"Attempt {attempt + 1}: Response not AIMessage or no tool calls.")
+
+            if is_valid_response: break
+        except Exception as e:
+            logger.error(f"[AgentNode] Exception during LLM invocation (Attempt {attempt + 1}): {e}", exc_info=True)
+            failures.append(f"Attempt {attempt + 1}: LLM invocation exception: {str(e)}")
+
+    # --- Fallback Logic ---
+    final_structure_needed = False
+    last_response_is_plain_ai = False
+    if response and isinstance(response, AIMessage):
+        if response.tool_calls: final_structure_needed = (response.tool_calls[0].get("name") == FinalApiResponseStructure.__name__)
+        else: last_response_is_plain_ai = True; final_structure_needed = True
+
+    if final_structure_needed and final_structure is None:
+        logger.warning(f"[AgentNode] Triggering fallback logic for FinalApiResponseStructure. Failures: {failures}")
+        fallback_text = "Error formatting final response."
+        if last_response_is_plain_ai and isinstance(response.content, str) and response.content.strip():
+             fallback_text = response.content.strip()
+             logger.debug(f"[AgentNode] Using LLM's plain text for fallback structure.")
+        else: fallback_text = "Could not generate final response structure. Check logs."
+        try:
+            final_structure = FinalApiResponseStructure(
+                text=fallback_text, include_tables=[True] * len(state.get("tables", [])),
+                include_visualizations=[True] * len(state.get("visualizations", [])))
+            logger.debug(f"[AgentNode] Created fallback FinalApiResponseStructure.")
+        except Exception as fallback_err:
+            logger.error(f"[AgentNode] Error creating fallback structure: {fallback_err}", exc_info=True)
+            final_structure = None
+
+    logger.debug(f"[AgentNode] Exiting agent node.")
+    return {"messages": [response] if response else [], "final_response_structure": final_structure}
+
+def _preprocess_state_for_llm(state: AgentState) -> AgentState:
+    """
+    Preprocess the state to ensure it's optimized for LLM context window.
+    This helps prevent issues with the LLM failing due to context limitations.
+    """
+    # Make a shallow copy of the state to avoid modifying the original
+    processed_state = {k: v for k, v in state.items()}
+    
+    # Handle messages - prioritize keeping tool outputs and recent messages
+    if 'messages' in processed_state:
+        messages = processed_state['messages']
         
-        if is_valid_response:
-            break # Exit loop if response is valid (operational tool call or successfully parsed final structure)
-        else:
-            logger.warning(f"LLM response invalid on attempt {attempt + 1}. Retrying if possible...")
-            # Optional: sleep briefly before retry?
-            # await asyncio.sleep(0.5)
-
-    # Return the (last) AIMessage and the successfully parsed final structure (if any)
-    return {
-        "messages": [response] if response else [],
-        "final_response_structure": final_structure # Add parsed/corrected structure here
-    }
+        # If we have too many messages, we need to prune
+        if len(messages) > settings.MAX_STATE_MESSAGES:
+            logger.debug(f"Pruning messages from {len(messages)} to {settings.MAX_STATE_MESSAGES}")
+            
+            # Always keep the user's first and last message for context
+            first_user_msg = next((msg for msg in messages if isinstance(msg, HumanMessage)), None)
+            last_user_msg = next((msg for msg in reversed(messages) if isinstance(msg, HumanMessage)), None)
+            
+            # Always keep the most recent tool messages as they contain crucial data
+            tool_messages = [msg for msg in messages if hasattr(msg, 'tool_call_id')]
+            recent_tool_messages = tool_messages[-5:] if len(tool_messages) > 5 else tool_messages
+            
+            # Create a set of message IDs to keep
+            keep_ids = set()
+            if first_user_msg:
+                keep_ids.add(id(first_user_msg))
+            if last_user_msg:
+                keep_ids.add(id(last_user_msg))
+            for msg in recent_tool_messages:
+                keep_ids.add(id(msg))
+                
+            # Keep a few of the most recent AI messages
+            ai_messages = [msg for msg in messages if isinstance(msg, AIMessage)]
+            for msg in ai_messages[-2:]:
+                keep_ids.add(id(msg))
+                
+            # Filter messages based on keep_ids set and most recent ones
+            priority_messages = [msg for msg in messages if id(msg) in keep_ids]
+            remaining_slots = settings.MAX_STATE_MESSAGES - len(priority_messages)
+            
+            # Fill remaining slots with the most recent messages
+            remaining_messages = [msg for msg in reversed(messages) if id(msg) not in keep_ids][:remaining_slots]
+            
+            # Combine and sort by original order
+            preserved_messages = priority_messages + remaining_messages
+            original_order = {id(msg): i for i, msg in enumerate(messages)}
+            processed_state['messages'] = sorted(preserved_messages, key=lambda msg: original_order.get(id(msg), 999999))
+            
+            logger.debug(f"After pruning, kept {len(processed_state['messages'])} messages")
+    
+    # Process tables - limit large ones
+    if 'tables' in processed_state and processed_state['tables']:
+        for i, table in enumerate(processed_state['tables']):
+            # If a table has too many rows, truncate it
+            if 'rows' in table and len(table['rows']) > 10:
+                table['rows'] = table['rows'][:10]
+                if 'metadata' not in table:
+                    table['metadata'] = {}
+                table['metadata']['truncated'] = True
+                table['metadata']['original_rows'] = len(state['tables'][i]['rows'])
+    
+    return processed_state
 
 # --- Tool Node Handler ---
 async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[str, Any]:
@@ -372,198 +437,95 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
     Returns:
         Dict representing updates to the agent state (new messages, potentially tables/visualizations).
     """
+    request_id = state.get("request_id")
+    logger.debug(f"[ToolsNode] Entering tool handler.")
     last_message = state["messages"][-1]
-    if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
-        logger.debug("Tool handler: No tool calls found in last AI message.")
-        return {} # No update
-
     tool_map = {tool.name: tool for tool in tools}
     tool_executions = []
+    new_messages = []; new_tables = []; new_visualizations = []
+    successful_calls = 0
+    operational_tool_calls = []
 
-    # Filter out calls to FinalApiResponseStructure, only execute operational tools
-    operational_tool_calls = [
-        tc for tc in last_message.tool_calls
-        if tc.get("name") != FinalApiResponseStructure.__name__
-    ]
+    if isinstance(last_message, AIMessage) and last_message.tool_calls:
+        operational_tool_calls = [tc for tc in last_message.tool_calls if tc.get("name") != FinalApiResponseStructure.__name__]
 
     if not operational_tool_calls:
-        logger.debug("Tool handler: No *operational* tool calls found (might be FinalApiResponseStructure call).")
-        # Return empty dict, but the AIMessage with the FinalApiResponseStructure call remains in history.
-        # The should_continue logic will handle routing to END based on that AIMessage.
+        logger.debug(f"[ToolsNode] No operational tool calls found.")
         return {}
 
-    logger.info(f"Tool handler: Found {len(operational_tool_calls)} operational tool calls.")
+    logger.debug(f"[ToolsNode] Dispatching {len(operational_tool_calls)} tool calls: {[tc.get('name') for tc in operational_tool_calls]}")
     for tool_call in operational_tool_calls:
         tool_name = tool_call.get("name")
-        tool_args = tool_call.get("args", {})
-        tool_id = tool_call.get("id", "")
+        tool_id = tool_call.get("id", "") # Get tool_id here
+        if tool_name in tool_map:
+            tool_executions.append({"tool": tool_map[tool_name], "args": tool_call.get("args", {}), "id": tool_id, "name": tool_name, "retries_left": 2})
+        else:
+             logger.error(f"[ToolsNode] Tool '{tool_name}' requested but not found.")
+             new_messages.append(ToolMessage(content=f"Error: Tool '{tool_name}' not found.", tool_call_id=tool_id, name=tool_name))
 
-        if tool_name not in tool_map:
-            logger.error(f"Tool '{tool_name}' not found in available operational tools list: {list(tool_map.keys())}")
-            tool_executions.append({
-                "error": f"Tool '{tool_name}' not found.",
-                "tool_id": tool_id,
-                "tool_name": tool_name
-                })
-            continue
+    if not tool_executions: # Handle case where all requested tools were missing
+        logger.warning(f"[ToolsNode] No tools could be prepared for execution.")
+        return {"messages": new_messages} if new_messages else {}
 
-        # Get the actual tool instance from the map
-        current_tool_instance = tool_map[tool_name]
-
-        tool_executions.append({
-            # Use the instance we already retrieved
-            "tool": current_tool_instance,
-            "args": tool_args,
-            "id": tool_id,
-            "name": tool_name,
-            "retries_left": 2
-        })
-
-    sem = asyncio.Semaphore(settings.MAX_CONCURRENT_TOOLS) # Limit concurrency based on settings
-    
+    sem = asyncio.Semaphore(settings.MAX_CONCURRENT_TOOLS)
     async def execute_with_retry(execution_details):
-        # Check if it's an error placeholder first
-        if "error" in execution_details:
-             return {
-                "success": False,
-                "error": execution_details["error"],
-                "tool_name": execution_details["tool_name"],
-                "tool_id": execution_details["tool_id"]
-             }
+        # Simplified retry logic focusing on logging
+        tool = execution_details["tool"]; args = execution_details["args"]; tool_id = execution_details["id"]; tool_name = execution_details["name"]; retries = execution_details["retries_left"]
+        try:
+            async with sem:
+                 # DEBUG log includes args, might be verbose
+                 logger.debug(f"[ToolsNode] Executing tool '{tool_name}' (ID: {tool_id})")
+                 content = await tool.ainvoke(args)
+                 if asyncio.iscoroutine(content): content = await content
+                 content_str = json.dumps(content) if isinstance(content, dict) else str(content)
+                 logger.debug(f"[ToolsNode] Tool '{tool_name}' (ID: {tool_id}) completed.")
+                 return {"success": True, "message": ToolMessage(content=content_str, tool_call_id=tool_id, name=tool_name), "raw_content": content, "tool_name": tool_name, "tool_id": tool_id}
+        except Exception as e:
+            error_msg_for_log = f"Error executing tool '{tool_name}' (ID: {tool_id}): {str(e)}"
+            if retries > 0 and _is_retryable_error(e):
+                logger.warning(f"[ToolsNode] {error_msg_for_log} - Retrying ({retries} left).", exc_info=False)
+                await asyncio.sleep(0.5 * (3 - retries)); execution_details["retries_left"] = retries - 1
+                return await execute_with_retry(execution_details)
+            else:
+                logger.error(f"[ToolsNode] {error_msg_for_log}", exc_info=True)
+                # Keep original error message structure for return value
+                return {"success": False, "error": f"{error_msg_for_log}", "tool_name": tool_name, "tool_id": tool_id}
 
-        async with sem:
-            tool = execution_details["tool"]
-            args = execution_details["args"]
-            tool_id = execution_details["id"]
-            tool_name = execution_details["name"]
-            retries = execution_details["retries_left"]
-
-            try:
-                logger.info(f"Executing tool: {tool_name} with args: {args}")
-                # Check if the tool supports async execution
-                if hasattr(tool, 'ainvoke'):
-                    content = await tool.ainvoke(args)
-                else:
-                    # Fallback to synchronous execution in a thread pool
-                    loop = asyncio.get_event_loop()
-                    # Ensure tool.invoke doesn't block the event loop if it's CPU-bound
-                    content = await loop.run_in_executor(None, functools.partial(tool.invoke, args))
-
-                logger.info(f"Tool '{tool_name}' execution completed successfully")
-                # Ensure content is JSON serializable for ToolMessage
-                if isinstance(content, dict):
-                    # Attempt to dump dicts to string for ToolMessage consistency
-                    try:
-                         content_str = json.dumps(content)
-                    except TypeError:
-                         logger.warning(f"Tool {tool_name} output dict not JSON serializable, using str().")
-                         content_str = str(content)
-                elif isinstance(content, str):
-                    content_str = content # Already a string
-                else:
-                    content_str = str(content) # Fallback
-
-                return {
-                    "success": True,
-                    "message": ToolMessage(content=content_str, tool_call_id=tool_id, name=tool_name), # Add name here
-                    "raw_content": content, # Keep raw content for parsing table/viz below
-                    "tool_name": tool_name
-                }
-            except Exception as e:
-                error_msg = f"Error executing tool '{tool_name}' with args {args}: {str(e)}"
-                logger.error(error_msg, exc_info=True) # Log traceback
-
-                if retries > 0 and _is_retryable_error(e):
-                    logger.info(f"Retrying tool '{tool_name}', {retries} attempts left")
-                    execution_details["retries_left"] = retries - 1
-                    await asyncio.sleep(0.5 * (3 - retries))
-                    return await execute_with_retry(execution_details)
-
-                return {
-                    "success": False,
-                    "error": error_msg,
-                    "tool_name": tool_name,
-                    "tool_id": tool_id
-                }
-
-    logger.info(f"Executing {len(tool_executions)} operational tool calls..." + (f" Names: {[t['name'] for t in tool_executions]}" if tool_executions else "")) # Log names
     results = await asyncio.gather(*[execute_with_retry(exec_data) for exec_data in tool_executions])
 
-    # --- Processing results: Initialize lists FIRST --- 
-    new_tables = []
-    new_visualizations = []
-    new_messages = []
-
-    # --- Single Pass: Process results and errors --- 
+    # Simplified result processing
     for result in results:
-        tool_id = result.get("tool_id", "")
-        tool_name = result.get("tool_name", "unknown_tool")
-
+        tool_name = result.get("tool_name", "unknown")
+        tool_id = result.get("tool_id", "") # Ensure tool_id is available for error message
         if result["success"]:
-            tool_message = result["message"]
-            raw_content = result.get("raw_content") # Keep raw content for potential parsing
-            new_messages.append(tool_message) # Append the message first
+            successful_calls += 1
+            new_messages.append(result["message"])
+            raw_content = result.get("raw_content")
+            # Basic table/viz extraction (no dupe check here for simplicity)
+            if isinstance(raw_content, dict):
+                 if tool_name == "sql_query" and isinstance(raw_content.get("table"), dict):
+                     table_data = raw_content["table"]
+                     if isinstance(table_data.get('columns'), list) and isinstance(table_data.get('rows'), list):
+                          new_tables.append(table_data) # Add table data
+                 elif tool_name == "chart_renderer" and isinstance(raw_content.get("visualization"), dict):
+                     viz_data = raw_content["visualization"]
+                     if viz_data.get('type') and viz_data.get('image_url'):
+                          new_visualizations.append(viz_data) # Add viz data
+        else:
+            logger.warning(f"[ToolsNode] Tool call '{tool_name}' (ID: {tool_id}) failed. Error appended.")
+            # Append error message only if tool mapping didn't already do it
+            if not any(getattr(m, 'tool_call_id', None) == tool_id for m in new_messages if isinstance(m, ToolMessage)):
+                 # Ensure correct arguments for ToolMessage
+                 error_content = f"Tool execution failed: {result.get('error', 'Unknown error')}"
+                 new_messages.append(ToolMessage(content=error_content, tool_call_id=tool_id, name=tool_name))
 
-            # Try to parse content IF it's sql_query or chart_renderer for tables/viz
-            content_to_parse = None
-            if tool_name in ["sql_query", "chart_renderer"]:
-                if isinstance(raw_content, dict):
-                    content_to_parse = raw_content
-                elif isinstance(raw_content, str):
-                    content_str = raw_content.strip()
-                    if content_str.startswith('{') and content_str.endswith('}'):
-                        try:
-                            content_to_parse = json.loads(content_str)
-                        except json.JSONDecodeError as json_err:
-                            logger.warning(f"Failed to parse raw string content as JSON for tool {tool_name}: {json_err}.")
 
-            if content_to_parse: # Only proceed if parsing was relevant and potentially successful
-                try:
-                    # SQL Query: Extract table
-                    if tool_name == "sql_query" and "table" in content_to_parse and content_to_parse["table"]:
-                        table_data = content_to_parse["table"]
-                        if isinstance(table_data, dict) and 'columns' in table_data and 'rows' in table_data:
-                             # Basic dupe check against state only
-                            if table_data not in state.get("tables", []):
-                                logger.info(f"Extracted table from sql_query: {len(table_data.get('rows', []))} rows.")
-                                new_tables.append(table_data)
-                            else:
-                                 logger.warning("Skipping duplicate table from sql_query.")
-
-                    # Chart Renderer: Extract visualization
-                    elif tool_name == "chart_renderer" and "visualization" in content_to_parse and content_to_parse["visualization"]:
-                        viz_data = content_to_parse["visualization"]
-                        if isinstance(viz_data, dict) and 'type' in viz_data and 'image_url' in viz_data:
-                             # Basic dupe check against state only
-                            if viz_data not in state.get("visualizations", []):
-                                logger.info(f"Extracted visualization: {viz_data.get('type', 'unknown')}")
-                                new_visualizations.append(viz_data)
-                            else:
-                                logger.warning("Skipping duplicate visualization from chart_renderer.")
-
-                except Exception as e:
-                    logger.error(f"Error processing extracted data from tool '{tool_name}' result: {str(e)}. Original message already appended.", exc_info=True)
-            # else: If not sql_query/chart_renderer or parsing failed, original message is already appended
-
-        else: # Handle tool execution failure
-            error_msg = result["error"]
-            logger.warning(f"Appending error message for failed tool: {tool_name}")
-            new_messages.append(ToolMessage(
-                content=f"Tool execution failed: {error_msg}",
-                tool_call_id=tool_id,
-                name=tool_name 
-            ))
-
-    # --- Return updates --- 
     update_dict = {}
-    if new_messages:
-        update_dict["messages"] = new_messages
-    if new_tables:
-        update_dict["tables"] = new_tables
-    if new_visualizations:
-        update_dict["visualizations"] = new_visualizations
+    if new_messages: update_dict["messages"] = new_messages
+    if new_tables: update_dict["tables"] = new_tables
+    if new_visualizations: update_dict["visualizations"] = new_visualizations
 
-    logger.debug(f"Tool handler returning updates: { {k: len(v) if isinstance(v, list) else v for k, v in update_dict.items()} }")
+    logger.debug(f"[ToolsNode] Tool handler finished. {successful_calls}/{len(results)} calls successful. State updates: {list(update_dict.keys())}")
     return update_dict
 
 def _is_retryable_error(error: Exception) -> bool:
@@ -581,105 +543,71 @@ def _is_retryable_error(error: Exception) -> bool:
     # e.g., if "408" in error_str or isinstance(error, SpecificAzureError)
     return False
 
-# --- NEW Node for Hierarchy Resolution ---
+# --- Node for Hierarchy Resolution ---
 async def resolve_hierarchy_node(state: AgentState, tools: List[Any]) -> Dict[str, Any]:
     """Executes ONLY the hierarchy_name_resolver tool if called.
     Simplified version of async_tools_node_handler.
     """
-    logger.debug("Entering resolve_hierarchy_node")
+    request_id = state.get("request_id")
+    logger.debug(f"[ResolveHierarchyNode] Entering hierarchy resolver node.")
     messages = state.get("messages", [])
     last_message = messages[-1] if messages else None
-
-    if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
-        logger.warning("resolve_hierarchy_node: No AIMessage or tool calls found.")
-        return {"messages": []}
-
-    # Find the hierarchy resolver tool call
     resolver_tool_call = None
-    for tool_call in last_message.tool_calls:
-        if tool_call.get("name") == HierarchyNameResolverTool.__name__:
-            resolver_tool_call = tool_call
-            break
+    tool_name = HierarchyNameResolverTool.__name__ # Tool name is fixed
+
+    if isinstance(last_message, AIMessage) and last_message.tool_calls:
+         for tc in last_message.tool_calls:
+              if tc.get("name") == tool_name: resolver_tool_call = tc; break
 
     if not resolver_tool_call:
-        logger.warning(f"resolve_hierarchy_node: Expected {HierarchyNameResolverTool.__name__} call, not found.")
+        logger.warning(f"[ResolveHierarchyNode] Expected {tool_name} call, not found.")
         return {"messages": []}
 
-    # Find the corresponding tool implementation
     tool_map = {tool.name: tool for tool in tools}
-    resolver_tool = tool_map.get(HierarchyNameResolverTool.__name__)
-
+    resolver_tool = tool_map.get(tool_name)
     if not resolver_tool:
-         logger.error(f"resolve_hierarchy_node: {HierarchyNameResolverTool.__name__} tool implementation not found.")
-         return {"messages": [ToolMessage(content=f"Error: Tool {HierarchyNameResolverTool.__name__} not available.", tool_call_id=resolver_tool_call['id'], name=HierarchyNameResolverTool.__name__)]}
+         logger.error(f"[ResolveHierarchyNode] {tool_name} tool implementation not found.")
+         # Ensure error message has correct args
+         err_tool_id = resolver_tool_call.get('id', '') if resolver_tool_call else ''
+         return {"messages": [ToolMessage(content=f"Error: Tool {tool_name} not available.", tool_call_id=err_tool_id, name=tool_name)]}
 
+    tool_id = resolver_tool_call.get("id", "")
+    args = resolver_tool_call.get("args", {})
     try:
-        args = resolver_tool_call.get("args", {})
-        tool_id = resolver_tool_call.get("id", "")
-        tool_name = resolver_tool_call.get("name", "")
-
-        logger.info(f"Executing single tool: {tool_name} with args: {args}")
-        tool_output = await resolver_tool.ainvoke(args)
-
-        # Convert output to string if needed (similar logic to async_tools_node_handler)
-        if isinstance(tool_output, dict):
-            content_str = json.dumps(tool_output)
-        else:
-            content_str = str(tool_output)
-
-        logger.info(f"Tool '{tool_name}' execution completed successfully")
+        logger.debug(f"[ResolveHierarchyNode] Executing {tool_name} (ID: {tool_id})")
+        content = await resolver_tool.ainvoke(args)
+        if asyncio.iscoroutine(content): content = await content
+        content_str = json.dumps(content) if isinstance(content, dict) else str(content)
+        logger.debug(f"[ResolveHierarchyNode] {tool_name} (ID: {tool_id}) completed successfully.")
         return {"messages": [ToolMessage(content=content_str, tool_call_id=tool_id, name=tool_name)]}
-
     except Exception as e:
-        error_msg = f"Error executing tool '{tool_name}' with args {args}: {str(e)}"
-        logger.error(error_msg, exc_info=True)
-        return {"messages": [ToolMessage(content=f"Tool execution failed: {error_msg}", tool_call_id=tool_id, name=tool_name)]}
+        error_msg_for_log = f"Error executing tool '{tool_name}' (ID: {tool_id}): {str(e)}";
+        logger.error(f"[ResolveHierarchyNode] {error_msg_for_log}", exc_info=True)
+        # Ensure error message has correct args
+        return {"messages": [ToolMessage(content=f"Tool execution failed: {str(e)}", tool_call_id=tool_id, name=tool_name)]}
 
 
 # --- Conditional Edge Logic (Updated) ---
 def should_continue(state: AgentState) -> str:
     """Determines the next step based on the last message."""
+    request_id = state.get("request_id")
     last_message = state["messages"][-1] if state["messages"] else None
+    next_node = END
 
-    if not isinstance(last_message, AIMessage):
-        # If the last message isn't from the AI (e.g., initial HumanMessage, or a ToolMessage from the handler),
-        # we likely need the agent to process it.
-        # However, after the tool handler, we *always* loop back to the agent.
-        # This condition might occur if the graph somehow ends up here unexpectedly.
-        # Let's default to ending, assuming the agent should have produced an AIMessage.
-        logger.warning(f"should_continue: Last message is not AIMessage ({type(last_message)}), routing to END.")
-        return END
+    if isinstance(last_message, AIMessage):
+        if last_message.tool_calls:
+            is_final_call = any(tc.get("name") == FinalApiResponseStructure.__name__ for tc in last_message.tool_calls)
+            is_resolver_only = len(last_message.tool_calls) == 1 and last_message.tool_calls[0].get("name") == HierarchyNameResolverTool.__name__
+            has_operational_calls = any(tc.get("name") != FinalApiResponseStructure.__name__ for tc in last_message.tool_calls)
 
-    # Check if the AI decided on the final answer by calling FinalApiResponseStructure
-    if last_message.tool_calls:
-        for tool_call in last_message.tool_calls:
-            if tool_call.get("name") == FinalApiResponseStructure.__name__:
-                logger.debug("Conditional edge: FinalApiResponseStructure call detected, routing to END.")
-                # The final structure should be in state['final_response_structure'] now
-                return END # Signal the graph to end
+            if is_final_call: next_node = END
+            elif is_resolver_only: next_node = "resolve_hierarchy"
+            elif has_operational_calls: next_node = "use_tool"
+    else:
+        logger.warning(f"[ShouldContinue] Last message not AIMessage ({type(last_message).__name__}), routing to END.")
 
-    # Check if the AI called ONLY the hierarchy resolver tool
-    if last_message.tool_calls:
-        operational_calls = [tc for tc in last_message.tool_calls if tc.get("name") != FinalApiResponseStructure.__name__]
-        is_only_resolver = len(operational_calls) == 1 and operational_calls[0].get("name") == HierarchyNameResolverTool.__name__
-
-        if is_only_resolver:
-            logger.debug(f"Conditional edge: Only {HierarchyNameResolverTool.__name__} called, routing to resolve_hierarchy node.")
-            return "resolve_hierarchy"
-
-    # Check if the AI called other tools (or a mix)
-    if last_message.tool_calls:
-         # Filter out any accidental FinalApiResponseStructure calls if logic above missed it
-         operational_calls = [tc for tc in last_message.tool_calls if tc.get("name") != FinalApiResponseStructure.__name__]
-         if operational_calls:
-              logger.debug(f"Conditional edge: Operational tool calls ({len(operational_calls)}) detected, routing to tools node.")
-              return "use_tool" # Route to execute tools
-
-    # If the AI message has no tool calls (e.g., a direct text response, which it shouldn't do per the prompt)
-    # or only had a FinalApiResponseStructure call (handled above), end the graph.
-    # This branch handles cases where the agent might unexpectedly return plain text, or if only the final structure was called.
-    logger.debug("Conditional edge: No operational tool calls in AIMessage, routing to END.")
-    return END
+    logger.debug(f"[ShouldContinue] Routing decision: '{next_node}'.")
+    return next_node
 
 # --- Create LangGraph Agent (Updated) ---
 def create_graph_app(organization_id: str) -> StateGraph:
@@ -742,12 +670,20 @@ async def process_chat_message(
     message: str,
     session_id: Optional[str] = None,
     chat_history: Optional[List[Dict]] = None,
+    request_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Processes a user chat message using the refactored LangGraph agent.
     Extracts the final response structure directly from the agent's output.
     """
-    logger.info(f"Processing chat message for org {organization_id}, session {session_id}. Original message: '{message[:100]}...'")
+    # Generate ReqID if not provided, keep it for potential tracing, but not for logging prefix
+    req_id = request_id or str(uuid.uuid4())
+     # Log start of processing
+    logger.info(f"--- Starting request processing ---")
+    # Log full user message at INFO level
+    logger.info(f"Org: {organization_id}, Session: {session_id}, History: {len(chat_history) if chat_history else 0}, User Message: '{message}'") 
+
+    # TODO: Load/manage chat history based on session_id (if provided)
 
     # ---> Organization ID Validation <--- 
     try:
@@ -778,7 +714,7 @@ async def process_chat_message(
         logger.debug(f"Validated chat history contains {len(validated_history)} messages.")
         initial_messages.extend(validated_history)
     else:
-        logger.debug("No chat history provided.")
+        logger.debug(f"No chat history provided.")
         
     # Add the current user message
     initial_messages.append(HumanMessage(content=message))
@@ -794,7 +730,8 @@ async def process_chat_message(
         messages=initial_messages,
         tables=[],
         visualizations=[],
-        final_response_structure=None
+        final_response_structure=None,
+        request_id=req_id # Pass request_id into state
     )
 
     try:
@@ -803,7 +740,7 @@ async def process_chat_message(
         if asyncio.iscoroutine(graph_app):
             graph_app = await graph_app
             
-        logger.info("Invoking LangGraph workflow...")
+        logger.info(f"Invoking LangGraph workflow...")
         # ---> Apply Recursion Limit <--- 
         final_state = await graph_app.ainvoke(
             initial_state,
@@ -811,67 +748,38 @@ async def process_chat_message(
                  recursion_limit=settings.MAX_GRAPH_ITERATIONS,
                  configurable={})
         )
-        logger.info("LangGraph workflow invocation complete.")
+        logger.info(f"LangGraph workflow invocation complete.")
 
         # Extract final response
         if final_state.get("final_response_structure"):
             structured_response = final_state["final_response_structure"]
-            logger.info(f"Successfully obtained FinalApiResponseStructure: {structured_response}")
-            
+            logger.info(f"Successfully obtained FinalApiResponseStructure.")
             # Filter tables/visualizations based on include flags
-            final_tables = [
-                table for i, table in enumerate(final_state.get('tables', []))
-                if i < len(structured_response.include_tables) and structured_response.include_tables[i]
-            ]
-            final_visualizations = [
-                viz for i, viz in enumerate(final_state.get('visualizations', []))
-                if i < len(structured_response.include_visualizations) and structured_response.include_visualizations[i]
-            ]
+            final_tables = [t for i, t in enumerate(final_state.get('tables', [])) if i < len(structured_response.include_tables) and structured_response.include_tables[i]]
+            final_visualizations = [v for i, v in enumerate(final_state.get('visualizations', [])) if i < len(structured_response.include_visualizations) and structured_response.include_visualizations[i]]
+            # Log if flags resulted in different counts than available (can indicate LLM confusion)
+            if structured_response.include_tables.count(True) != len(final_tables) or structured_response.include_visualizations.count(True) != len(final_visualizations):
+                  logger.warning(f"Inclusion mismatch. State had T={len(final_state.get('tables',[]))}/V={len(final_state.get('visualizations',[]))}. Flags T={structured_response.include_tables}/V={structured_response.include_visualizations}. Included T={len(final_tables)}/V={len(final_visualizations)}.")
 
-            # --- Mismatch Check --- 
-            state_table_count = len(final_state.get('tables', []))
-            state_viz_count = len(final_state.get('visualizations', []))
-            llm_table_flags = len(structured_response.include_tables)
-            llm_viz_flags = len(structured_response.include_visualizations)
-            
-            if llm_table_flags != state_table_count:
-                logger.warning(f"Mismatch: LLM provided {llm_table_flags} include_tables flags ({structured_response.include_tables}), but state has {state_table_count} tables. Recalculating inclusion based on flags.")
-                # Recalculate based on available flags
-                final_tables = [
-                    table for i, table in enumerate(final_state.get('tables', []))
-                    if i < llm_table_flags and structured_response.include_tables[i]
-                ]
-            if llm_viz_flags != state_viz_count:
-                logger.warning(f"Mismatch: LLM provided {llm_viz_flags} include_visualizations flags ({structured_response.include_visualizations}), but state has {state_viz_count} visualizations. Recalculating inclusion based on flags.")
-                final_visualizations = [
-                    viz for i, viz in enumerate(final_state.get('visualizations', []))
-                    if i < llm_viz_flags and structured_response.include_visualizations[i]
-                ]
-            
-            logger.info(f"Final response includes {len(final_tables)} tables and {len(final_visualizations)} visualizations.")
-            
-            response_data = ChatData(
-                text=structured_response.text,
-                tables=final_tables if final_tables else None, # Return None if empty list
-                visualizations=final_visualizations if final_visualizations else None # Return None if empty list
-            )
-            response_keys = [k for k, v in response_data.model_dump().items() if v is not None]
-            logger.info(f"Successfully processed chat message. Response keys: {response_keys}")
+            response_data = ChatData(text=structured_response.text, tables=final_tables or None, visualizations=final_visualizations or None)
+            logger.info(f"Final AI Response Text: {structured_response.text[:250]}{'...' if len(structured_response.text) > 250 else ''}")
+            logger.info(f"Success. Returning response.")
+            logger.info(f"--- Finished request processing ---")
             return {"status": "success", "data": response_data.model_dump(exclude_none=True), "error": None}
         else:
-            # Fallback if final structure is missing (e.g., graph ended unexpectedly)
-            logger.error("Graph execution finished, but FinalApiResponseStructure was not found in the final state.")
-            # Check last message for potential error clues
-            last_msg_content = str(final_state['messages'][-1].content) if final_state['messages'] else "No messages."
-            fallback_text = f"An unexpected error occurred. Could not generate a final response. Last known state: {last_msg_content[:200]}..."
-            return {"status": "error", "error": fallback_text, "data": None}
+            logger.error(f"Graph finished, but FinalApiResponseStructure missing. Returning error.")
+            last_msg_content = str(final_state['messages'][-1].content) if final_state.get('messages') else "No messages."
+            # Simplified error details for log brevity
+            error_details = {"last_message_preview": last_msg_content[:100], "cause": "Final structure missing from state"}
+            return {"status": "error", "data": None, "error": {"code": "FINAL_STRUCTURE_MISSING", "message": "Unable to generate final response", "details": error_details}}
 
     except Exception as e:
-        logger.error(f"Unhandled exception during chat processing for org {organization_id}: {str(e)}", exc_info=True)
-        # Check if it's a recursion limit error
-        if "recursion limit" in str(e).lower():
-             return {"status": "error", "error": f"Processing aborted due to exceeding complexity limit ({settings.MAX_GRAPH_ITERATIONS} iterations). Please simplify your request.", "data": None}
-        return {"status": "error", "error": f"An internal error occurred: {str(e)}", "data": None}
+        logger.error(f"Unhandled exception during processing: {str(e)}", exc_info=True)
+        error_code = "INTERNAL_ERROR"; error_message = "Internal error."; error_details = {"exception": str(e)}
+        if "recursion limit" in str(e).lower(): error_code = "RECURSION_LIMIT_EXCEEDED"; error_message = "Request complexity limit exceeded."
+        return {"status": "error", "data": None, "error": {"code": error_code, "message": error_message, "details": error_details}}
+    finally:
+        logger.info(f"--- Finished request processing ---")
 
 
 # --- test_azure_openai_connection() remains the same ---

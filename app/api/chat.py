@@ -1,9 +1,10 @@
 import logging
 import uuid
+import asyncio
 from datetime import datetime
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 # from pydantic import BaseModel # No longer directly needed here
 
 # Import the refactored process_chat_message
@@ -18,51 +19,55 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 @router.post("/chat", response_model=ChatResponse, tags=["chat"])
-async def chat(request: ChatRequest):
+async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
     """Processes a chat message using the LangGraph agent and returns a response."""
+    # Create a unique ID for this request to track any leaked tasks
+    request_id = str(uuid.uuid4())
+    logger.info(f"Starting chat request for org {request.organization_id}, session: {request.session_id}")
+    
+    # Create a new task group to ensure all tasks are properly awaited
+    # This helps prevent "leaking" tasks across requests
     try:
-        # logger.info(f"Received chat request from user {request.user_id} with session_id: {request.session_id}")
-        logger.info(f"Received chat request for org {request.organization_id} with session_id: {request.session_id}")
-
-        # The LangGraph agent now handles memory via session_id internally.
-        # We pass the necessary info directly to process_chat_message.
-        # No need to manually load/add history here.
-
-        # Process the message using the refactored function
-        api_response_dict = await process_chat_message(
-            # user_id=request.user_id, # Removed
-            organization_id=request.organization_id,
-            message=request.message,
-            session_id=request.session_id, # Pass session_id directly
-            # chat_history is no longer passed here
+        # Set a timeout for the entire processing to prevent hung requests
+        api_response_dict = await asyncio.wait_for(
+            process_chat_message(
+                organization_id=request.organization_id,
+                message=request.message,
+                session_id=request.session_id,
+                request_id=request_id  # Pass request ID for tracing, not logging
+            ),
+            timeout=60.0  # 60 second timeout to prevent infinite hang
         )
+        
+        logger.info(f"Successfully completed chat request")
+        
+        # Construct the response model
+        response = ChatResponse(**api_response_dict)
+        return response
 
-        # process_chat_message now returns the complete dictionary needed for ChatResponse
-        # We just need to construct the Pydantic model from it.
-        return ChatResponse(**api_response_dict)
-
+    except asyncio.TimeoutError:
+        logger.error(f"Request timed out after 60 seconds (ReqID: {request_id})")
+        return ChatResponse(
+            status="error",
+            data=None,
+            error={
+                "code": "REQUEST_TIMEOUT",
+                "message": "The request took too long to process. Please try again with a simpler query.",
+                "details": {"request_id": request_id}
+            },
+            timestamp=datetime.now()
+        )
     except Exception as e:
-        # Generic error handler for unexpected issues in this layer
-        logger.error(f"Unexpected error in chat API endpoint: {str(e)}", exc_info=True)
-        # Use a standard error structure, consistent with how process_chat_message might return errors
-        error_response = ChatResponse(
-             status="error",
-             data=None,
-             error={
-                 "code": "API_ENDPOINT_ERROR",
-                 "message": "An unexpected error occurred handling your request.",
-                 "details": {"error": str(e)}
-             },
-             timestamp=datetime.now()
+        # Generic error handler for unexpected issues
+        logger.error(f"Unexpected error in chat API endpoint: {str(e)} (ReqID: {request_id})", exc_info=True)
+        
+        return ChatResponse(
+            status="error",
+            data=None,
+            error={
+                "code": "API_ENDPOINT_ERROR",
+                "message": "An unexpected error occurred handling your request.",
+                "details": {"error": str(e), "request_id": request_id}
+            },
+            timestamp=datetime.now()
         )
-        # Return it directly, maybe with a 500 status code, although response_model handles structure
-        # Consider raising HTTPException for clearer status codes if needed, but
-        # returning the ChatResponse structure ensures consistency.
-        # For now, just return the structured error within a 200 OK,
-        # as process_chat_message also returns errors this way.
-        return error_response
-        # Alternative: Raise HTTPException for non-200 status
-        # raise HTTPException(
-        #     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        #     detail=error_response.dict() # Send the structured error as detail
-        # )

@@ -11,10 +11,13 @@ from fastapi.staticfiles import StaticFiles
 from app.api import chat, health
 from app.core.config import settings
 from app.core.logging import setup_logging
+from app.db.connection import create_db_engines, validate_schema_definitions
 
-# Setup logging
+# --- Setup logging FIRST --- #
 setup_logging()
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__) # Get logger after setup
+logger.info("Logging configured.")
+# ------------------------ #
 
 # --- CORS Configuration ---
 # Define the origins allowed to access your API
@@ -33,9 +36,19 @@ origins = [
 # Create FastAPI app
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting up Bibliotheca Chatbot API")
+    # Use the configured logger
+    logger.info("Lifespan: Starting up Bibliotheca Chatbot API")
+    logger.info("Lifespan: Initializing async database connections")
+    await create_db_engines()
+    
+    if settings.VALIDATE_SCHEMA_ON_STARTUP:
+        logger.info("Lifespan: Validating database schema definitions")
+        await validate_schema_definitions()
+    
+    logger.info("Lifespan: Application startup tasks complete.")
     yield
-    logger.info("Shutting down Bibliotheca Chatbot API")
+    
+    logger.info("Lifespan: Shutting down Bibliotheca Chatbot API")
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -62,21 +75,17 @@ app.add_middleware(
 app.include_router(chat.router, prefix="/api/v1", tags=["chat"])
 app.include_router(health.router, prefix="/api/v1", tags=["health"])
 
-# Startup event
-@app.on_event("startup")
-async def startup_event():
-    logger.info("Starting up Bibliotheca Chatbot API")
-
-# Shutdown event
-@app.on_event("shutdown")
-async def shutdown_event():
-    logger.info("Shutting down Bibliotheca Chatbot API")
+logger.info("FastAPI app created and configured.")
 
 if __name__ == "__main__":
+    # Ensure logging is setup before uvicorn potentially takes over
+    logger.info(f"Starting Uvicorn server. Host=0.0.0.0, Port=8000, Reload={settings.DEBUG}")
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
         port=8000,
         reload=settings.DEBUG,
-        log_level="info",
+        log_level=settings.LOG_LEVEL.lower(), # Use level from settings
+        # Use default Uvicorn log config unless specified otherwise
+        # log_config=None 
     ) 

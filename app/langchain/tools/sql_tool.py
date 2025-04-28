@@ -17,7 +17,6 @@ from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 from pydantic import BaseModel, Field
 
 from app.core.config import settings
-from app.db.connection import get_db_engine
 from app.db.schema_definitions import SCHEMA_DEFINITIONS
 
 logger = logging.getLogger(__name__)
@@ -111,12 +110,14 @@ class SQLQueryTool(BaseTool):
         
         return "\n".join(schema_info)
     
-    def _generate_sql(
+    async def _generate_sql(
         self, 
         query_description: str, 
         db_name: str
     ) -> Tuple[str, Dict[str, Any]]:
         """Generate SQL with placeholders and parameters from a natural language query description using LCEL, enforcing organization filtering."""
+        log_prefix = f"[Org: {self.organization_id}] [SQLQueryTool] " # Add prefix
+        logger.debug(f"{log_prefix}Generating SQL for DB '{db_name}', Desc: '{query_description[:100]}...'") # DEBUG for internal step
         schema_info = self._get_schema_info(db_name)
         
         llm = AzureChatOpenAI(
@@ -138,20 +139,20 @@ Schema:
 Query description: {query_description}
 
 Important Guidelines:
-1. Use parameter placeholders (e.g., :filter_value, :hierarchy_id) for ALL dynamic values derived from the query description (like names, IDs, specific filter values) EXCEPT for the mandatory :organization_id and time-related values. DO NOT use parameters for date/time calculations.
-2. Generate a valid JSON dictionary mapping placeholder names (without the colon) to their actual values. This MUST include `organization_id`.
-3. Quote table and column names with double quotes (e.g., "hierarcyCaches", "createdAt"). Use the actual table names from the schema (e.g., '5', '8') when writing the SQL, even though logical names ('events', 'footfall') are used in the schema description itself.
-4. **Mandatory Organization Filtering:** ALWAYS filter results by the organization ID. Use the parameter `:organization_id`. Add the appropriate WHERE clause:
+1.  **Parameter Placeholders:** Use parameter placeholders (e.g., :filter_value, :hierarchy_id) for ALL dynamic values derived from the query description (like names, IDs, specific filter values) EXCEPT for the mandatory `:organization_id` and time-related values. **DO NOT** use parameters for date/time calculations.
+2.  **Parameter Dictionary:** Generate a valid JSON dictionary mapping placeholder names (without the colon) to their actual values. This MUST include `organization_id`.
+3.  **Quoting & Naming:** Quote table and column names with double quotes (e.g., "hierarchyCaches", "createdAt"). Use the actual table names from the schema (e.g., '5', '8') when writing the SQL, even though logical names ('events', 'footfall') are used in the schema description itself.
+4.  **Mandatory Organization Filtering:** ALWAYS filter results by the organization ID. Use the parameter `:organization_id`. Add the appropriate WHERE clause:
     *   If querying table '5' (event data), add `"5"."organizationId" = :organization_id` to your WHERE clause (using AND if other conditions exist).
     *   If querying `hierarchyCaches` directly for the organization's details, filter using `"id" = :organization_id`.
     *   If querying `hierarchyCaches` for specific locations *within* an organization, ensure the data relates back to the `:organization_id` (e.g., via JOIN or direct filter on `parentId` if appropriate).
     *   If querying table '8' (footfall data), add `"8"."organizationId" = :organization_id` to your WHERE clause.
     *   You MUST include `:organization_id` as a key in the `params` dictionary with the correct value. **Use the exact `organization_id` value provided to you in the context (e.g., '{organization_id}'), do NOT use example UUIDs or placeholders like 'your-organization-uuid'.**
-5. **JOINs for Related Data:** When joining table '5' or '8' and `hierarchyCaches`, use appropriate keys like `"5"."hierarchyId" = hc."id"` or `"8"."hierarchyId" = hc."id"`. Remember to apply the organization filter (Guideline #4).
-6. **Case Sensitivity:** PostgreSQL is case-sensitive; respect exact table/column capitalization.
-7. **Column Selection:** Use specific column selection instead of SELECT *.
-8. **Sorting:** Add ORDER BY clauses for meaningful sorting, especially when LIMIT is used.
-9. **LIMIT Clause:**
+5.  **JOINs for Related Data:** When joining table '5' or '8' and `hierarchyCaches`, use appropriate keys like `"5"."hierarchyId" = hc."id"` or `"8"."hierarchyId" = hc."id"`. Remember to apply the organization filter (Guideline #4).
+6.  **Case Sensitivity:** PostgreSQL is case-sensitive; respect exact table/column capitalization.
+7.  **Column Selection:** Use specific column selection instead of SELECT *.
+8.  **Sorting:** Add ORDER BY clauses for meaningful sorting, especially when LIMIT is used.
+9.  **LIMIT Clause:**
     *   For standard SELECT queries retrieving multiple rows, ALWAYS include `LIMIT 50` at the end.
     *   **DO NOT** add `LIMIT` for aggregate queries (like COUNT(*), SUM(...)) expected to return a single summary row.
 10. **Aggregations (COUNT vs SUM):**
@@ -173,13 +174,15 @@ Important Guidelines:
     *   Ensure both the specific value and the benchmark value have clear, user-friendly aliases.
 13. **Time Filtering (Generate SQL Directly):**
     *   If the `query_description` includes time references (e.g., "last week", "yesterday", "past 3 months", "since June 1st", "before 2024"), you MUST generate the appropriate SQL `WHERE` clause condition directly.
-    *   Use relevant SQL functions like `NOW()`, `CURRENT_DATE`, `INTERVAL`, `DATE_TRUNC`, `EXTRACT`, and comparison operators (`>=`, `<`, `BETWEEN`).
+    *   Use relevant SQL functions like `NOW()`, `CURRENT_DATE`, `INTERVAL`, `DATE_TRUNC`, `EXTRACT`, `MAKE_DATE`, and comparison operators (`>=`, `<`, `BETWEEN`).
     *   **Relative Time Interpretation:** For simple relative terms like "last week", "last month", prioritize using straightforward intervals like `NOW() - INTERVAL '7 days'` or `NOW() - INTERVAL '1 month'`, respectively. Use `DATE_TRUNC` or specific date ranges only if the user query explicitly demands calendar alignment (e.g., "the week starting Monday", "the calendar month of March").
     *   **Relative Months/Years:** For month names (e.g., "March", "in June") without a specified year, **ALWAYS** assume the **current year** in your date logic. For years alone (e.g., "in 2024"), query the whole year. **Critically, incorporate the current year directly into your date comparisons using `NOW()` or `CURRENT_DATE` where appropriate, don't just extract the year separately and then use a hardcoded year in the comparison.**
+    *   **Specific Day + Month (No Year):** For specific dates without a year (e.g., "April 1st", "on the 5th of June"), you MUST construct the date using the **current year**. Use appropriate SQL date functions like `MAKE_DATE(EXTRACT(YEAR FROM NOW())::int, <month_number>, <day_number>)` for PostgreSQL.
     *   Identify the correct timestamp column for filtering (e.g., `"eventTimestamp"` for table `"5"` and `"8"`, `"createdAt"` for others - check schema).
     *   Example for "last week": `WHERE "eventTimestamp" >= NOW() - INTERVAL '7 days'` # Prefer this
     *   Example for "yesterday": `WHERE DATE_TRUNC('day', "eventTimestamp") = CURRENT_DATE - INTERVAL '1 day'` # DATE_TRUNC makes sense here
     *   Example for "March" (current year): `WHERE EXTRACT(MONTH FROM "eventTimestamp") = 3 AND EXTRACT(YEAR FROM "eventTimestamp") = EXTRACT(YEAR FROM NOW())` # Check month AND current year
+    *   Example for "April 1st" (current year): `WHERE DATE_TRUNC('day', "eventTimestamp") = MAKE_DATE(EXTRACT(YEAR FROM NOW())::int, 4, 1)` # Use MAKE_DATE with current year
     *   Example for "first week of February" (current year): `WHERE "eventTimestamp" >= DATE_TRUNC('year', NOW()) + INTERVAL '1 month' AND "eventTimestamp" < DATE_TRUNC('year', NOW()) + INTERVAL '1 month' + INTERVAL '7 days'` 
     *   Example for "June 2024": `WHERE "eventTimestamp" >= '2024-06-01' AND "eventTimestamp" < '2024-07-01'`
     *   **DO NOT** use parameters like `:start_date` or `:end_date` for these time calculations.
@@ -218,7 +221,7 @@ Example (Aggregate Query for the Org):
         
         sql_chain = prompt | llm | JsonOutputParser(pydantic_object=SQLOutput)
         
-        logger.debug(f"Invoking SQL generation chain for org {self.organization_id} with query: {query_description}")
+        logger.debug(f"{log_prefix}Invoking SQL generation chain for org {self.organization_id} with query: {query_description}")
             
         try:
             invoke_payload = {
@@ -227,41 +230,48 @@ Example (Aggregate Query for the Org):
                 "query_description": query_description,
             }
             
-            structured_output = sql_chain.invoke(invoke_payload)
-            logger.debug(f"Raw LLM Output for SQL generation: {structured_output}") 
+            # Use ainvoke for async LLM call
+            structured_output = await sql_chain.ainvoke(invoke_payload)
+            logger.debug(f"{log_prefix}Raw LLM Output for SQL generation: {structured_output}") 
             
             sql_query = structured_output.get('sql', '')
             parameters = structured_output.get('params', {})
             
             if not isinstance(sql_query, str) or not isinstance(parameters, dict):
-                 logger.error(f"LLM returned unexpected types. SQL: {type(sql_query)}, Params: {type(parameters)}")
+                 logger.error(f"{log_prefix}LLM returned unexpected types. SQL: {type(sql_query)}, Params: {type(parameters)}")
                  raise ValueError("LLM failed to return the expected SQL/parameter structure.")
             
             if not sql_query:
                 raise ValueError("LLM failed to generate an SQL query string.")
 
             if 'organization_id' not in parameters:
-                logger.warning(f":organization_id missing from LLM params. Manually adding {self.organization_id}.")
+                logger.warning(f"{log_prefix}:organization_id missing from LLM params. Manually adding {self.organization_id}.")
                 parameters['organization_id'] = self.organization_id
             elif parameters['organization_id'] != self.organization_id:
-                logger.warning(f"LLM parameter :organization_id ({parameters['organization_id']}) != tool's ({self.organization_id}). Overwriting.")
+                logger.warning(f"{log_prefix}LLM parameter :organization_id ({parameters['organization_id']}) != tool's ({self.organization_id}). Overwriting.")
                 parameters['organization_id'] = self.organization_id
             else:
-                logger.debug(f":organization_id ({self.organization_id}) present and correct in LLM params.")
-                
+                 logger.debug(f"{log_prefix}LLM-provided :organization_id ({parameters['organization_id']}) matches tool's.")
+            
             # Remove any user_id parameter if LLM included it erroneously
             if 'user_id' in parameters:
-                logger.warning("LLM included :user_id parameter erroneously. Removing.")
+                logger.warning(f"{log_prefix}LLM included :user_id parameter erroneously. Removing.")
                 del parameters['user_id']
             
-            logger.debug(f"Generated SQL: {sql_query}, Params: {parameters}")
+            # --- Log the Generated SQL --- # 
+            logger.info(f"{log_prefix}Generated SQL: {sql_query} | Params: {parameters}")
+            # --- End Log --- #
+
             return sql_query, parameters
         except Exception as e:
-            logger.error(f"Error generating SQL: {e}", exc_info=True)
-            raise
+            logger.error(f"{log_prefix}Error during SQL generation: {e}", exc_info=True)
+            # Re-raise or handle appropriately
+            raise ValueError(f"Failed to generate SQL: {e}") from e
     
-    def _execute_sql(self, sql: str, parameters: Dict[str, Any], db_name: str) -> Dict:
-        """Execute SQL with parameters and return results."""
+    async def _execute_sql(self, sql: str, parameters: Dict[str, Any], db_name: str) -> Dict:
+        """Execute SQL with parameters and return results (asynchronous version)."""
+        log_prefix = f"[Org: {self.organization_id}] [SQLQueryTool] " # Add prefix
+        logger.debug(f"{log_prefix}Executing SQL on DB '{db_name}'...") # DEBUG for execution start
         MAX_ROWS = 50 # Used for Python-level truncation check if needed (e.g., if LLM forgets LIMIT)
         original_sql = sql # Keep for logging/checks if needed
         
@@ -277,44 +287,41 @@ Example (Aggregate Query for the Org):
             first_statement_type = parsed_statements[0].get_type()
             if first_statement_type not in ('SELECT', 'UNKNOWN'): # UNKNOWN can be CTEs (WITH ... SELECT)
                  if first_statement_type != 'UNKNOWN':
-                     logger.warning(f"Generated SQL might not be a SELECT statement (Type: {first_statement_type}). Proceeding cautiously.")
-                     # Optionally raise stricter error:
-                     # raise ValueError(f"Generated SQL is not a SELECT statement (Type: {first_statement_type}). Only SELECT is allowed.")
+                     logger.warning(f"{log_prefix}Generated SQL might not be a SELECT statement (Type: {first_statement_type}). Proceeding cautiously.")
             
-            logger.debug("SQL syntax parsed successfully.")
+            logger.debug(f"{log_prefix}SQL syntax parsed successfully.")
             
         except ImportError:
-            logger.warning("sqlparse library not installed or found. Skipping SQL syntax validation.")
+            logger.warning(f"{log_prefix}sqlparse library not installed or found. Skipping SQL syntax validation.")
         except ValueError as ve:
-             logger.error(f"SQL validation failed: {ve}. SQL: {sql}", exc_info=True)
+             logger.error(f"{log_prefix}SQL validation failed: {ve}. SQL: {sql[:200]}...", exc_info=False)
              raise # Re-raise the ValueError to be caught by _run
         except Exception as validation_err:
-            logger.error(f"Unexpected error during SQL validation: {validation_err}. SQL: {sql}", exc_info=True)
+            logger.error(f"{log_prefix}Unexpected error during SQL validation: {validation_err}. SQL: {sql}", exc_info=True)
             raise ValueError(f"Generated SQL failed validation: {validation_err}")
         # --- End Validation ---
         
         # <<< ADDED: CRITICAL Check for organization_id before execution >>>
         if 'organization_id' not in parameters or parameters['organization_id'] != self.organization_id:
              error_msg = f"SECURITY CHECK FAILED: organization_id mismatch/missing in parameters before execution. Expected {self.organization_id}, got {parameters.get('organization_id')}. Aborting."
-             logger.error(error_msg)
+             logger.error(f"{log_prefix}{error_msg}")
              raise ValueError(error_msg)
         
-        engine = get_db_engine(db_name)
-        if not engine:
-            raise ValueError(f"Database engine for '{db_name}' not found")
+        # Import here to avoid circular imports
+        from app.db.connection import get_async_db_connection
         
         # Log execution details - be mindful of sensitive data in parameters in production
-        logger.debug(f"Executing SQL for org {self.organization_id}: {sql}")
-        logger.debug(f"With Parameters: {parameters}") # Ensure datetime objects are handled correctly by logger/SQLAlchemy
+        logger.debug(f"{log_prefix}Executing SQL (async) for org {self.organization_id}: {sql}")
+        logger.debug(f"{log_prefix}With Parameters: {parameters}")
         
         try:
-            with engine.connect() as conn:
+            async with get_async_db_connection(db_name) as conn:
                 # Execute with parameters for safety
-                result = conn.execute(text(sql), parameters)
+                result = await conn.execute(text(sql), parameters)
                 columns = list(result.keys())
                 
-                # Fetch rows
-                raw_rows = result.fetchall() 
+                # Fetch rows asynchronously
+                raw_rows = result.fetchall()
                 
                 truncated = False
                 total_count = len(raw_rows)
@@ -326,7 +333,7 @@ Example (Aggregate Query for the Org):
                     # This acts as a safeguard if the LLM generates a large LIMIT or no LIMIT.
                     truncated = True
                     raw_rows = raw_rows[:MAX_ROWS]
-                    logger.warning(f"Query results exceeded {MAX_ROWS} rows. Truncating.")
+                    logger.warning(f"{log_prefix}Query results exceeded {MAX_ROWS} rows. Truncating.")
                 
                 rows = [list(row) for row in raw_rows]
                 
@@ -334,30 +341,32 @@ Example (Aggregate Query for the Org):
                      if len(rows) == 1 and len(columns) == 1:
                          return {"columns": columns, "rows": rows}
                      else:
-                         logger.warning(f"COUNT query returned unexpected structure: {columns}, {rows}")
-                         # Fall through to return structure anyway
-                 
+                         logger.warning(f"{log_prefix}COUNT query returned unexpected structure: {columns}, {rows}")
+                
                 # Include truncation info if applicable
                 response_data = {"columns": columns, "rows": rows}
                 if truncated:
                     response_data["metadata"] = {"truncated": True, "total_rows_returned": total_count, "rows_shown": MAX_ROWS}
+                    logger.warning(f"{log_prefix}Query results truncated to {MAX_ROWS} rows (from {total_count}).")
                     
                 return response_data
                 
         except SQLAlchemyError as e:
             # Log the specific SQL and params that caused the error
-            logger.error(f"SQL execution error for org {self.organization_id}, query: {sql}, params: {parameters}. Error: {str(e)}", exc_info=True)
+            logger.error(f"{log_prefix}SQL execution error (async) for org {self.organization_id}, query: {sql}, params: {parameters}. Error: {str(e)}", exc_info=True)
             # Provide a more informative error message
+            logger.debug(f"{log_prefix}Failed SQL: {sql[:200]}... | Params: {parameters}") # Log failed SQL on error
             raise ValueError(f"Database error executing query. Please check query syntax and parameters. Details: {str(e)}")
         except Exception as e: # Catch other potential errors (like connection issues)
-            logger.error(f"Unexpected error during SQL execution for org {self.organization_id}: {e}", exc_info=True)
+            logger.error(f"{log_prefix}Unexpected error during SQL execution (async) for org {self.organization_id}: {e}", exc_info=True)
             raise ValueError(f"An unexpected error occurred during query execution: {str(e)}")
     
-    def _run(
+    async def _run(
         self, query_description: str, db_name: Optional[str] = None
     ) -> str:
-        """Run the tool: generate parameterized SQL, execute, format results."""
-        logger.info(f"Executing SQL query tool for org {self.organization_id} with description: '{query_description}'")
+        """Run the tool asynchronously using async database connections."""
+        log_prefix = f"[Org: {self.organization_id}] [SQLQueryTool] " # Add prefix
+        logger.info(f"{log_prefix}Executing SQL query tool (async) for org {self.organization_id} with description: '{query_description[:100]}...'")
         
         target_db = db_name or self.selected_db
         if not target_db:
@@ -367,21 +376,22 @@ Example (Aggregate Query for the Org):
             # Fallback to the first defined database schema if none is specified
             try:
                 target_db = next(iter(SCHEMA_DEFINITIONS.keys()))
-                logger.info(f"No database specified, using first defined schema: {target_db}")
+                logger.info(f"{log_prefix}No database specified, using first defined schema: {target_db}")
             except StopIteration: # Handle empty SCHEMA_DEFINITIONS case
                  logger.error("SCHEMA_DEFINITIONS is empty. Cannot select a default database.")
                  raise ValueError("No database schemas available to select a default.")
 
         self.selected_db = target_db # Store for potential future calls within the same agent run
 
-        # Execute the main SQL generation and execution logic
+        # Execute the main SQL generation and execution logic with async
         try:
-            # Generate SQL and parameters (no dates passed)
-            sql, parameters = self._generate_sql(query_description, target_db)
+            # Await the now async _generate_sql
+            sql, parameters = await self._generate_sql(query_description, target_db)
             
-            results = self._execute_sql(sql, parameters, target_db)
+            # Use true async SQL execution
+            results = await self._execute_sql(sql, parameters, target_db)
             row_count = len(results.get('rows', []))
-            logger.info(f"SQL query returned {row_count} rows for org {self.organization_id}, description: '{query_description}'")
+            logger.info(f"{log_prefix}Completed successfully. Returned {row_count} rows.") # INFO completion summary
             
             text_summary = f"Retrieved {row_count} rows of data matching your query."
             if results.get("metadata", {}).get("truncated"):
@@ -394,7 +404,7 @@ Example (Aggregate Query for the Org):
             return json.dumps(output_dict, default=json_default)
             
         except ValueError as ve: # Catch generation/execution ValueErrors
-             logger.error(f"SQL Tool failed for org {self.organization_id}, description '{query_description}': {ve}", exc_info=False) # Keep log cleaner
+             logger.error(f"{log_prefix}Failed: {ve}", exc_info=False) # Log known errors concisely
              # Return structured error message to the agent/user
              fallback_output = {
                  "table": {"columns": ["Error"], "rows": [[f"Failed to process query: {ve}"]]},
@@ -402,21 +412,26 @@ Example (Aggregate Query for the Org):
              }
              return json.dumps(fallback_output, default=json_default)
         except Exception as e: # Catch other unexpected errors
-            logger.exception(f"Unexpected critical error in SQL Tool for org {self.organization_id}, description '{query_description}': {e}", exc_info=True)
+            logger.exception(f"{log_prefix}Unexpected critical error in SQL Tool for org {self.organization_id}, description '{query_description}': {e}", exc_info=True)
             fallback_output = {
                  "table": {"columns": ["Error"], "rows": [["An unexpected critical error occurred."]]},
                  "text": f"An unexpected critical error occurred while processing your query."
              }
             return json.dumps(fallback_output, default=json_default)
-    
-    async def _arun(
-        self, query_description: str, db_name: Optional[str] = None
-    ) -> str:
-        """Run the tool asynchronously."""
-        # Still uses run_in_executor for now as core logic is synchronous.
-        # True async requires asyncpg/aiopg integration and async LLM calls.
-        loop = asyncio.get_event_loop()
-        # Ensure _run has access to self correctly
-        db_to_use = db_name or self.selected_db
-        func = functools.partial(self._run, query_description=query_description, db_name=db_to_use)
-        return await loop.run_in_executor(None, func)
+
+    # Implement ainvoke to ensure compatibility with BaseTool
+    async def ainvoke(self, input_data: Dict[str, Any], **kwargs: Any) -> Any:
+        """Override ainvoke to ensure it calls our async _run method."""
+        if not isinstance(input_data, dict):
+            raise ValueError(f"Expected dict input, got {type(input_data)}")
+        
+        query_description = input_data.get("query_description", "")
+        db_name = input_data.get("db_name")
+        
+        if not query_description:
+            return json.dumps({
+                "table": {"columns": ["Error"], "rows": [["No query description provided"]]},
+                "text": "Error: No query description provided in input data."
+            }, default=json_default)
+            
+        return await self._run(query_description=query_description, db_name=db_name, **kwargs)

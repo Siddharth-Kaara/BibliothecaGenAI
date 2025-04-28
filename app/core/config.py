@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     DATABASE_URLS: str = ""  # Format: "db1=postgresql://user:pass@host:port/db1,db2=postgresql://user:pass@host:port/db2"
     VALIDATE_SCHEMA_ON_STARTUP: bool = True  # Whether to validate schema definitions against actual DB
     DB_POOL_SIZE: int = 10 # Default pool size for database connections
+    DB_MAX_OVERFLOW: int = 20 # Default max overflow connections (Added sensible default)
+    DB_POOL_TIMEOUT: int = 30 # Default seconds to wait for connection (Kept original implicit default)
+    DB_POOL_RECYCLE: int = 1800 # Default seconds after which connections are recycled (e.g., 30 mins)
     
     # Azure OpenAI settings
     AZURE_OPENAI_API_KEY: str = ""

@@ -44,27 +44,50 @@ def setup_logging():
     root_logger.addHandler(file_handler)
     
     # Set specific logger levels, respecting the main debug level
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
-    logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING) # Added to reduce font scan noise
-
-    # Allow Uvicorn debug logs if main level is debug
-    uvicorn_level = log_level if log_level == logging.DEBUG else logging.INFO
-    logging.getLogger("uvicorn").setLevel(uvicorn_level)
-    logging.getLogger("uvicorn.error").setLevel(uvicorn_level) # Also control uvicorn error logger
-    logging.getLogger("uvicorn.access").setLevel(uvicorn_level) # And access logger
-
-    # Allow OpenAI/LangChain debug logs if main level is debug
-    # Note: LangChain might use other logger names too, but 'openai' is common for LLM calls
-    openai_level = log_level if log_level == logging.DEBUG else logging.WARNING
-    logging.getLogger("openai").setLevel(openai_level) # Base OpenAI client
+    # Lower the level of noisy libraries unless LOG_LEVEL is DEBUG
+    default_external_level = logging.WARNING if log_level > logging.DEBUG else logging.INFO
+    logging.getLogger("httpx").setLevel(default_external_level)
+    logging.getLogger("openai").setLevel(default_external_level) # Base OpenAI client
     logging.getLogger("openai._base_client").setLevel(logging.WARNING) # Reduce spam from raw requests
     logging.getLogger("httpcore").setLevel(logging.WARNING) # Reduce spam from HTTP library
+    logging.getLogger("langchain").setLevel(logging.INFO if log_level > logging.DEBUG else logging.DEBUG) # Langchain core
+    logging.getLogger("langgraph").setLevel(logging.INFO if log_level > logging.DEBUG else logging.DEBUG) # Langgraph core
+    logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+    logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING)
+
+    # --- Configure Uvicorn Loggers --- #
+    # Get Uvicorn loggers
+    uvicorn_logger = logging.getLogger("uvicorn")
+    uvicorn_error_logger = logging.getLogger("uvicorn.error")
+    uvicorn_access_logger = logging.getLogger("uvicorn.access")
     
-    # Potentially add other LangChain/LangGraph loggers if needed, e.g., 'langchain', 'langgraph'
-    logging.getLogger("langchain").setLevel(log_level) # Explicitly set langchain level
-    logging.getLogger("langgraph").setLevel(log_level) # Explicitly set langgraph level
-    # Force the agent logger to INFO to reduce verbosity, regardless of main log_level
-    logging.getLogger("app.langchain.agent").setLevel(logging.INFO)
+    # DO NOT clear existing handlers - let Uvicorn use its defaults
+    # uvicorn_logger.handlers.clear()
+    # uvicorn_error_logger.handlers.clear()
+    # uvicorn_access_logger.handlers.clear()
+
+    # Set levels based on the main log level
+    uvicorn_level = log_level # Allow Uvicorn DEBUG if main level is DEBUG
+    uvicorn_logger.setLevel(uvicorn_level)
+    uvicorn_error_logger.setLevel(uvicorn_level)
+    uvicorn_access_logger.setLevel(uvicorn_level) # Access logs often desired even if INFO
+
+    # Prevent Uvicorn loggers from propagating to OUR root logger handlers
+    uvicorn_logger.propagate = False
+    uvicorn_error_logger.propagate = False
+    uvicorn_access_logger.propagate = False
+    # --- End Uvicorn Configuration --- #
+
+    # --- Configure Application Loggers --- #
+    # Ensure our core agent/tool logs are visible based on main LOG_LEVEL
+    logging.getLogger("app").setLevel(log_level) # Set base level for our app
+    logging.getLogger("app.langchain.agent").setLevel(log_level) # Explicitly match main level
+    logging.getLogger("app.langchain.tools").setLevel(log_level) # Set base for tools
+    # Reduce verbosity of DB connection logs unless main level is DEBUG
+    db_conn_level = logging.INFO if log_level > logging.DEBUG else logging.DEBUG
+    logging.getLogger("app.db.connection").setLevel(db_conn_level)
+    # Example: If a specific tool is too noisy, set its level higher here
+    # logging.getLogger("app.langchain.tools.sql_tool").setLevel(logging.INFO) 
+    # --- End Application Logger Configuration --- #
 
     return root_logger

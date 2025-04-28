@@ -11,7 +11,7 @@ from sqlalchemy import text
 from langchain_core.output_parsers import StrOutputParser
 
 from app.core.config import settings
-from app.db.connection import get_db_engine
+from app.db.connection import get_async_db_connection
 from app.langchain.tools.sql_tool import SQLQueryTool
 
 logger = logging.getLogger(__name__)
@@ -99,7 +99,7 @@ class SummarySynthesizerTool(BaseTool):
             return [query]
     
     async def _execute_subqueries_concurrently(self, subqueries: List[str]) -> List[Tuple[str, Dict]]:
-        """Execute subqueries concurrently using sql_tool._arun and asyncio.gather."""
+        """Execute subqueries concurrently using sql_tool._run and asyncio.gather."""
         results = []
         
         # Create SQL tool instance ONCE
@@ -109,9 +109,9 @@ class SummarySynthesizerTool(BaseTool):
             """Helper coroutine to run one subquery and handle errors."""
             subquery_result_str = "{}" # Initialize for potential error logging
             try:
-                # Execute asynchronously using sql_tool's _arun
+                # Execute asynchronously using sql_tool's _run (which is now async)
                 # It returns a JSON STRING
-                subquery_result_str = await sql_tool._arun(
+                subquery_result_str = await sql_tool._run(
                     query_description=subquery, 
                     db_name="report_management" # Assuming default DB
                 )
@@ -137,7 +137,7 @@ class SummarySynthesizerTool(BaseTool):
                  logger.error(f"Failed to decode JSON from SQL tool for subquery '{subquery}': {json_e}. Raw string: '{subquery_result_str}'")
                  return (subquery, {"error": "Failed to parse SQL tool output", "table": {"columns": ["Error"], "rows": [["Invalid JSON received"]]}, "text": "Invalid JSON received"})
             except Exception as e:
-                logger.error(f"Exception executing subquery '{subquery}' via _arun for org {self.organization_id}: {str(e)}", exc_info=True)
+                logger.error(f"Exception executing subquery '{subquery}' via _run for org {self.organization_id}: {str(e)}", exc_info=True)
                 # Ensure the fallback structure matches what _synthesize_results expects
                 return (subquery, {"error": f"Execution Error: {str(e)}", "table": {"columns": ["Error"], "rows": [[str(e)]]}, "text": f"Execution Error: {str(e)}"})
 
@@ -210,58 +210,43 @@ class SummarySynthesizerTool(BaseTool):
         
         return summary.strip()
     
-    async def _arun(self, query: str) -> Dict[str, str]:
-        """Run the tool asynchronously with concurrent sub-query execution.
-           Returns a dictionary containing ONLY the summary text.
-        """
-        logger.info(f"Executing ASYNC summary synthesizer tool for org {self.organization_id}")
+    async def _run(self, query: str) -> Dict[str, str]:
+        log_prefix = f"[Org: {self.organization_id}] [SummaryTool] "
+        logger.info(f"{log_prefix}Executing. Query: '{query[:100]}...'")
         
         subquery_results: List[Tuple[str, Dict]] = []
         summary = "An error occurred during summary generation."
         
-        # Decompose the query (sync for now, could be async)
         try:
             subqueries = self._decompose_query(query)
-            logger.info(f"Decomposed query into {len(subqueries)} subqueries")
+            logger.info(f"{log_prefix}Decomposed into {len(subqueries)} subqueries.")
         except Exception as e:
-             logger.error(f"Error during query decomposition: {e}", exc_info=True)
-             return {"text": f"Failed to understand the request structure: {e}"} # Return only text error
+             logger.error(f"{log_prefix}Error during query decomposition: {e}", exc_info=True)
+             return {"text": f"Failed to understand request structure: {e}"} 
 
-        # Execute subqueries concurrently
         try:
             subquery_results = await self._execute_subqueries_concurrently(subqueries)
         except Exception as e:
-            logger.error(f"Error during concurrent subquery execution: {e}", exc_info=True)
-            # Attempt synthesis with partial/error results if possible, or return error
-            # For simplicity now, return a generic text error
-            return {"text": f"An error occurred while fetching data: {e}"}
+            logger.error(f"{log_prefix}Error during concurrent subquery execution: {e}", exc_info=True)
+            return {"text": f"Error fetching data: {e}"}
         
-        # Synthesize results (sync for now, could be async)
         try:
             summary = self._synthesize_results(query, subquery_results)
-            logger.info("Successfully generated summary from concurrent results.")
+            logger.info(f"{log_prefix}Completed successfully.")
         except Exception as e:
-             logger.error(f"Error during summary synthesis: {e}", exc_info=True)
-             # Return only text error
-             return {"text": f"Failed to synthesize the final summary: {e}"}
+             logger.error(f"{log_prefix}Error during summary synthesis: {e}", exc_info=True)
+             return {"text": f"Failed to synthesize summary: {e}"}
         
-        # Return standardized output format with text ONLY
         return {"text": summary}
-
-    def _run(self, query: str) -> Dict[str, str]:
-        """Synchronous wrapper for the asynchronous execution logic."""
-        logger.warning("Running summary synthesizer synchronously. Consider using async for better performance.")
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                logger.error("Cannot run async logic synchronously from a running event loop.")
-                return {"text": "Error: Synchronous execution from async context not fully supported."}
-            else:
-                result = loop.run_until_complete(self._arun(query))
-                return result # Result is already Dict[str, str]
-        except RuntimeError as e:
-             logger.error(f"RuntimeError running summary synthesizer synchronously: {e}", exc_info=True)
-             return {"text": f"Failed to run summary task: {e}"}
-        except Exception as e:
-             logger.error(f"Unexpected error in sync wrapper for summary synthesizer: {e}", exc_info=True)
-             return {"text": f"An unexpected error occurred: {e}"}
+    
+    # Implement ainvoke to ensure compatibility with BaseTool
+    async def ainvoke(self, input_data: Dict[str, Any], **kwargs: Any) -> Any:
+        """Override ainvoke to ensure it calls our async _run method."""
+        if not isinstance(input_data, dict):
+            raise ValueError(f"Expected dict input, got {type(input_data)}")
+        
+        query = input_data.get("query", "")
+        if not query:
+            return {"text": "Error: No query provided in input data."}
+            
+        return await self._run(query=query, **kwargs)

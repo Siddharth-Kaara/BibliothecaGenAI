@@ -19,6 +19,7 @@ from langchain_openai import AzureChatOpenAI
 
 from app.core.config import settings
 
+# Use standard logger
 logger = logging.getLogger(__name__)
 
 # Set a default Seaborn style
@@ -322,24 +323,23 @@ class ChartRendererTool(BaseTool):
         data: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        logger.info("Executing chart renderer tool (Matplotlib/Seaborn)")
+        log_prefix = "[ChartRendererTool] "
+        logger.info(f"{log_prefix}Executing. Data: {data is not None}, Metadata: {metadata is not None}")
+        
         pie_switch_message = None
         facet_message = None
 
         if data is None:
-            logger.error("'data' argument is required for chart_renderer.")
+            logger.error(f"{log_prefix}Missing required 'data' argument.")
             return {"error": "Missing required 'data' argument", "visualization": None}
             
         # Use provided metadata or generate if needed (and query is provided)
         # Note: Current agent logic explicitly provides metadata, so generation is less likely needed here
         if metadata is None:
-            # ---> REMOVED LLM-based metadata generation fallback
-            # Instead, rely on simple fallback logic below
-            logger.warning("Metadata not provided. Will attempt simple fallback based on data.")
+            logger.warning(f"{log_prefix}Metadata not provided. Applying fallback.")
             metadata = {} # Start with empty metadata
-        # --->
         elif not isinstance(metadata, dict):
-             logger.error(f"Invalid metadata format: Expected dict, got {type(metadata)}")
+             logger.error(f"{log_prefix}Invalid metadata format.")
              return {"error": "Invalid metadata format provided", "visualization": None}
         
         try:
@@ -352,7 +352,7 @@ class ChartRendererTool(BaseTool):
 
             if not metadata.get("x_column") or metadata["x_column"] not in df.columns or \
                not metadata.get("y_column") or metadata["y_column"] not in df.columns:
-                 logger.warning("Essential metadata (x_column/y_column) missing or invalid. Applying fallback logic.")
+                 logger.warning(f"{log_prefix}Essential metadata missing/invalid. Applying fallback.")
                  fallback_applied = False
                  fallback_config = DEFAULT_FALLBACK_METADATA.get(chart_type)
                  if fallback_config:
@@ -362,14 +362,14 @@ class ChartRendererTool(BaseTool):
                           non_numeric_cols = df.select_dtypes(exclude=['number']).columns.tolist()
                           if non_numeric_cols:
                                metadata["x_column"] = non_numeric_cols[0]
-                               logger.info(f"Applying fallback x_column: '{metadata['x_column']}'")
+                               logger.info(f"{log_prefix}Applying fallback x_column: '{metadata['x_column']}'")
                                fallback_applied = True
                      if not metadata.get("y_column") or metadata["y_column"] not in df.columns:
                           # Guess first numeric as Y
                           numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
                           if numeric_cols:
                                metadata["y_column"] = numeric_cols[0]
-                               logger.info(f"Applying fallback y_column: '{metadata['y_column']}'")
+                               logger.info(f"{log_prefix}Applying fallback y_column: '{metadata['y_column']}'")
                                fallback_applied = True
                      # Apply other fallback defaults if missing
                      metadata["title"] = metadata.get("title") or fallback_config.get("title", "Chart")
@@ -377,7 +377,7 @@ class ChartRendererTool(BaseTool):
                      metadata["y_label"] = metadata.get("y_label") or fallback_config.get("y_label") or metadata.get("y_column")
                      
                  if not fallback_applied:
-                     logger.error("Fallback failed: Could not determine suitable x/y columns from data.")
+                     logger.error(f"{log_prefix}Fallback failed.")
                      # Fallback failed, we cannot proceed reasonably
                      return {"error": "Could not determine valid x/y columns for chart from metadata or fallback", "visualization": None}
             
@@ -387,7 +387,7 @@ class ChartRendererTool(BaseTool):
                 if label_col and label_col in df.columns:
                     n_categories = df[label_col].nunique()
                     if n_categories > MAX_PIE_CATEGORIES:
-                        logger.warning(f"Too many categories ({n_categories}) for pie chart. Switching to bar chart.")
+                        logger.warning(f"{log_prefix}Too many categories ({n_categories}) for pie. Switching to bar.")
                         metadata['chart_type'] = "bar" # Update metadata
                         chart_type = "bar" # Update local var for flow control
                         pie_switch_message = f"Note: Switched from pie to bar chart ({n_categories} cats > {MAX_PIE_CATEGORIES} max)."
@@ -422,16 +422,16 @@ class ChartRendererTool(BaseTool):
                          min_val = grouped_max[grouped_max > 0].min()
                          if pd.notna(min_val) and min_val > 0 and (max_val / min_val) > SCALE_RATIO_THRESHOLD:
                              use_facet = True
-                             logger.warning("Large scale difference. Switching bar chart to faceted plot.")
+                             logger.warning(f"{log_prefix}Large scale difference. Using faceted bar chart.")
                              facet_message = f"Note: Used faceted bar chart due to large metric scale differences (Ratio > {SCALE_RATIO_THRESHOLD})."
-                     except Exception as scale_err: logger.warning(f"Scale ratio check failed: {scale_err}")
+                     except Exception as scale_err: logger.warning(f"{log_prefix}Scale ratio check failed: {scale_err}")
                  else:
-                      logger.warning(f"Skipping scale check for faceting: Y column ('{final_y_col}') or Hue column ('{final_hue_col}') not valid.")
+                      logger.warning(f"{log_prefix}Skipping scale check for faceting: Y column ('{final_y_col}') or Hue column ('{final_hue_col}') not valid.")
 
             # 7. Render Plot
             if chart_type == "bar" and use_facet:
                 # Render Faceted Bar Plot
-                logger.debug(f"Rendering faceted bar chart: col='{final_hue_col}', hue='{final_hue_col}'")
+                logger.debug(f"{log_prefix}Rendering faceted bar chart: col='{final_hue_col}', hue='{final_hue_col}'")
                 try:
                     g = sns.catplot(data=df, x=final_x_col, y=final_y_col, col=final_hue_col,
                                     hue=final_hue_col,
@@ -445,7 +445,7 @@ class ChartRendererTool(BaseTool):
                     # if g.legend: g.legend.remove()
                     plot_object = g # Store FacetGrid
                 except Exception as plot_err:
-                    logger.error(f"Catplot error: {plot_err}", exc_info=True)
+                    logger.error(f"{log_prefix}Catplot error: {plot_err}", exc_info=True)
                     # Create error plot on standard figure
                     fig, ax = plt.subplots(); ax.text(0.5, 0.5, f"Faceted plot error:\n{plot_err}", ha='center', va='center'); plot_object = fig
             else:
@@ -472,7 +472,7 @@ class ChartRendererTool(BaseTool):
                         ax.legend(title=final_hue_col)
                     plt.tight_layout()
                 except Exception as render_err:
-                     logger.error(f"Error during standard {chart_type} rendering: {render_err}", exc_info=True)
+                     logger.error(f"{log_prefix}Error during standard {chart_type} rendering: {render_err}", exc_info=True)
                      # Clear and add error text if render func failed internally
                      ax.cla()
                      ax.text(0.5, 0.5, f"Error rendering {chart_type} chart:\n{render_err}", ha='center', va='center')
@@ -487,10 +487,10 @@ class ChartRendererTool(BaseTool):
             chart_id = uuid.uuid4()
             save_filename = f"chart_{chart_id}.png"
             save_path = Path(settings.CHART_DIR) / save_filename
-            logger.debug(f"Attempting to save chart to: {save_path}")
+            logger.debug(f"{log_prefix}Attempting to save chart to: {save_path}")
             figure_to_save.savefig(save_path, format='png', bbox_inches='tight')
             plt.close(figure_to_save)
-            logger.info(f"Chart saved successfully to {save_path}")
+            logger.info(f"{log_prefix}Chart saved successfully to {save_path}")
             chart_url = f"{settings.CHART_URL_BASE.rstrip('/')}/{save_filename}"
 
             # 9. Construct Return Value
@@ -512,11 +512,11 @@ class ChartRendererTool(BaseTool):
             return return_data
 
         except ValueError as ve:
-            logger.error(f"Chart generation config/data error: {ve}", exc_info=True)
+            logger.error(f"{log_prefix}Chart config/data error: {ve}", exc_info=False)
             plt.close(plt.gcf())
             return {"error": f"Chart configuration error: {ve}", "visualization": None}
         except Exception as e:
-            logger.error(f"Chart generation failed unexpectedly: {e}", exc_info=True)
+            logger.error(f"{log_prefix}Chart generation failed unexpectedly: {e}", exc_info=True)
             plt.close(plt.gcf())
             return {"error": f"Failed to generate chart: {e}", "visualization": None}
 
@@ -527,7 +527,8 @@ class ChartRendererTool(BaseTool):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Async wrapper for _run using run_in_executor."""
-        logger.debug("Chart renderer _arun called, invoking _run...")
+        log_prefix = "[ChartRendererTool] "
+        logger.debug(f"{log_prefix}Executing async run via executor...")
         loop = asyncio.get_event_loop()
         try:
             result = await loop.run_in_executor(
@@ -537,7 +538,7 @@ class ChartRendererTool(BaseTool):
             )
             return result
         except Exception as e:
-             logger.error(f"Chart renderer tool failed: {str(e)}", exc_info=True)
+             logger.error(f"{log_prefix}Async execution failed: {str(e)}", exc_info=True)
              # Propagate error as a dictionary suitable for ToolMessage content
              # Allows agent to potentially see the error reason
              return {"error": f"Chart rendering failed: {str(e)}"}
