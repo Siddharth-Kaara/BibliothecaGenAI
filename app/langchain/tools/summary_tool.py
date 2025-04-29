@@ -12,7 +12,7 @@ from langchain_core.output_parsers import StrOutputParser
 
 from app.core.config import settings
 from app.db.connection import get_async_db_connection
-from app.langchain.tools.sql_tool import SQLQueryTool
+from app.langchain.tools.sql_tool import SQLExecutionTool
 
 logger = logging.getLogger(__name__)
 
@@ -98,47 +98,114 @@ class SummarySynthesizerTool(BaseTool):
             logger.debug(f"Problematic subqueries value: {subqueries_str}")
             return [query]
     
+    async def _generate_sql_from_description(self, query_description: str) -> Tuple[str, Dict[str, Any]]:
+        """Generate SQL query and parameters from a natural language description."""
+        llm = AzureChatOpenAI(
+            openai_api_key=settings.AZURE_OPENAI_API_KEY,
+            azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
+            openai_api_version=settings.AZURE_OPENAI_API_VERSION,
+            deployment_name=settings.AZURE_OPENAI_DEPLOYMENT_NAME,
+            model_name=settings.LLM_MODEL_NAME,
+            temperature=0.1,
+        )
+        
+        template = """
+        You are a SQL expert. Given the following query description, generate a PostgreSQL SQL query.
+        
+        Query description: {query_description}
+        
+        Important guidelines:
+        1. Always filter by organization_id using parameter placeholder (:organization_id)
+        2. Use appropriate joins between tables
+        3. For entity-specific queries, include organizational averages for comparison
+        4. Use descriptive column aliases
+        5. Include LIMIT for non-aggregate queries
+        6. Use parameters for any values that should be passed separately
+        
+        Return your response in JSON format with two keys:
+        - "sql": The SQL query string with placeholders
+        - "params": A dictionary of parameters (must include "organization_id": "{organization_id}")
+        
+        Example:
+        {{"sql": "SELECT COUNT(*) AS \\"Total Borrows\\" FROM \\"5\\" WHERE \\"organizationId\\" = :organization_id AND \\"1\\" = 1", "params": {{"organization_id": "{organization_id}"}}}}
+        """
+        
+        prompt = PromptTemplate(
+            input_variables=["query_description", "organization_id"], 
+            template=template
+        )
+        
+        chain = prompt | llm | StrOutputParser()
+        result = await chain.ainvoke({
+            "query_description": query_description,
+            "organization_id": self.organization_id
+        })
+        
+        # Parse the JSON result
+        try:
+            result = result.strip()
+            if result.startswith("```json"):
+                result = result[7:]
+            if result.endswith("```"):
+                result = result[:-3]
+                
+            parsed = json.loads(result.strip())
+            sql = parsed.get("sql", "")
+            params = parsed.get("params", {})
+            
+            # Ensure organization_id is present and correct
+            if "organization_id" not in params:
+                params["organization_id"] = self.organization_id
+            elif params["organization_id"] != self.organization_id:
+                params["organization_id"] = self.organization_id
+                
+            return sql, params
+        except Exception as e:
+            logger.error(f"Error parsing SQL generation result: {e}")
+            raise ValueError(f"Failed to generate SQL: {e}")
+    
     async def _execute_subqueries_concurrently(self, subqueries: List[str]) -> List[Tuple[str, Dict]]:
-        """Execute subqueries concurrently using sql_tool._run and asyncio.gather."""
+        """Execute subqueries concurrently using SQLExecutionTool and asyncio.gather."""
         results = []
         
-        # Create SQL tool instance ONCE
-        sql_tool = SQLQueryTool(organization_id=self.organization_id)
+        # Create SQL execution tool instance ONCE
+        sql_tool = SQLExecutionTool(organization_id=self.organization_id)
         
         async def run_single_query(subquery: str) -> Tuple[str, Dict]:
             """Helper coroutine to run one subquery and handle errors."""
-            subquery_result_str = "{}" # Initialize for potential error logging
             try:
-                # Execute asynchronously using sql_tool's _run (which is now async)
-                # It returns a JSON STRING
-                subquery_result_str = await sql_tool._run(
-                    query_description=subquery, 
-                    db_name="report_management" # Assuming default DB
-                )
-                # Parse the JSON string result
-                subquery_result_dict = json.loads(subquery_result_str)
+                # Generate SQL from the description
+                sql_query, params = await self._generate_sql_from_description(subquery)
                 
-                # Check if the PARSED dict contains an error key from the SQL tool itself
+                # Execute SQL using the execution tool
+                result_str = await sql_tool._run(
+                    sql=sql_query, 
+                    params=params,
+                    db_name="report_management"
+                )
+                
+                # Parse the JSON string result
+                subquery_result_dict = json.loads(result_str)
+                
+                # Check if the PARSED dict contains an error key
                 if isinstance(subquery_result_dict, dict) and "error" in subquery_result_dict:
                     error_msg = subquery_result_dict["error"]
-                    logger.error(f"SQL tool returned error for subquery '{subquery}': {error_msg}")
-                    # Return the error dict directly as it's already the expected structure
+                    logger.error(f"SQL execution error for subquery '{subquery}': {error_msg}")
                     return (subquery, subquery_result_dict)
                 
-                # Basic validation of expected structure after successful parse & no error key
+                # Basic validation of expected structure
                 if not isinstance(subquery_result_dict, dict) or "table" not in subquery_result_dict:
-                     logger.error(f"Unexpected result format from SQL tool for subquery '{subquery}' after JSON parse. Got: {type(subquery_result_dict)} Keys: {subquery_result_dict.keys() if isinstance(subquery_result_dict, dict) else 'N/A'}")
-                     return (subquery, {"error": "Invalid format from SQL tool", "table": {"columns": ["Error"], "rows": [["Invalid format received"]]}, "text": "Invalid format received"})
+                     logger.error(f"Unexpected result format for subquery '{subquery}' after JSON parse. Got: {type(subquery_result_dict)} Keys: {subquery_result_dict.keys() if isinstance(subquery_result_dict, dict) else 'N/A'}")
+                     return (subquery, {"error": "Invalid format from SQL execution", "table": {"columns": ["Error"], "rows": [["Invalid format received"]]}, "text": "Invalid format received"})
                 
                 # Successfully parsed and validated dictionary
                 return (subquery, subquery_result_dict)
 
             except json.JSONDecodeError as json_e:
-                 logger.error(f"Failed to decode JSON from SQL tool for subquery '{subquery}': {json_e}. Raw string: '{subquery_result_str}'")
+                 logger.error(f"Failed to decode JSON for subquery '{subquery}': {json_e}.")
                  return (subquery, {"error": "Failed to parse SQL tool output", "table": {"columns": ["Error"], "rows": [["Invalid JSON received"]]}, "text": "Invalid JSON received"})
             except Exception as e:
-                logger.error(f"Exception executing subquery '{subquery}' via _run for org {self.organization_id}: {str(e)}", exc_info=True)
-                # Ensure the fallback structure matches what _synthesize_results expects
+                logger.error(f"Exception executing subquery '{subquery}' for org {self.organization_id}: {str(e)}", exc_info=True)
                 return (subquery, {"error": f"Execution Error: {str(e)}", "table": {"columns": ["Error"], "rows": [[str(e)]]}, "text": f"Execution Error: {str(e)}"})
 
         # Create tasks for all subqueries
@@ -176,7 +243,7 @@ class SummarySynthesizerTool(BaseTool):
             limited_rows = table_data.get("rows", [])[:5]
             columns = table_data.get("columns", [])
             results_str += f"Results (showing up to 5 rows): {json.dumps({"columns": columns, "rows": limited_rows}, indent=2)}\n"
-            results_str += f"Total rows in original result: {len(table_data.get("rows", []))}\n\n"
+            results_str += f"Total rows in original result: {len(table_data.get('rows', []))}\n\n"
         
         template = """
         You are a data analyst. Given the original user query and results from potentially multiple subqueries,
