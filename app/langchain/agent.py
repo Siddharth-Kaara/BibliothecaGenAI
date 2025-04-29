@@ -456,7 +456,25 @@ def agent_node(state: AgentState, llm_with_structured_output):
             final_structure = None
 
     logger.debug(f"[AgentNode] Exiting agent node.")
-    return {"messages": [response] if response else [], "final_response_structure": final_structure}
+    
+    # --- Construct Final Return Dictionary --- #
+    return_dict = {
+        "messages": [response] if response else [],
+        "final_response_structure": final_structure
+    }
+    # If the final structure is being returned, pass through existing tables/visualizations
+    if final_structure:
+        # ---> Add Debug Logging <--- 
+        current_tables = state.get("tables", [])
+        current_visualizations = state.get("visualizations", [])
+        logger.info(f"[AgentNode] Final step. Tables in current state: {len(current_tables)}")
+        logger.info(f"[AgentNode] Final step. Visualizations in current state: {len(current_visualizations)}")
+        return_dict["tables"] = current_tables
+        return_dict["visualizations"] = current_visualizations
+        logger.info(f"[AgentNode] Returning dict with keys: {list(return_dict.keys())}")
+        # ---> End Debug Logging <--- 
+        
+    return return_dict # Return messages, final_structure, and potentially tables/visualizations
 
 def _preprocess_state_for_llm(state: AgentState) -> AgentState:
     """
@@ -600,16 +618,56 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
             successful_calls += 1
             new_messages.append(result["message"])
             raw_content = result.get("raw_content")
-            # Basic table/viz extraction (no dupe check here for simplicity)
-            if isinstance(raw_content, dict):
-                 if tool_name in ["sql_query", "execute_sql"] and isinstance(raw_content.get("table"), dict):
-                     table_data = raw_content["table"]
-                     if isinstance(table_data.get('columns'), list) and isinstance(table_data.get('rows'), list):
-                          new_tables.append(table_data) # Add table data
-                 elif tool_name == "chart_renderer" and isinstance(raw_content.get("visualization"), dict):
-                     viz_data = raw_content["visualization"]
+            table_data = None # Initialize table_data
+            parsed_content = None # Initialize parsed_content
+
+
+            # Attempt to parse raw_content if it's a string (JSON from SQL tool)
+            if isinstance(raw_content, str):
+                try:
+                    parsed_content = json.loads(raw_content)
+                    logger.debug(f"[ToolsNode] Successfully parsed JSON string from tool '{tool_name}'.")
+                except json.JSONDecodeError:
+                    logger.warning(f"[ToolsNode] Failed to parse potential JSON string from tool '{tool_name}'. Content: {raw_content[:200]}...")
+                    # Keep raw_content as is if parsing fails, might be plain text
+                    parsed_content = raw_content
+            elif isinstance(raw_content, dict):
+                # If it's already a dict, use it directly
+                parsed_content = raw_content
+            else:
+                 # Handle other types if necessary, or log
+                 logger.debug(f"[ToolsNode] Raw content from tool '{tool_name}' is neither string nor dict: {type(raw_content)}")
+                 parsed_content = raw_content # Assign raw_content for potential downstream use
+
+            # Basic table/viz extraction using the parsed_content
+            if isinstance(parsed_content, dict):
+                 if tool_name in ["sql_query", "execute_sql"]:
+                     # Check if 'table' key exists and contains a dict
+                     if isinstance(parsed_content.get("table"), dict):
+                         table_data = parsed_content["table"]
+                         logger.debug(f"[ToolsNode] Found 'table' key in parsed content for tool '{tool_name}'.")
+                     # Check if parsed_content *itself* looks like the table data (fallback, less likely now)
+                     elif isinstance(parsed_content.get('columns'), list) and isinstance(parsed_content.get('rows'), list):
+                         table_data = parsed_content
+                         logger.debug(f"[ToolsNode] Parsed content directly matches table structure for tool '{tool_name}'.")
+                     else:
+                          logger.warning(f"[ToolsNode] Parsed SQL tool '{tool_name}' content is a dict but doesn't match expected table structures. Keys: {list(parsed_content.keys())}")
+
+                     # If we found valid table_data, process it
+                     if table_data and isinstance(table_data.get('columns'), list) and isinstance(table_data.get('rows'), list):
+                         new_tables.append(table_data)
+                         logger.info(f"[ToolsNode] Extracted table from '{tool_name}' with {len(table_data.get('rows', []))} rows and {len(table_data.get('columns', []))} columns")
+                     elif table_data: # If table_data was assigned but structure invalid
+                          logger.warning(f"[ToolsNode] Potential table data from '{tool_name}' had invalid structure (missing columns/rows). Keys: {list(table_data.keys())}")
+
+                 elif tool_name == "chart_renderer" and isinstance(parsed_content.get("visualization"), dict):
+                     # Assuming chart_renderer returns a dict directly (not a JSON string)
+                     viz_data = parsed_content["visualization"]
                      if viz_data.get('type') and viz_data.get('image_url'):
                           new_visualizations.append(viz_data) # Add viz data
+                          logger.info(f"[ToolsNode] Extracted visualization of type '{viz_data.get('type')}'")
+                     else:
+                          logger.warning(f"[ToolsNode] Visualization result missing 'type' or 'image_url'. Structure: {list(viz_data.keys())}")
         else:
             logger.warning(f"[ToolsNode] Tool call '{tool_name}' (ID: {tool_id}) failed. Error appended.")
             # Append error message only if tool mapping didn't already do it
@@ -618,13 +676,25 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
                  error_content = f"Tool execution failed: {result.get('error', 'Unknown error')}"
                  new_messages.append(ToolMessage(content=error_content, tool_call_id=tool_id, name=tool_name))
 
-
-    update_dict = {}
-    if new_messages: update_dict["messages"] = new_messages
-    if new_tables: update_dict["tables"] = new_tables
-    if new_visualizations: update_dict["visualizations"] = new_visualizations
-
-    logger.debug(f"[ToolsNode] Tool handler finished. {successful_calls}/{len(results)} calls successful. State updates: {list(update_dict.keys())}")
+    # Update state with new messages and any extracted tables/visualizations
+    logger.info(f"[ToolsNode] Updating state with {len(new_messages)} messages, {len(new_tables)} tables, {len(new_visualizations)} visualizations")
+    
+    # Get existing tables and visualizations from state
+    existing_tables = state.get('tables', [])
+    existing_visualizations = state.get('visualizations', [])
+    
+    # Combine existing with new
+    combined_tables = existing_tables + new_tables
+    combined_visualizations = existing_visualizations + new_visualizations
+    
+    update_dict = {"messages": new_messages}
+    if new_tables:
+        logger.info(f"[ToolsNode] Found {len(new_tables)} new table(s) to add to state. State will have {len(combined_tables)} total tables.")
+        update_dict["tables"] = combined_tables  # Add to existing tables
+    if new_visualizations:
+        logger.info(f"[ToolsNode] Found {len(new_visualizations)} new visualization(s) to add to state. State will have {len(combined_visualizations)} total visualizations.")
+        update_dict["visualizations"] = combined_visualizations  # Add to existing visualizations
+    
     return update_dict
 
 def _is_retryable_error(error: Exception) -> bool:
