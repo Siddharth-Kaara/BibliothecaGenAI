@@ -93,6 +93,7 @@ Tool Use and Response Guidelines:
 5.  **SQL Query Generation (`sql_query` tool - Use Primarily for Raw Data/Charts):**
     *   Call this tool *after* name resolution (if needed).
     *   **CRITICAL:** When constructing the `query_description` argument for this tool, you **MUST** explicitly include the **resolved hierarchy ID(s)** obtained from the `hierarchy_name_resolver` tool's output (`ToolMessage`). Do NOT just use the resolved name.
+    *   **Time Descriptions:** When the user query includes time references (e.g., 'last week', 'last Christmas', 'March'), pass these descriptions **semantically** in the `query_description`. **DO NOT** attempt to calculate the specific date yourself (e.g., do not change 'last Christmas' to 'December 25th, 2024'). Rely on the `sql_query` tool to interpret these descriptions using its internal context.
     *   Example Description: `"Get borrow counts for hierarchy ID 'ca4b911c-8b54-e811-2a94-0024e880a2b7' last week"` (NOT "Get borrow counts for Maxville Branch last week").
     *   The SQL generating LLM inside `sql_query` is instructed to use these IDs directly for filtering.
     *   Filter appropriately (e.g., by ID, timestamp). Avoid adding non-existent filters like `isActive`.

@@ -129,9 +129,21 @@ class SQLQueryTool(BaseTool):
             temperature=0,
         )
         
-        # Integrating org filtering into the existing prompt structure
-        template = """You are a SQL expert. Given the following database schema and a query description,
+        # --- Get Current Time Context --- 
+        now = datetime.datetime.now()
+        current_date_str = now.strftime("%Y-%m-%d")
+        current_day_name = now.strftime("%A") # e.g., Monday
+        current_year = now.year
+        # --- End Current Time Context ---
+
+        # Integrating org filtering and time context into the existing prompt structure
+        template = """You are a SQL expert. Given the following database schema, current time context, and a query description,
 generate a PostgreSQL SQL query and its corresponding parameters dictionary.
+
+Current Context:
+- Today's Date: {current_date}
+- Day of the Week: {current_day}
+- Current Year: {current_year}
 
 Schema:
 {schema}
@@ -173,19 +185,23 @@ Important Guidelines:
     *   Only include this benchmark if it can be done efficiently. The CTE approach is generally efficient.
     *   Ensure both the specific value and the benchmark value have clear, user-friendly aliases.
 13. **Time Filtering (Generate SQL Directly):**
+    *   Use the Current Context provided above to resolve relative dates and years.
     *   If the `query_description` includes time references (e.g., "last week", "yesterday", "past 3 months", "since June 1st", "before 2024"), you MUST generate the appropriate SQL `WHERE` clause condition directly.
     *   Use relevant SQL functions like `NOW()`, `CURRENT_DATE`, `INTERVAL`, `DATE_TRUNC`, `EXTRACT`, `MAKE_DATE`, and comparison operators (`>=`, `<`, `BETWEEN`).
-    *   **Relative Time Interpretation:** For simple relative terms like "last week", "last month", prioritize using straightforward intervals like `NOW() - INTERVAL '7 days'` or `NOW() - INTERVAL '1 month'`, respectively. Use `DATE_TRUNC` or specific date ranges only if the user query explicitly demands calendar alignment (e.g., "the week starting Monday", "the calendar month of March").
-    *   **Relative Months/Years:** For month names (e.g., "March", "in June") without a specified year, **ALWAYS** assume the **current year** in your date logic. For years alone (e.g., "in 2024"), query the whole year. **Critically, incorporate the current year directly into your date comparisons using `NOW()` or `CURRENT_DATE` where appropriate, don't just extract the year separately and then use a hardcoded year in the comparison.**
-    *   **Specific Day + Month (No Year):** For specific dates without a year (e.g., "April 1st", "on the 5th of June"), you MUST construct the date using the **current year**. Use appropriate SQL date functions like `MAKE_DATE(EXTRACT(YEAR FROM NOW())::int, <month_number>, <day_number>)` for PostgreSQL.
-    *   Identify the correct timestamp column for filtering (e.g., `"eventTimestamp"` for table `"5"` and `"8"`, `"createdAt"` for others - check schema).
-    *   Example for "last week": `WHERE "eventTimestamp" >= NOW() - INTERVAL '7 days'` # Prefer this
-    *   Example for "yesterday": `WHERE DATE_TRUNC('day', "eventTimestamp") = CURRENT_DATE - INTERVAL '1 day'` # DATE_TRUNC makes sense here
-    *   Example for "March" (current year): `WHERE EXTRACT(MONTH FROM "eventTimestamp") = 3 AND EXTRACT(YEAR FROM "eventTimestamp") = EXTRACT(YEAR FROM NOW())` # Check month AND current year
-    *   Example for "April 1st" (current year): `WHERE DATE_TRUNC('day', "eventTimestamp") = MAKE_DATE(EXTRACT(YEAR FROM NOW())::int, 4, 1)` # Use MAKE_DATE with current year
-    *   Example for "first week of February" (current year): `WHERE "eventTimestamp" >= DATE_TRUNC('year', NOW()) + INTERVAL '1 month' AND "eventTimestamp" < DATE_TRUNC('year', NOW()) + INTERVAL '1 month' + INTERVAL '7 days'` 
-    *   Example for "June 2024": `WHERE "eventTimestamp" >= '2024-06-01' AND "eventTimestamp" < '2024-07-01'`
-    *   **DO NOT** use parameters like `:start_date` or `:end_date` for these time calculations.
+    *   **Relative Time Interpretation:** For simple relative terms like "last week", "last month", prioritize straightforward intervals like `NOW() - INTERVAL '7 days'` or `NOW() - INTERVAL '1 month'`.
+    *   **Relative Months/Years:** For month names (e.g., "March") without a year, assume the **current year** ({current_year}). For years alone (e.g., "in 2024"), query the whole year.
+    *   **Specific Day + Month (No Year):** For dates like "April 1st", construct the date using the **current year** ({current_year}). Use `MAKE_DATE({current_year}, <month_number>, <day_number>)`.
+    *   **Last Working Day Logic:** Based on the `Current Context`, determine the date of the last working day (assuming Mon-Fri). Filter for events matching *that specific date* using `DATE_TRUNC('day', "timestamp_column") = calculated_date`.
+        *   If Today is Monday, Last Working Day = `CURRENT_DATE - INTERVAL '3 days'`.
+        *   If Today is Sunday, Last Working Day = `CURRENT_DATE - INTERVAL '2 days'`.
+        *   If Today is Saturday, Last Working Day = `CURRENT_DATE - INTERVAL '1 day'`.
+        *   If Today is Tue-Fri, Last Working Day = `CURRENT_DATE - INTERVAL '1 day'`.
+        *   Identify the correct timestamp column (check schema).
+        *   **Example for "March"**: `WHERE EXTRACT(MONTH FROM "eventTimestamp") = 3 AND EXTRACT(YEAR FROM "eventTimestamp") = {current_year}`
+        *   **Example for "April 1st"**: `WHERE DATE_TRUNC('day', "eventTimestamp") = MAKE_DATE({current_year}, 4, 1)`
+        *   **Example for "last working day" (if Today is Monday)**: `WHERE DATE_TRUNC('day', "eventTimestamp") = CURRENT_DATE - INTERVAL '3 days'`
+        *   **Example for "last working day" (if Today is Wednesday)**: `WHERE DATE_TRUNC('day', "eventTimestamp") = CURRENT_DATE - INTERVAL '1 day'`
+        *   **DO NOT** use parameters like `:start_date` or `:end_date` for these time calculations.
 14. **Footfall Queries (Table "8"):**
     *   If the query asks generally about "footfall", "visitors", "people entering/leaving", or "how many people visited", calculate **both** the sum of entries (`SUM("39")`) and the sum of exits (`SUM("40")`).
     *   Alias them clearly (e.g., `AS "Total Entries"`, `AS "Total Exits"`).
@@ -211,7 +227,7 @@ Example (Aggregate Query for the Org):
 """
         
         prompt = PromptTemplate(
-            input_variables=["schema", "organization_id", "query_description"],
+            input_variables=["schema", "organization_id", "query_description", "current_date", "current_day", "current_year"],
             template=template,
         )
         
@@ -228,6 +244,9 @@ Example (Aggregate Query for the Org):
                 "schema": schema_info,
                 "organization_id": self.organization_id,
                 "query_description": query_description,
+                "current_date": current_date_str, # Pass calculated date
+                "current_day": current_day_name,   # Pass calculated day
+                "current_year": current_year      # Pass calculated year
             }
             
             # Use ainvoke for async LLM call
