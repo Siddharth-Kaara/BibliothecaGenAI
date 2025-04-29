@@ -1,6 +1,6 @@
 import os
 from typing import Any, Dict, List, Optional, Union
-from pydantic import AnyHttpUrl, PostgresDsn, field_validator, model_validator
+from pydantic import AnyHttpUrl, PostgresDsn, field_validator, model_validator, Field
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
@@ -32,9 +32,12 @@ class Settings(BaseSettings):
     VERBOSE_LLM: bool = False
     
     # Agent & Graph settings
-    MAX_CONCURRENT_TOOLS: int = 10 # Max concurrent tool executions (Semaphore limit)
-    MAX_STATE_MESSAGES: int = 50 # Max messages to keep in AgentState history
-    MAX_GRAPH_ITERATIONS: int = 10 # Max recursion depth for the LangGraph agent
+    MAX_CONCURRENT_TOOLS: int = Field(default=3, description="Maximum number of tools to execute concurrently.")
+    MAX_STATE_MESSAGES: int = Field(default=20, description="Maximum number of messages to keep in agent state.")
+    MAX_GRAPH_ITERATIONS: int = Field(default=10, description="Maximum iterations allowed for the LangGraph agent.")
+    MAX_TABLE_ROWS_IN_STATE: int = Field(default=100, description="Maximum rows per table to keep in agent state.")
+    TOOL_RETRY_DELAY: float = Field(default=1.0, description="Base delay in seconds between tool execution retries.")
+    TOOL_EXECUTION_RETRIES: int = Field(default=2, description="Number of retries allowed for failed tool executions.")
     
     # Security
     SECRET_KEY: str = ""
@@ -45,6 +48,9 @@ class Settings(BaseSettings):
     # Chart generation
     CHART_DIR: str = "static/charts"
     CHART_URL_BASE: str = "/static/charts"
+    
+    # Cache Configuration
+    REDIS_HOST: str = Field(default="localhost")
     
     class Config:
         env_file = ".env"

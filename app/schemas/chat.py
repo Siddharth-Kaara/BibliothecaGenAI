@@ -25,11 +25,19 @@ class TableData(BaseModel):
     """Structured table data with separate columns and rows."""
     columns: List[str] = Field(..., description="List of column headers")
     rows: List[List[Any]] = Field(..., description="List of rows, where each row is a list of values corresponding to the columns")
+    metadata: Optional[Dict[str, Any]] = Field(default=None, description="Optional metadata about the table (e.g., source, description).")
 
-class Visualization(BaseModel):
-    """Visualization data for chat responses."""
-    type: str = Field(..., description="Type of visualization (bar, pie, line, etc.)")
-    image_url: str = Field(..., description="URL or base64 data of the visualization image")
+# --- New Chart Specification for API Response ---
+class ApiChartSpecification(BaseModel):
+    """Defines the specification for a chart to be rendered by the frontend."""
+    type_hint: str = Field(..., description="Suggested chart type (e.g., 'bar', 'pie', 'line'). Frontend decides final implementation.")
+    title: str = Field(..., description="The title for the chart.")
+    x_column: str = Field(..., description="The name of the column from the data to use for the X-axis or labels.")
+    y_column: str = Field(..., description="The name of the column from the data to use for the Y-axis or values.")
+    color_column: Optional[str] = Field(default=None, description="Optional: The name of the column to use for grouping data by color/hue.")
+    x_label: Optional[str] = Field(default=None, description="Optional: A descriptive label for the X-axis.")
+    y_label: Optional[str] = Field(default=None, description="Optional: A descriptive label for the Y-axis.")
+    data: TableData = Field(..., description="The actual data for the chart, matching the TableData structure.")
 
 class Error(BaseModel):
     """Error details."""
@@ -41,7 +49,7 @@ class ChatData(BaseModel):
     """Data for a successful chat response with support for multiple outputs."""
     text: str = Field(..., description="Text response from the chatbot")
     tables: Optional[List[TableData]] = Field(None, description="List of table data (columns and rows), if applicable")
-    visualizations: Optional[List[Visualization]] = Field(None, description="List of visualization data, if applicable")
+    visualizations: Optional[List[ApiChartSpecification]] = Field(None, description="List of chart specifications for the frontend to render, if applicable")
 
 class ChatResponse(BaseModel):
     """Response schema for the chat endpoint."""

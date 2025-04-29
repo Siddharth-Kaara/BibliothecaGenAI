@@ -53,7 +53,7 @@ class SQLExecutionTool(BaseTool):
     
     async def _execute_sql(self, sql: str, parameters: Dict[str, Any], db_name: str) -> Dict:
         """Execute SQL with parameters and return results (asynchronous version)."""
-        log_prefix = f"[Org: {self.organization_id}] [SQLExecutionTool] "
+        log_prefix = f"[SQLExecutionTool] "
         logger.debug(f"{log_prefix}Executing SQL on DB '{db_name}'...")
         MAX_ROWS = 50
         original_sql = sql
@@ -123,7 +123,7 @@ class SQLExecutionTool(BaseTool):
              raise ValueError(error_msg)
         if parameters['organization_id'] != self.organization_id:
             error_msg = f"SECURITY CHECK FAILED: organization_id mismatch in parameters. Expected {self.organization_id}, got {parameters.get('organization_id')}. Aborting."
-            logger.error(f"{log_prefix}{error_msg}")
+            logger.error(f"[SQLExecutionTool] {error_msg}")
             raise ValueError(error_msg)
         
         # Log execution details
@@ -156,18 +156,18 @@ class SQLExecutionTool(BaseTool):
                 return response_data
                 
         except SQLAlchemyError as e:
-            logger.error(f"{log_prefix}SQL execution error for org {self.organization_id}. Error: {str(e)}", exc_info=True)
+            logger.error(f"[SQLExecutionTool] SQL execution error for org {self.organization_id}. Error: {str(e)}", exc_info=True)
             logger.debug(f"{log_prefix}Failed SQL: {sql[:500]}... | Params: {parameters}")
             raise ValueError(f"Database error executing query. Details: {str(e)}")
         except Exception as e:
-            logger.error(f"{log_prefix}Unexpected error during SQL execution for org {self.organization_id}: {e}", exc_info=True)
+            logger.error(f"[SQLExecutionTool] Unexpected error during SQL execution for org {self.organization_id}: {e}", exc_info=True)
             raise ValueError(f"An unexpected error occurred during query execution: {str(e)}")
     
     async def _run(
         self, sql: str, params: Dict[str, Any], db_name: str = "report_management", run_manager=None
     ) -> str:
         """Execute the SQL query against the database."""
-        log_prefix = f"[Org: {self.organization_id}] [SQLExecutionTool] "
+        log_prefix = f"[SQLExecutionTool] "
         logger.info(f"{log_prefix}Executing provided SQL query on DB '{db_name}'.")
         
         try:
@@ -193,7 +193,7 @@ class SQLExecutionTool(BaseTool):
              }
              return json.dumps(fallback_output, default=json_default)
         except Exception as e:
-            logger.exception(f"{log_prefix}Unexpected critical error during SQL execution for org {self.organization_id}, SQL: '{sql[:100]}...': {e}", exc_info=True)
+            logger.exception(f"[SQLExecutionTool] Unexpected critical error during SQL execution for org {self.organization_id}, SQL: '{sql[:100]}...': {e}", exc_info=True)
             fallback_output = {
                  "table": {"columns": ["Error"], "rows": [["An unexpected critical error occurred during execution."]]},
                  "text": f"An unexpected critical error occurred while executing the query."
