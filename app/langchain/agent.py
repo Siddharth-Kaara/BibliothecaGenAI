@@ -5,16 +5,16 @@ from typing import Any, Dict, List, Optional, Tuple, TypedDict, Annotated, Seque
 import operator
 from pydantic import BaseModel, Field
 import functools
-from pydantic_core import ValidationError # Import for specific error handling
-import uuid # Import for UUID validation
-import datetime # Import datetime
+from pydantic_core import ValidationError 
+import uuid 
+import datetime 
 
 # LangChain & LangGraph Imports
 from langchain_core.messages import BaseMessage, FunctionMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import AzureChatOpenAI
 from langchain_core.output_parsers.openai_tools import PydanticToolsParser, JsonOutputToolsParser
-from langchain_core.runnables import RunnableConfig # Import for config
+from langchain_core.runnables import RunnableConfig 
 from langgraph.graph import StateGraph, END
 from langchain.tools import BaseTool
 
@@ -27,7 +27,48 @@ from app.schemas.chat import ChatData, ApiChartSpecification, TableData
 
 logger = logging.getLogger(__name__)
 
-# --- New Instruction Structure included directly in FinalApiResponseStructure ---
+
+# --- Helper Function to Get Schema String --- #
+def _get_schema_string(db_name: str = "report_management") -> str:
+    """Gets schema information from predefined schema definitions as a formatted string."""
+    from app.db.schema_definitions import SCHEMA_DEFINITIONS # Keep import local
+    logger.debug(f"[_get_schema_string] Fetching schema for database: {db_name}")
+    
+    if db_name not in SCHEMA_DEFINITIONS:
+        error_msg = f"No schema definition found for database {db_name}."
+        logger.warning(f"[_get_schema_string] {error_msg}")
+        return error_msg
+    
+    db_info = SCHEMA_DEFINITIONS[db_name]
+    schema_info = [
+        f"Database: {db_name}",
+        f"Description: {db_info['description']}",
+        ""
+    ]
+    
+    for table_name, table_info in db_info['tables'].items():
+        schema_info.append(f"Table: {table_name}")
+        schema_info.append(f"Description: {table_info['description']}")
+        
+        schema_info.append("Columns:")
+        for column in table_info['columns']:
+            primary_key = " (PRIMARY KEY)" if column.get('primary_key') else ""
+            foreign_key = f" (FOREIGN KEY -> {column.get('foreign_key')})" if column.get('foreign_key') else ""
+            timestamp_note = " (Timestamp for filtering)" if 'timestamp' in column['type'].lower() else ""
+            schema_info.append(f"  {column['name']} ({column['type']}){primary_key}{foreign_key} - {column['description']}{timestamp_note}")
+        
+        if 'example_queries' in table_info:
+            schema_info.append("Example queries:")
+            for query in table_info['example_queries']:
+                schema_info.append(f"  {query}")
+        
+        schema_info.append("")  # Empty line between tables
+    
+    logger.debug(f"[_get_schema_string] Successfully retrieved schema for {db_name}")
+    return "\n".join(schema_info)
+
+
+# --- Instruction Structure included directly in FinalApiResponseStructure ---
 class ChartSpecFinalInstruction(BaseModel):
     """Defines the specification for a chart to be rendered by the frontend.
        This structure is generated directly by the LLM within the FinalApiResponseStructure.
@@ -40,6 +81,7 @@ class ChartSpecFinalInstruction(BaseModel):
     color_column: Optional[str] = Field(default=None, description="Optional: The name of the column to use for grouping data by color/hue (e.g., for grouped bar charts).")
     x_label: Optional[str] = Field(default=None, description="Optional: A descriptive label for the X-axis. Defaults to x_column if not provided.")
     y_label: Optional[str] = Field(default=None, description="Optional: A descriptive label for the Y-axis. Defaults to y_column if not provided.")
+
 
 # --- Define Structure for LLM Final Response (Used as a Tool/Schema) ---
 class FinalApiResponseStructure(BaseModel):
@@ -68,67 +110,6 @@ class AgentState(TypedDict):
     final_response_structure: Optional[FinalApiResponseStructure]
     # Add request_id for logging context
     request_id: Optional[str] = None
-
-
-# --- Database Schema Tool ---
-class DatabaseSchemaTool(BaseTool):
-    """Tool for fetching database schema information to help generate SQL queries."""
-    
-    name: str = "get_schema_info"
-    description: str = """Fetches database schema information to help generate SQL queries.
-    Use this tool when you need details about database tables, columns, and relationships.
-    The output includes table names, column descriptions, primary/foreign keys, and data types."""
-    
-    class SchemaQueryArgs(BaseModel):
-        db_name: str = Field(
-            default="report_management", 
-            description="The database name to fetch schema for. Default is 'report_management'."
-        )
-    
-    args_schema: type[BaseModel] = SchemaQueryArgs
-    
-    def _run(self, db_name: str = "report_management") -> str:
-        """Get schema information from predefined schema definitions."""
-        logger.debug(f"[DatabaseSchemaTool] Fetching schema for database: {db_name}")
-        
-        from app.db.schema_definitions import SCHEMA_DEFINITIONS
-        
-        if db_name not in SCHEMA_DEFINITIONS:
-            error_msg = f"No schema definition found for database {db_name}."
-            logger.warning(f"[DatabaseSchemaTool] {error_msg}")
-            return error_msg
-        
-        db_info = SCHEMA_DEFINITIONS[db_name]
-        schema_info = [
-            f"Database: {db_name}",
-            f"Description: {db_info['description']}",
-            ""
-        ]
-        
-        for table_name, table_info in db_info['tables'].items():
-            schema_info.append(f"Table: {table_name}")
-            schema_info.append(f"Description: {table_info['description']}")
-            
-            schema_info.append("Columns:")
-            for column in table_info['columns']:
-                primary_key = " (PRIMARY KEY)" if column.get('primary_key') else ""
-                foreign_key = f" (FOREIGN KEY -> {column.get('foreign_key')})" if column.get('foreign_key') else ""
-                timestamp_note = " (Timestamp for filtering)" if 'timestamp' in column['type'].lower() else ""
-                schema_info.append(f"  {column['name']} ({column['type']}){primary_key}{foreign_key} - {column['description']}{timestamp_note}")
-            
-            if 'example_queries' in table_info:
-                schema_info.append("Example queries:")
-                for query in table_info['example_queries']:
-                    schema_info.append(f"  {query}")
-            
-            schema_info.append("")  # Empty line between tables
-        
-        logger.info(f"[DatabaseSchemaTool] Successfully retrieved schema for {db_name}")
-        return "\n".join(schema_info)
-    
-    async def _arun(self, db_name: str = "report_management") -> str:
-        """Async implementation of schema retrieval."""
-        return self._run(db_name=db_name)
 
 
 # --- System Prompt ---
@@ -199,6 +180,7 @@ Available Tools:
     a. **When to Include Charts:** Populate the `chart_specs` list within `FinalApiResponseStructure` ONLY if:
         - The user explicitly requested a chart/visualization, OR
         - You are presenting complex data (e.g., comparisons across >3 categories/metrics) where a visual representation significantly aids understanding.
+        - **CRITICAL EXCEPTION:** If the user **explicitly asked ONLY for a table** and *not* a chart, **DO NOT** generate any chart specifications, even if the data seems complex. Respect the user's request for a table format. Table(s) and chart(s) should be given simultaneously only in those rare cases where tables have some extra, non-redundant data which would add actual and extra value over the text + chart(s) combo.
         - **AVOID charts for simple comparisons** (e.g., 2-3 items); prefer just the `text` summary unless a chart is explicitly requested.
     b. **Data Prerequisite:** Ensure the data needed for any chart specification exists in the `state['tables']` list, typically from a preceding `execute_sql` call.
     c. **Populating `chart_specs`:** For each chart you decide to include, add a `ChartSpecFinalInstruction` object to the `chart_specs` list within the `FinalApiResponseStructure` arguments.
@@ -325,10 +307,15 @@ When generating SQL queries to be executed by the `execute_sql` tool, follow the
     - Alias them clearly (e.g., `AS "Total Entries"`, `AS "Total Exits"`).
     - If the query specifically asks *only* for entries (e.g., "people came in") or *only* for exits (e.g., "people went out"), then only sum the corresponding column ("39" or "40").
 
+15. **Combine Related Metrics in SQL:**
+    - When the user asks for multiple related metrics from the same table over the same period (e.g., "borrows and returns", "entries and exits", "successful and unsuccessful borrows"), generate a **single SQL query** that calculates all requested metrics using appropriate aggregate functions (e.g., `SUM("1") AS "Total Borrows", SUM("3") AS "Total Returns"`).
+    - **DO NOT** generate separate SQL queries for each metric if they can be efficiently combined into one query.
+
 # --- END SQL GENERATION GUIDELINES --- #
 
 **MANDATORY FINAL STEP:** Always conclude by calling `FinalApiResponseStructure` with appropriate arguments for `text`, `include_tables`, and `chart_specs`.
 """
+
 
 # --- LLM and Tools Initialization ---
 def get_llm():
@@ -347,7 +334,7 @@ def get_llm():
     )
 
 def get_tools(organization_id: str) -> List[Any]:
-    """Get operational tools for the agent (excluding FinalApiResponseStructure and DatabaseSchemaTool)."""
+    """Get operational tools for the agent (excluding FinalApiResponseStructure)."""
     return [
         HierarchyNameResolverTool(organization_id=organization_id),
         SQLExecutionTool(organization_id=organization_id),
@@ -360,13 +347,11 @@ def create_llm_with_tools_and_final_response_structure(organization_id: str):
     # Get operational tools first
     operational_tools = get_tools(organization_id)
     # Define all structures the LLM can output as "tools"
-    # Note: ChartSpecFinalInstruction is *part of* FinalApiResponseStructure, not bound separately
     all_bindable_items = operational_tools + [FinalApiResponseStructure]
 
-    # --- Fetch DB Schema String --- #
+    # --- Fetch DB Schema String using the helper function --- #
     try:
-        schema_tool = DatabaseSchemaTool() # Instantiate locally to get schema
-        db_schema_string = schema_tool._run() # Call synchronous run method
+        db_schema_string = _get_schema_string() # Call the helper function
         logger.debug("Successfully fetched DB schema string to inject into prompt.")
     except Exception as e:
         logger.error(f"Failed to fetch DB schema for prompt injection: {e}", exc_info=True)
@@ -539,13 +524,7 @@ def agent_node(state: AgentState, llm_with_structured_output):
         "final_response_structure": final_structure
         # REMOVED: chart_spec_instructions
     }
-    # We no longer need to explicitly pass tables here, final processing retrieves them from state.
-    # if final_structure:
-    #     current_tables = state.get("tables", [])
-    #     logger.info(f"[AgentNode] Final step detected. Tables in current state: {len(current_tables)}")
-    #     return_dict["tables"] = current_tables
-    #     logger.info(f"[AgentNode] Returning dict with keys: {list(return_dict.keys())}")
-        
+
     return return_dict
 
 
@@ -603,8 +582,6 @@ def _preprocess_state_for_llm(state: AgentState) -> AgentState:
                 processed_table['metadata']['original_rows'] = len(original_tables[i]['rows']) 
             processed_tables.append(processed_table)
         processed_state['tables'] = processed_tables
-
-    # REMOVED: Pruning logic for chart_spec_instructions as it's no longer in state
 
     return processed_state
 
@@ -835,7 +812,7 @@ def should_continue(state: AgentState) -> str:
         return END
 
 
-# --- Create LangGraph Agent (Updated) ---
+# --- Create LangGraph Agent ---
 def create_graph_app(organization_id: str) -> StateGraph:
     """
     Create the updated LangGraph application.
@@ -891,7 +868,7 @@ def create_graph_app(organization_id: str) -> StateGraph:
     return graph_app
 
 
-# --- Refactored process_chat_message (Updated for Simpler Chart Specs) ---
+# --- Refactored process_chat_message ---
 async def process_chat_message(
     organization_id: str,
     message: str,
@@ -990,12 +967,14 @@ async def process_chat_message(
                      if isinstance(source_table_dict, dict) and isinstance(source_table_dict.get('columns'), list) and isinstance(source_table_dict.get('rows'), list):
                           try:
                               source_table_data = TableData(**source_table_dict)
-                              api_data_for_chart = source_table_data # Default
-                              
-                              # Placeholder: Wide-to-long transformation logic
-                              if instruction.type_hint == "bar" and instruction.color_column and instruction.y_column == "Value":
-                                   logger.warning(f"Bar chart spec '{instruction.title}' might require wide-to-long data transformation; passing original data for now.")
-                                   # api_data_for_chart = transform_wide_to_long(source_table_data, instruction)
+                              # --- Apply Wide-to-Long Transformation if needed --- #
+                              api_data_for_chart = source_table_data # Start with original
+                              # Condition: Bar chart AND a color column is specified 
+                              # (implies multiple metrics needing the long format based on prompt Guideline #5e)
+                              if instruction.type_hint == "bar" and instruction.color_column is not None:
+                                  logger.info(f"Applying wide-to-long transformation for chart spec: {instruction.title}")
+                                  # Pass the original x_column name to identify the ID column
+                                  api_data_for_chart = _transform_wide_to_long(source_table_data, instruction.x_column)
 
                               # Construct the ApiChartSpecification (for API response)
                               api_spec = ApiChartSpecification(
@@ -1006,7 +985,7 @@ async def process_chat_message(
                                   color_column=instruction.color_column,
                                   x_label=instruction.x_label or instruction.x_column,
                                   y_label=instruction.y_label or instruction.y_column,
-                                  data=api_data_for_chart # Use the TableData model here
+                                  data=api_data_for_chart # Use the potentially transformed TableData here
                               )
                               final_visualizations_for_api.append(api_spec)
                               logger.debug(f"Successfully added API visualization spec: {api_spec.title}")
@@ -1046,7 +1025,55 @@ async def process_chat_message(
         return {"status": "error", "data": None, "error": {"code": error_code, "message": error_message, "details": error_details}}
 
 
-# --- test_azure_openai_connection() remains the same ---
+# --- Helper function for Data Transformation --- #
+def _transform_wide_to_long(wide_table: TableData, id_column_name: str) -> TableData:
+    """Transforms TableData from wide to long format for grouped bar charts."""
+    logger.debug(f"[_transform_wide_to_long] Starting transformation for table with ID column: {id_column_name}")
+    long_rows = []
+    metric_col_name = "Metric" # Convention expected by prompt Guideline #5e
+    value_col_name = "Value"   # Convention expected by prompt Guideline #5e
+
+    if not wide_table.rows or not wide_table.columns:
+        logger.warning("[_transform_wide_to_long] Input table has no rows or columns. Returning empty.")
+        return TableData(columns=[id_column_name, metric_col_name, value_col_name], rows=[], metadata=wide_table.metadata)
+
+    try:
+        id_col_index = wide_table.columns.index(id_column_name)
+    except ValueError:
+        logger.error(f"[_transform_wide_to_long] ID column '{id_column_name}' not found in wide table columns: {wide_table.columns}. Returning original table as fallback.")
+        return wide_table # Fallback to original to prevent downstream errors
+
+    value_column_indices = {
+        i: col_name for i, col_name in enumerate(wide_table.columns) if i != id_col_index
+    }
+
+    if not value_column_indices:
+         logger.warning(f"[_transform_wide_to_long] No value columns found besides ID column '{id_column_name}'. Returning original table.")
+         return wide_table
+
+    for wide_row in wide_table.rows:
+        id_value = wide_row[id_col_index]
+        for index, metric_name in value_column_indices.items():
+            value = wide_row[index]
+            try:
+                # Convert numeric types, pass others as is? Or enforce numeric?
+                # Let's try converting to float, falling back to None if not possible
+                numeric_value = float(value) if value is not None else None
+                long_rows.append([id_value, metric_name, numeric_value])
+            except (ValueError, TypeError):
+                 logger.warning(f"[_transform_wide_to_long] Could not convert value '{value}' for metric '{metric_name}' to float. Appending as None.")
+                 long_rows.append([id_value, metric_name, None])
+
+    long_columns = [id_column_name, metric_col_name, value_col_name]
+    logger.debug(f"[_transform_wide_to_long] Transformation complete. Produced {len(long_rows)} long format rows.")
+    
+    new_metadata = wide_table.metadata.copy() if wide_table.metadata else {}
+    new_metadata["transformed_from_wide"] = True
+
+    return TableData(columns=long_columns, rows=long_rows, metadata=new_metadata)
+
+
+# --- test_azure_openai_connection() ---
 async def test_azure_openai_connection() -> bool:
     """Test connection to Azure OpenAI API."""
     try:
