@@ -43,6 +43,23 @@ def setup_logging():
     file_handler.setFormatter(file_format)
     root_logger.addHandler(file_handler)
     
+    # --- Usage logger setup --- #
+    usage_file_handler = RotatingFileHandler(
+        log_dir / "usage.log",
+        maxBytes=5242880,  # 5MB for usage logs
+        backupCount=3,
+    )
+    usage_file_handler.setLevel(logging.INFO) # Log all usage events
+    # Simple formatter - the message is already key-value formatted
+    usage_format = logging.Formatter("%(asctime)s - %(message)s") 
+    usage_file_handler.setFormatter(usage_format)
+    
+    usage_logger = logging.getLogger("usage")
+    usage_logger.setLevel(logging.INFO) # Ensure logger level allows INFO
+    usage_logger.addHandler(usage_file_handler)
+    usage_logger.propagate = False # Don't send usage logs to root logger/other handlers
+    # --- End Usage logger setup --- #
+    
     # Set specific logger levels, respecting the main debug level
     # Lower the level of noisy libraries unless LOG_LEVEL is DEBUG
     default_external_level = logging.WARNING if log_level > logging.DEBUG else logging.INFO
