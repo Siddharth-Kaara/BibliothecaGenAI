@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     MAX_TABLE_ROWS_IN_STATE: int = Field(default=100, description="Maximum rows per table to keep in agent state.")
     TOOL_RETRY_DELAY: float = Field(default=1.0, description="Base delay in seconds between tool execution retries.")
     TOOL_EXECUTION_RETRIES: int = Field(default=2, description="Number of retries allowed for failed tool executions.")
+    LLM_MAX_RETRIES: int = Field(default=2, description="Max retries for LLM calls via underlying client (total attempts = N+1).")
     
     # Security
     SECRET_KEY: str = ""

@@ -8,15 +8,16 @@ import functools
 from pydantic_core import ValidationError 
 import uuid 
 import datetime 
-import re # Import regex module
-import openai # <-- ADD THIS IMPORT
+import re 
+import openai
+from openai import APIConnectionError, APITimeoutError, RateLimitError 
 
 # LangChain & LangGraph Imports
 from langchain_core.messages import BaseMessage, FunctionMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import AzureChatOpenAI
 from langchain_core.output_parsers.openai_tools import PydanticToolsParser, JsonOutputToolsParser
-from langchain_core.runnables import RunnableConfig 
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, END
 from langchain.tools import BaseTool
 
@@ -108,12 +109,10 @@ class FinalApiResponseStructure(BaseModel):
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add] # Conversation history
     tables: Annotated[List[Dict[str, Any]], operator.add] # List of tables from sql_query tool calls
-    # REMOVED: visualizations - chart specs are now part of FinalApiResponseStructure
     # Add a field to hold the final structured response once generated
     final_response_structure: Optional[FinalApiResponseStructure]
     # Add request_id for logging context
     request_id: Optional[str] = None
-    # Add fields for cumulative token counts
     prompt_tokens: Annotated[int, operator.add]
     completion_tokens: Annotated[int, operator.add]
 
@@ -130,7 +129,8 @@ Your primary responsibility is to analyze organizational data and provide accura
 *   **DO NOT** provide the final answer as plain text in the message content. Your final output MUST be a call to `FinalApiResponseStructure`.
 *   The `FinalApiResponseStructure` includes fields for `text`, `include_tables`, and importantly, `chart_specs`.
 *   **FORMATTING:** Your response *must* be structured as an `AIMessage` object where the `tool_calls` list contains the `FinalApiResponseStructure` call with its arguments. Do not simply write the JSON or the tool name in the text content.
-*   Failure to call `FinalApiResponseStructure` as the absolute final step, formatted correctly as a tool call within the `AIMessage.tool_calls` attribute, is an error.
+*   **STRICT SCHEMA:** When calling `FinalApiResponseStructure`, you **MUST ONLY provide arguments for the defined fields: `text`, `include_tables`, `chart_specs`. DO NOT include any other fields or data** within the `args` dictionary.
+*   Failure to call `FinalApiResponseStructure` as the absolute final step, formatted correctly as a tool call within the `AIMessage.tool_calls` attribute, and adhering strictly to its schema, is an error.
 
 # --- Example: Refusal Tool Call ---
 # If you need to refuse a request (e.g., asking for weather), your FINAL output MUST be an AIMessage containing ONLY this tool call:
@@ -178,7 +178,15 @@ Available Tools:
 
 1. **Analyze Request & History:** Always review the conversation history (`messages`) for context, previous tool outputs (`ToolMessage`), and accumulated data (`tables` in state).
 
-2. **Hierarchy Name Resolution (MANDATORY for location names):**
+2. **Handle Tool Errors:** If the last message in the history is a `ToolMessage` indicating an error during the execution of a tool (e.g., `SQLExecutionTool`, `HierarchyNameResolverTool`), **DO NOT** attempt to re-run the failed tool or interpret the technical error details. Instead, your **NEXT and FINAL** action MUST be to invoke the `FinalApiResponseStructure` tool with:
+    *   A polite, user-friendly `text` message acknowledging an issue occurred while trying to fulfill the request (e.g., "I encountered a problem while trying to retrieve the data. Please try rephrasing your request or try again later."). **DO NOT include technical details** from the error message.
+    *   Empty `include_tables` and `chart_specs` lists.
+
+3. **Handle Ambiguity:** If the user's request is too vague or ambiguous to determine a clear course of action (e.g., which tool to use, what specific data is needed, what timeframe is relevant), **DO NOT guess or execute a default action.** Instead, your **NEXT and FINAL** action MUST be to invoke the `FinalApiResponseStructure` tool to ask a clarifying question. 
+    *   Example `text`: "To help me answer accurately, could you please specify which metric (e.g., borrows, footfall) and timeframe you are interested in?" or "Could you please clarify which location or type of activity you'd like to know about?"
+    *   Use empty `include_tables` and `chart_specs`.
+
+4. **Hierarchy Name Resolution (MANDATORY for location names):**
    - If the user mentions specific organizational hierarchy entities by name (e.g., "Main Library", "Argyle Branch"), you MUST call the `hierarchy_name_resolver` tool **ALONE** as your first action.
    - Pass the list of names as `name_candidates`.
    - This tool uses the correct `organization_id` from the request context automatically.
@@ -186,15 +194,16 @@ Available Tools:
    - If any status is 'not_found' or 'error': Inform the user via `FinalApiResponseStructure` (with empty `chart_specs`).
    - If all relevant names have status 'found': Proceed to the next step using the returned `id` values.
 
-3. **Database Schema Understanding:**
+5. **Database Schema Understanding:**
    - The full schema for the 'report_management' database is provided above in the prompt.
    - **Refer to this schema directly** when generating SQL queries.
    - Table names must be used exactly as defined in the schema: '5' for events, '8' for footfall, and 'hierarchyCaches' for hierarchy data.
 
-4. **SQL Generation & Execution:**
+6. **SQL Generation & Execution:**
    - YOU are responsible for generating the SQL query based on the database schema provided above.
    - After generating SQL, use the `execute_sql` tool to execute it. The result will be added to the `tables` list in the state.
-   - **CRITICAL TRANSITION:** Once you have formulated the **single** `execute_sql` tool call that you determine will directly and sufficiently answer the user's quantitative query, your **IMMEDIATE NEXT STEP** must be to prepare and invoke the `FinalApiResponseStructure` tool (Guideline #7). **Do not generate the same `execute_sql` call multiple times in your response; generate it only once and then proceed immediately to the final structure.** Do not call any *other* operational tools after this point unless the initial SQL results (once returned in the next step) are clearly insufficient or erroneous.
+   - **CRITICAL TRANSITION:** Once you have formulated the **single** `execute_sql` tool call that you determine will directly and sufficiently answer the user's quantitative query, your **IMMEDIATE NEXT STEP** must be to prepare and invoke the `FinalApiResponseStructure` tool (Guideline #9). **Do not generate the same `execute_sql` call multiple times in your response; generate it only once and then proceed immediately to the final structure.** Do not call any *other* operational tools after this point unless the initial SQL results (once returned in the next step) are clearly insufficient or erroneous.
+   - **CRITICAL (Benchmarking): DO NOT generate a separate `execute_sql` call just to calculate an organizational average if it can be (and should be) calculated within the main benchmarking query using a CTE (as per SQL Guideline #10).** Generate only the *single*, combined query.
    - **CRITICAL:** The arguments for `execute_sql` MUST be a JSON object with the keys "sql" and "params".
      - The "sql" key holds the SQL query string.
      - The "params" key holds a dictionary of parameters. This dictionary **MUST** include "organization_id" and any other parameters used in the query.
@@ -202,7 +211,7 @@ Available Tools:
      - Example arguments structure:
        ```json
        {{
-         "sql": "SELECT ... WHERE \\"organizationId\\" = :organization_id",
+         "sql": "SELECT ... WHERE \"organizationId\" = :organization_id",
          "params": {{
            "organization_id": "<ACTUAL_ORG_ID_VALUE>",
            "other_param": "value"
@@ -217,7 +226,7 @@ Available Tools:
      - All parameters in the SQL are prefixed with a colon (e.g., `:organization_id`)
      - All parameters used in the SQL have a corresponding key in the params dictionary (e.g., if `:branch_id` is in the SQL, `params` must contain a `"branch_id"` key).
 
-5. **Chart Specification Strategy:** When formulating the final response using `FinalApiResponseStructure`:
+7. **Chart Specification Strategy:** When formulating the final response using `FinalApiResponseStructure`:
     a. **When to Include Charts:** Populate the `chart_specs` list within `FinalApiResponseStructure` ONLY if:
         - The user explicitly requested a chart/visualization, OR
         - You are presenting complex data (e.g., comparisons across >3 categories/metrics) where a visual representation significantly aids understanding.
@@ -288,210 +297,101 @@ Available Tools:
             }}}}
             ```
 
-6. **CRITICAL TOOL CHOICE: `execute_sql` vs. `summary_synthesizer`:**
+8. **CRITICAL TOOL CHOICE: `execute_sql` vs. `summary_synthesizer`:**
    - **Use Direct SQL Generation (`execute_sql`) IF AND ONLY IF:** The user asks for a comparison OR retrieval of **specific, quantifiable metrics** (e.g., counts, sums of borrows, returns, renewals, logins) for **specific, resolved entities** (e.g., Main Library [ID: xxx], Argyle Branch [ID: yyy]) over a **defined time period**. Your goal is to generate a single, efficient SQL query. The result table might be used for a chart specification later.
    - **Use `summary_synthesizer` ONLY FOR:** More **open-ended, qualitative summary requests** (e.g., "summarize activity," "tell me about the branches") where specific metrics are not the primary focus, or when the exact metrics are unclear. Call it directly after name resolution (if applicable), providing context in the `query` argument. Its output will be purely text. **Do not include chart specifications when `summary_synthesizer` is used.**
 
-7. **Final Response Formation:**
-   - **TRIGGER:** You must reach this step and call `FinalApiResponseStructure` as your final action. This is mandatory **immediately after** receiving the necessary data from `execute_sql` (per Guideline #4) or `summary_synthesizer`.
+9. **Final Response Formation:**
+   - **TRIGGER:** You must reach this step and call `FinalApiResponseStructure` as your final action. This is mandatory **immediately after** receiving the necessary data from `execute_sql` (per Guideline #5) or `summary_synthesizer`.
    - Examine the gathered data (`tables` in state).
    - **Decide which tables to include using the `include_tables` flag in `FinalApiResponseStructure`. Apply the following criteria:**
        *   **Prefer `False` for Redundancy:** If the essential information from a table is fully represented in a chart (listed in `chart_specs`) AND adequately summarized in the `text`, set the corresponding `include_tables` flag to `False` to avoid unnecessary duplication.
        *   **Prefer `False` for Simple Summaries:** If a table contains a simple result (e.g., a single row with a total count) that is clearly stated and explained in the `text`, the table is often redundant; lean towards setting the flag to `False`.
        *   **Prefer `True` for Detail/Explicit Request:** Include a table (set flag to `True`) primarily when it provides detailed data points that are not easily captured in the text or a chart, or if the user explicitly asked for the table or raw data.
        *   Default to `False` unless the user explicitly asks for it, or the table adds some actual and extra value over the text + chart (if there is one) combo.
-   - Decide which chart specifications to generate and include directly in the `chart_specs` list within `FinalApiResponseStructure` (follow Guideline #5).
-   - **CRITICAL `text` field Formatting:** Ensure the `text` field is **CONCISE** (1-3 sentences), focuses on insights/anomalies, and **REFERENCES** any included table(s) or chart spec(s). **DO NOT** repeat detailed data. **NEVER include markdown tables or extensive data lists in the `text` field;** use the `include_tables` and `chart_specs` fields for detailed data presentation. Example: "The table below shows X, and the bar chart illustrates the trend for Y."
+   - Decide which chart specifications to generate and include directly in the `chart_specs` list within `FinalApiResponseStructure` (follow Guideline #6).
+   - **CRITICAL `text` field Formatting:** Ensure the `text` field is **CONCISE** (1-3 sentences), focuses on insights/anomalies, and **REFERENCES** any included table(s) or chart spec(s). **DO NOT** repeat detailed data. **NEVER include markdown tables or extensive data lists in the `text` field;** use the `include_tables` and `chart_specs` fields for detailed data presentation. 
+     *   **Mention Default Timeframes:** If the underlying data query used the **default timeframe** (e.g., 'last 30 days') because the user didn't specify one (as per SQL Guideline #11), **you MUST explicitly mention this timeframe** in your `text` response. Example: "*Over the last 30 days,* the total borrows were X..." or "The table below shows data *for the past 30 days*."
+     *   **Mention Resolved Names:** If the request involved resolving a hierarchy name (using `hierarchy_name_resolver`) and the resolved name is distinct or adds clarity (e.g., includes a code like '(MN)' or differs significantly from the user's input), **mention the resolved name** in your `text` response when referring to that entity. Example: "For *Main Library (MN)*, the total entries were Y..."
+     *   Example referencing items: "The table below shows X, and the bar chart illustrates the trend for Y."
    - If no useful tables/specs are included, provide the full answer/summary in the `text` field, but still keep it reasonably concise.
-   - **Accuracy:** Ensure the final text accurately reflects and references any included items.
+   - **Accuracy:** Ensure the final text accurately reflects and references any included items, timeframes, and resolved entities.
 
-8. **Strict Out-of-Scope Handling:**
-   - If a request is unrelated to library data or operations (e.g., weather, general knowledge, historical facts outside the library context, calculations), you MUST refuse it directly.
-   - **DO NOT** engage with the substance of the out-of-scope request, even if it contains factual errors you could correct. Simply state that the request is outside your capabilities.
-   - Use `FinalApiResponseStructure` (with empty `chart_specs` and `include_tables`) to deliver a brief refusal message (e.g., "I cannot answer questions about topics outside of library data and operations."). Ensure it's formatted correctly as a tool call (See example in 'CRITICAL FINAL STEP' section).
+10. **Strict Out-of-Scope Handling:**
+    - If a request is unrelated to library data or operations (e.g., weather, general knowledge, historical facts outside the library context, calculations, copyrighted material like specific song lyrics), you MUST refuse it directly.
+    - **CRITICAL:** Your refusal message MUST be polite and direct. **DO NOT** engage with the substance of the out-of-scope request (e.g., don't correct factual errors in the request). **MOST IMPORTANTLY: DO NOT offer alternative assistance related to the out-of-scope topic** (e.g., do not offer to summarize a song if you refuse to give lyrics; do not offer to find related books if asked about recipes). Simply state that the request is outside your capabilities and stop.
+    - Use `FinalApiResponseStructure` (with empty `chart_specs` and `include_tables`) to deliver a brief refusal message (e.g., "I cannot answer questions about topics outside of library data and operations." or "I cannot provide copyrighted material like song lyrics. My capabilities are focused on library data."). Ensure it's formatted correctly as a tool call (See example in 'CRITICAL FINAL STEP' section).
 
 # --- Workflow Summary --- #
 1. Analyze Request & History.
-2. **IF** hierarchy names present -> Call `hierarchy_name_resolver` FIRST. Check results; Refuse if needed.
-3. **DECIDE** Tool (Guideline #6):
+2. **IF** Tool Error in last message -> Generate error response via `FinalApiResponseStructure` & END.
+3. **IF** Request Ambiguous -> Ask clarifying question via `FinalApiResponseStructure` & END.
+4. **IF** hierarchy names present -> Call `hierarchy_name_resolver` FIRST. Check results; Refuse if needed.
+5. **DECIDE** Tool (Guideline #8):
    *   Specific Metrics? -> Plan for `execute_sql`.
    *   Qualitative Summary? -> Plan for `summary_synthesizer`.
-4. **IF** using `execute_sql`:
-   *   Refer to the schema provided above in the prompt.
-   *   Generate SQL & Call `execute_sql` (via tools node).
-   *   Double-check parameter values and SQL syntax (Guideline #4 and #16).
-5. **IF** using `summary_synthesizer`:
-   *   Call `summary_synthesizer` (via tools node).
-6. **DECIDE** final response content (text, which tables to include).
-7. **DECIDE** if chart(s) needed based on state['tables'].
-8. **IF** chart needed -> Prepare `ChartSpecFinalInstruction` object(s) (Guideline #5).
-9. **ALWAYS** conclude with `FinalApiResponseStructure` call, populating `text`, `include_tables`, and the `chart_specs` list appropriately.
+6. **IF** using `execute_sql`:
+   *   Refer to schema.
+   *   Generate SQL & Call `execute_sql`.
+   *   Check syntax & params.
+7. **IF** using `summary_synthesizer`:
+   *   Call `summary_synthesizer`.
+8. **DECIDE** final response content (text, tables, mention defaults/resolved names).
+9. **DECIDE** if chart(s) needed.
+10. **IF** chart needed -> Prepare `ChartSpecFinalInstruction`(s).
+11. **ALWAYS** conclude with `FinalApiResponseStructure` call.
 # --- End Workflow Summary --- #
 
 # --- SQL GENERATION GUIDELINES --- #
 
-When generating SQL queries to be executed by the `execute_sql` tool, follow these strict guidelines:
+When generating SQL queries for the `execute_sql` tool, adhere strictly to these rules:
 
-1. **Parameter Placeholders:** Use parameter placeholders (e.g., :filter_value, :hierarchy_id) for ALL dynamic values derived from the query description (like names, IDs, specific filter values) EXCEPT for time-related values. **DO NOT** use parameters for date/time calculations.
-
-2. **Parameter Dictionary:** Create a valid parameters dictionary mapping placeholder names (without the colon) to their actual values. This MUST include the correct `organization_id` value (see Orchestration Guideline #4). Example: For SQL with `:organization_id` and `:branch_id`, the params dictionary must include both keys with their actual values.
-
-3. **Quoting & Naming (CRITICAL):**
-   - Quote table and column names with double quotes (e.g., "hierarchyCaches", "createdAt").
-   - **YOU MUST use the ACTUAL physical table names (e.g., '5' for events, '8' for footfall) in your SQL queries.**
-   - The schema description uses logical names (like 'events') for clarity, but your SQL query MUST use the physical names ('5', '8').
-   - **Failure to use the physical table names '5' or '8' will cause an error.**
-   - Example correct usage: `SELECT * FROM "5" WHERE ...` (NOT `SELECT * FROM "events" WHERE ...`)
-
-4. **Mandatory Organization Filtering:** ALWAYS filter results by the organization ID. Use the parameter `:organization_id`.
-   - **If querying table '5' (event data):** Add `"5"."organizationId" = :organization_id` to your WHERE clause.
-   - **If querying table '8' (footfall data):** Add `"8"."organizationId" = :organization_id` to your WHERE clause.
-   - **If querying `hierarchyCaches` for the organization's own details:** Filter using `hc."id" = :organization_id`.
-   - **If querying `hierarchyCaches` for LOCATIONS WITHIN the organization (e.g., branches, areas):** You MUST filter by the parent ID being the organization ID. Add `hc."parentId" = :organization_id` to your WHERE clause. DO NOT filter using `hc."organizationId"` as this column doesn't exist.
-
-5. **JOINs for Related Data:** When joining table '5' or '8' and `hierarchyCaches`, use appropriate keys:
-   - For events: `"5"."hierarchyId" = hc."id"`
-   - For footfall: `"8"."hierarchyId" = hc."id"`
-   - Always use table aliases for joins (e.g., `hc` for hierarchyCaches).
-   - Always apply the organization filter on both tables being joined (e.g., `WHERE "5"."organizationId" = :organization_id AND hc."parentId" = :organization_id`).
-
-6. **Case Sensitivity:** PostgreSQL is case-sensitive; respect exact table/column capitalization as shown in the schema.
-   - Example: Use `"eventTimestamp"` not `"EventTimestamp"` or `"eventtimestamp"`.
-
-7. **Column Selection:** Use specific column selection instead of SELECT *. Name all columns explicitly.
-   - Example: `SELECT "5"."1" AS "Total Borrows", hc."name" AS "Location Name" FROM ...`
-
-8. **Sorting:** Add ORDER BY clauses for meaningful sorting, especially when LIMIT is used.
-   - Example: `ORDER BY "Total Borrows" DESC` or `ORDER BY hc."name" ASC`.
-
-9. **LIMIT Clause:**
-   - For standard SELECT queries retrieving multiple rows, ALWAYS include `LIMIT 50` at the end.
-   - **DO NOT** add `LIMIT` for aggregate queries (like COUNT(*), SUM(...)) expected to return a single summary row.
-
-10. **Aggregations (COUNT vs SUM):**
-    - Use `COUNT(*)` for "how many records/items".
-    - Use `SUM("column_name")` for "total number/sum" based on a specific value column.
-      - For borrows: `SUM("1")`
-      - For returns: `SUM("3")`
-      - For logins: `SUM("5")`
-      - For renewals: `SUM("7")`
-      - For entries (footfall): `SUM("39")`
-      - For exits (footfall): `SUM("40")`
-    - Ensure `GROUP BY` includes all non-aggregated selected columns.
-    - Example: `SELECT hc."name" AS "Location Name", SUM("1") AS "Total Borrows" FROM "5" JOIN "hierarchyCaches" hc ON "5"."hierarchyId" = hc."id" WHERE "5"."organizationId" = :organization_id AND hc."parentId" = :organization_id AND "eventTimestamp" >= NOW() - INTERVAL '7 days' GROUP BY hc."name"`
-
-11. **User-Friendly Aliases:**
-    - When selecting columns or using aggregate functions (SUM, COUNT, etc.), ALWAYS use descriptive, user-friendly aliases with title casing using the `AS` keyword.
-    - Examples: `SELECT hc."hierarchyId" AS "Hierarchy ID"`, `SELECT COUNT(*) AS "Total Records"`, `SELECT SUM("39") AS "Total Entries"`.
-    - Do NOT use code-style aliases like `total_entries` or `hierarchyId`.
-
-12. **Benchmarking for Analytical Queries:**
-    - If the user asks for analysis or comparison regarding a specific entity (e.g., "is branch X busy?", "compare borrows for branch Y"), *in addition* to selecting the specific metric(s) for that entity, include a simple benchmark for comparison in the same query.
-    - **Use CTEs for Benchmarks:** The preferred way to calculate an organization-wide average (or similar benchmark) alongside a specific entity's value is using a Common Table Expression (CTE).
-    - Example:
-      ```sql
-      WITH org_avg AS (
-        SELECT AVG(total_borrows) AS "Org Average Borrows"
-        FROM (
-          SELECT SUM("1") AS total_borrows
-          FROM "5"
-          WHERE "organizationId" = :organization_id
-            AND "eventTimestamp" >= NOW() - INTERVAL '30 days'
-          GROUP BY "hierarchyId"
-        ) AS sub
-      )
-      SELECT
-        hc."name" AS "Branch Name",
-        SUM("1") AS "Branch Borrows",
-        (SELECT "Org Average Borrows" FROM org_avg) AS "Organization Average Borrows"
-      FROM "5"
-      JOIN "hierarchyCaches" hc ON "5"."hierarchyId" = hc."id"
-      WHERE "5"."hierarchyId" = :branch_id
-        AND "5"."organizationId" = :organization_id
-        AND "eventTimestamp" >= NOW() - INTERVAL '30 days'
-      GROUP BY hc."name"
-      ```
-    - **Avoid nested aggregates:** Do NOT use invalid nested aggregate/window functions like `AVG(SUM(...)) OVER ()`. Use CTEs as shown above.
-    - Only include this benchmark if it can be done efficiently. The CTE approach is generally efficient.
-    - Ensure both the specific value and the benchmark value have clear, user-friendly aliases.
-
-13. **Time Filtering (Generate SQL Directly):**
-    - Use the Current Time Context provided above to resolve relative dates and years.
-    - If the user query includes time references (e.g., "last week", "yesterday", "past 3 months", "since June 1st", "before 2024"), you MUST generate the appropriate SQL `WHERE` clause condition directly.
-    - Use relevant SQL functions like `NOW()`, `CURRENT_DATE`, `INTERVAL`, `DATE_TRUNC`, `EXTRACT`, `MAKE_DATE`, and comparison operators (`>=`, `<`, `BETWEEN`).
-    - **Relative Time Interpretation:**
-      - "Today" -> `DATE_TRUNC('day', "eventTimestamp") = CURRENT_DATE`
-      - "Yesterday" -> `DATE_TRUNC('day', "eventTimestamp") = CURRENT_DATE - INTERVAL '1 day'`
-      - "Last week" -> `"eventTimestamp" >= NOW() - INTERVAL '7 days'`
-      - "Last month" -> `"eventTimestamp" >= NOW() - INTERVAL '1 month'`
-      - "Last 30 days" -> `"eventTimestamp" >= NOW() - INTERVAL '30 days'`
-      - "This year" -> `EXTRACT(YEAR FROM "eventTimestamp") = {current_year}`
-    - **Relative Months/Years:** For month names (e.g., "March") without a year, assume the **current year** ({current_year}). For years alone (e.g., "in 2024"), query the whole year.
-    - **Specific Day + Month (No Year):** For dates like "April 1st", construct the date using the **current year** ({current_year}). Use `MAKE_DATE({current_year}, <month_number>, <day_number>)`. (No casting needed as {current_year} is already an integer).
-    - **Last Working Day Logic:** Based on the `Current Context` Day of the Week ({current_day}), determine the date of the last working day (assuming Mon-Fri). Filter for events matching *that specific date* using `DATE_TRUNC('day', "timestamp_column") = calculated_date`.
-        *   If Today is Monday, Last Working Day = `CURRENT_DATE - INTERVAL '3 days'` (Friday).
-        *   If Today is Tuesday, Last Working Day = `CURRENT_DATE - INTERVAL '1 day'` (Monday).
-        *   If Today is Wednesday through Friday, Last Working Day = `CURRENT_DATE - INTERVAL '1 day'`.
-        *   Identify the correct timestamp column (typically "eventTimestamp" for tables '5' and '8').
-    - **Examples:**
-        *   For "March": `WHERE EXTRACT(MONTH FROM "eventTimestamp") = 3 AND EXTRACT(YEAR FROM "eventTimestamp") = {current_year}`
-        *   For "April 1st": `WHERE DATE_TRUNC('day', "eventTimestamp") = MAKE_DATE({current_year}, 4, 1)`
-        *   For "last working day" (if Today is Monday): `WHERE DATE_TRUNC('day', "eventTimestamp") = CURRENT_DATE - INTERVAL '3 days'`
-        *   For "last working day" (if Today is Wednesday): `WHERE DATE_TRUNC('day', "eventTimestamp") = CURRENT_DATE - INTERVAL '1 day'`
-        *   For "Q1 2023": `WHERE "eventTimestamp" >= MAKE_DATE(2023, 1, 1) AND "eventTimestamp" < MAKE_DATE(2023, 4, 1)`
-    - **DO NOT** use parameters like `:start_date` or `:end_date` for these time calculations.
-
-14. **Date-Based Aggregation:**
-    - If the user asks for metrics 'by date', 'per day', 'daily', or 'along with dates', generate SQL that aggregates the relevant metric(s) using appropriate functions (SUM, COUNT) and explicitly includes `DATE("eventTimestamp") AS "Date"` (or the relevant timestamp column) in the SELECT list.
-    - You **MUST** also include `DATE("eventTimestamp")` in the `GROUP BY` clause.
-    - Remember to apply necessary time filters (e.g., last 30 days) in the `WHERE` clause.
-    - Example: `SELECT DATE("eventTimestamp") AS "Date", SUM("1") AS "Total Borrows" FROM "5" WHERE ... GROUP BY DATE("eventTimestamp") ORDER BY "Date" ASC`
-
-15. **Footfall Queries (Table \"8\"):**
-    - If the query asks generally about "footfall", "visitors", "people entering/leaving", or "how many people visited", calculate **both** the sum of entries (`SUM(\"39\")`) and the sum of exits (`SUM(\"40\")`).
-    - Alias them clearly (e.g., `AS "Total Entries"`, `AS "Total Exits"`).
-    - If the query specifically asks *only* for entries (e.g., "people came in") or *only* for exits (e.g., "people went out"), then only sum the corresponding column ("39" or "40").
-    - Example:
-      ```sql
-      SELECT
-        SUM("39") AS "Total Entries",
-        SUM("40") AS "Total Exits"
-      FROM "8"
-      WHERE "organizationId" = :organization_id AND "eventTimestamp" >= NOW() - INTERVAL '7 days'
-      ```
-
-16. **Combine Related Metrics in SQL:**
-    - When the user asks for multiple related metrics from the same table over the same period (e.g., "borrows and returns", "entries and exits", "successful and unsuccessful borrows"), generate a **single SQL query** that calculates all requested metrics using appropriate aggregate functions (e.g., `SUM("1") AS "Total Borrows", SUM("3") AS "Total Returns"`).
-    - **CRITICAL:** **DO NOT** generate separate `execute_sql` tool calls for each metric if they can be efficiently combined into one query. Generate **ONLY ONE** `execute_sql` call containing the single, combined query.
-    - **CRITICAL:** **DO NOT** generate multiple `execute_sql` calls if they request the same core data and differ only in presentation (e.g., `ORDER BY` clause). Generate only the single, most relevant query needed to retrieve the necessary data for the final answer.
-    - Example:
-      ```sql
-      SELECT
-        hc."name" AS "Location Name",
-        SUM("1") AS "Total Borrows",
-        SUM("3") AS "Total Returns",
-        SUM("7") AS "Total Renewals"
-      FROM "5"
-      JOIN "hierarchyCaches" hc ON "5"."hierarchyId" = hc."id"
-      WHERE "5"."organizationId" = :organization_id
-        AND hc."parentId" = :organization_id -- Correct JOIN filter
-        AND "eventTimestamp" >= NOW() - INTERVAL '30 days'
-      GROUP BY hc."name"
-      ORDER BY "Total Borrows" DESC
-      LIMIT 50
-      ```
-
-17. **SQL Syntax Verification Checklist:**
-    Before finalizing the SQL query tool call arguments, verify that:
-    - All table and column names used in the SQL query match exactly with the schema provided (including physical names like '5', '8').
-    - All table and column names are properly double-quoted.
-    - All parameter placeholders in the SQL string are prefixed with colons (:).
-    - The `WHERE` clause includes the appropriate organization filter(s) (on table '5', '8', or 'hierarchyCaches' as needed).
-    - All parameters used in the SQL string have corresponding key-value entries in the `params` dictionary.
-    - For joined tables, appropriate join conditions and table aliases are used.
-    - For aggregate queries, all non-aggregated selected columns are included in the `GROUP BY` clause.
-    - For multi-row result queries, appropriate `ORDER BY` and `LIMIT 50` clauses are included (unless it's a single-row aggregate result).
-    - For time-based queries, the correct SQL time functions and calculations are generated directly in the SQL string, not passed as parameters.
+1.  **Parameters:** Use parameter placeholders (e.g., `:filter_value`, `:hierarchy_id`, `:branch_id`) for ALL dynamic values EXCEPT date/time calculations. The `params` dictionary MUST map placeholder names (without colons) to values and MUST include the correct `organization_id`.
+2.  **Use Resolved Hierarchy IDs:** If a previous step involved `hierarchy_name_resolver` and returned an ID for a location (e.g., in a `ToolMessage`), subsequent SQL queries filtering by that location **MUST** use the resolved ID via a parameter (e.g., `WHERE "hierarchyId" = :branch_id` or `WHERE hc."id" = :location_id`). **DO NOT** filter using the location name string (e.g., `WHERE hc."name" = 'Resolved Branch Name'`).
+3.  **Quoting & Naming:** Double-quote all table/column names (e.g., `"hierarchyCaches"`, `"createdAt"`). **CRITICAL: You MUST use the physical table names ('5' for events, '8' for footfall)** in your SQL, not logical names. Refer to the schema above. PostgreSQL is case-sensitive (e.g., use `"eventTimestamp"`, not `"EventTimestamp"`).
+4.  **Mandatory Org Filtering:** ALWAYS filter by organization ID using `:organization_id`.
+    *   Table '5' or '8': Add `WHERE "table_name"."organizationId" = :organization_id`.
+    *   `hierarchyCaches` for org details: Filter `WHERE hc."id" = :organization_id`.
+    *   `hierarchyCaches` for locations within org: Filter `WHERE hc."parentId" = :organization_id`.
+5.  **JOINs:** Use correct keys (`"5"."hierarchyId" = hc."id"` or `"8"."hierarchyId" = hc."id"`). Use table aliases (e.g., `hc`). Filter BOTH tables by organization (e.g., `WHERE "5"."organizationId" = :organization_id AND hc."parentId" = :organization_id`).
+6.  **Selection:** Select specific columns, not `*`. Example: `SELECT "5"."1" AS "Total Borrows", hc."name" AS "Location Name" FROM ...`.
+7.  **Aliases:** ALWAYS use descriptive, user-friendly, title-cased aliases for selected columns and aggregates (e.g., `AS "Total Borrows"`, `AS "Location Name"`). Do not use code-style aliases.
+8.  **Sorting & Limit:** Use `ORDER BY` for meaningful sorting. ALWAYS add `LIMIT 50` to multi-row SELECT queries (NOT needed for single-row aggregates like COUNT/SUM).
+9.  **Aggregations:** Use `COUNT(*)` for counts. Use `SUM("column")` for totals, referencing the correct physical column number from the schema:
+    *   Borrows: `SUM("1") AS "Total Borrows"`
+    *   Returns: `SUM("3") AS "Total Returns"`
+    *   Logins: `SUM("5") AS "Total Logins"`
+    *   Renewals: `SUM("7") AS "Total Renewals"`
+    *   Entries (Footfall): `SUM("39") AS "Total Entries"`
+    *   Exits (Footfall): `SUM("40") AS "Total Exits"`
+    *   Ensure `GROUP BY` includes all non-aggregated selected columns.
+10. **Benchmarking:** For analysis/comparison queries (e.g., "compare branch X borrows"), use a CTE to calculate an organization-wide average or benchmark alongside the specific entity's metric. **CRITICAL:** The CTE must calculate the average of the **total metric per location**, not the average of the raw metric values across all events. Use a subquery with `SUM(...)` and `GROUP BY "hierarchyId"` inside the `AVG()` calculation. Ensure clear aliases. **Avoid nested aggregates** (like `AVG(SUM(...)) OVER ()`); use the CTE pattern:
+    ```sql
+    -- Example CTE Pattern for Benchmarking (Average of SUMs per location)
+    WITH org_avg AS (
+      SELECT AVG(total_metric_per_location) AS "Org Average Metric"
+      FROM (
+        SELECT SUM("metric_column") AS total_metric_per_location
+        FROM "source_table"
+        WHERE "organizationId" = :organization_id /* + optional time filter */
+        GROUP BY "hierarchyId"
+      ) AS subquery_of_totals_per_location
+    )
+    SELECT hc."name", SUM("metric_column"), (SELECT "Org Average Metric" FROM org_avg)
+    FROM "source_table" JOIN "hierarchyCaches" hc ON ...
+    WHERE /* Filter for specific location using ID */ AND "source_table"."organizationId" = :organization_id /* + optional time filter */
+    GROUP BY hc."name";
+    ```
+11. **Time Filtering:** Generate SQL date/time conditions DIRECTLY using `NOW()`, `CURRENT_DATE`, `INTERVAL`, `DATE_TRUNC`, `EXTRACT`, `MAKE_DATE`, etc., based on the Current Time Context provided above and user query terms. **DO NOT** pass dates/times as parameters.
+    *   **Default Timeframe (MANDATORY):** If the user asks for an aggregate calculation (SUM, COUNT, AVG) but **does not specify a time period**, you **MUST** default to using a recent period, specifically **`"eventTimestamp" >= NOW() - INTERVAL '30 days'`**. Include this default filter in the `WHERE` clause. This is mandatory unless the user explicitly specifies a different timeframe.
+    *   Resolve relative terms: "last week" -> `"eventTimestamp" >= NOW() - INTERVAL '7 days'`, "yesterday" -> `DATE_TRUNC('day', "eventTimestamp") = CURRENT_DATE - INTERVAL '1 day'`.
+    *   Use `{current_year}` for month/day without year: "March" -> `EXTRACT(MONTH FROM "eventTimestamp") = 3 AND EXTRACT(YEAR FROM "eventTimestamp") = {current_year}`, "April 1st" -> `DATE_TRUNC('day', "eventTimestamp") = MAKE_DATE({current_year}, 4, 1)`.
+    *   Handle specific ranges: "Q1 2023" -> `"eventTimestamp" >= MAKE_DATE(2023, 1, 1) AND "eventTimestamp" < MAKE_DATE(2023, 4, 1)`.
+    *   Calculate last working day based on `{current_day}`: If Today is Mon, use `CURRENT_DATE - INTERVAL '3 days'`; Tue-Fri use `CURRENT_DATE - INTERVAL '1 day'`. Filter like: `DATE_TRUNC('day', "eventTimestamp") = <calculated_date>`.
+12. **Date Aggregation:** For "daily" or "by date" metrics, include `DATE("eventTimestamp") AS "Date"` in SELECT and GROUP BY.
+13. **Footfall Queries (Table '8'):** For general footfall/visitor queries, calculate `SUM("39") AS "Total Entries"` AND `SUM("40") AS "Total Exits"`. If only entries or exits are asked for, sum only the specific column.
+14. **Combine Metrics:** **CRITICAL:** Generate a SINGLE `execute_sql` call if multiple related metrics (e.g., borrows & returns) from the same table/period are requested. **DO NOT** make separate calls for each metric. Also, do not make separate calls if queries differ only by presentation (e.g., `ORDER BY`).
+15. **Final Check:** Before finalizing the tool call, mentally re-verify all points above, **especially applying the mandatory default timeframe (#11 if applicable)** and using resolved IDs (#2): physical names ('5', '8'), quoting, parameters, org filter, aliases, joins, aggregates, LIMIT, time logic, metric combination.
 
 # --- END SQL GENERATION GUIDELINES --- #
 
@@ -501,7 +401,7 @@ When generating SQL queries to be executed by the `execute_sql` tool, follow the
 
 # --- LLM and Tools Initialization ---
 def get_llm():
-    """Get the Azure OpenAI LLM."""
+    """Get the Azure OpenAI LLM configured with internal retries."""
     logger.info(f"Initializing Azure OpenAI LLM with deployment {settings.AZURE_OPENAI_DEPLOYMENT_NAME}")
     # Ensure model supports tool calling / structured output
     return AzureChatOpenAI(
@@ -512,6 +412,7 @@ def get_llm():
         model_name=settings.LLM_MODEL_NAME, 
         temperature=0.15,
         verbose=settings.VERBOSE_LLM,
+        max_retries=settings.LLM_MAX_RETRIES, # Pass retry setting
         # streaming=False # Ensure streaming is False if not handled downstream
     )
 
@@ -579,8 +480,10 @@ def create_llm_with_tools_and_final_response_structure(organization_id: str):
         tools=all_bindable_items, # Pass operational tools + FinalApiResponseStructure
         tool_choice=None # Let the LLM decide which tool/structure to call
     )
-    logger.debug(f"Created LLM bound with tools and FinalApiResponseStructure for org: {organization_id}")
-    return prompt | llm_with_tools
+    
+    logger.debug(f"Created LLM runnable bound with tools/structure for org: {organization_id}")
+    # Return the combined prompt and LLM runnable
+    return prompt | llm_with_tools 
 
 # --- Agent Node: Decides action - call a tool or invoke FinalApiResponseStructure ---
 def _get_sql_call_signature(args: Dict[str, Any]) -> tuple:
@@ -603,248 +506,238 @@ def _get_sql_call_signature(args: Dict[str, Any]) -> tuple:
     return (core_sql, params_signature)
 
 def agent_node(state: AgentState, llm_with_structured_output):
-    """Invokes the LLM to decide the next action or final response structure.
-       Includes smarter deduplication for execute_sql calls.
+    """Invokes the LLM ONCE to decide the next action or final response structure.
+       If the LLM returns a plain AIMessage, it coerces it into FinalApiResponseStructure.
     """
     request_id = state.get("request_id")
-    logger.debug(f"[AgentNode] Entering agent node...")
+    logger.debug(f"[AgentNode] Entering agent node (single invocation logic)...")
 
     llm_response: Optional[AIMessage] = None
     final_structure: Optional[FinalApiResponseStructure] = None
-    final_api_call = None # Initialize here to ensure variable exists in scope
-    
-    # Parser for the final response structure (which might include chart specs)
-    final_response_parser = PydanticToolsParser(tools=[FinalApiResponseStructure])
-    
-    preprocessed_state = _preprocess_state_for_llm(state)
-    failures = []
-
-    for attempt in range(3): # Retry loop
-        try:
-            llm_response = llm_with_structured_output.invoke(preprocessed_state)
-            logger.debug(f"[AgentNode] Raw LLM response (Attempt {attempt + 1}): {llm_response.pretty_repr() if isinstance(llm_response, BaseMessage) else llm_response}")
-
-            if isinstance(llm_response, AIMessage) and llm_response.tool_calls:
-                 operational_calls = []
-                 final_api_call = None
-
-                 # Check for final structure call first
-                 for tc in llm_response.tool_calls:
-                     if tc.get("name") == FinalApiResponseStructure.__name__:
-                         if final_api_call is None: final_api_call = tc
-                         else: logger.warning(f"[AgentNode] Multiple FinalApiResponseStructure calls found, using first.")
-                     else:
-                         operational_calls.append(tc)
-
-                 # If FinalApiResponseStructure is called, parse it
-                 if final_api_call:
-                     logger.debug("[AgentNode] Found FinalApiResponseStructure call.")
-                     try:
-                         # Add default for include_tables before parsing
-                         args = final_api_call.get("args", {})
-                         num_tables = len(state.get('tables', []))
-                         if "include_tables" not in args: args["include_tables"] = [False] * num_tables
-                         if isinstance(args.get("include_tables"), bool): args["include_tables"] = [args["include_tables"]] * max(1, num_tables)
-                         # chart_specs default is handled by Pydantic model (default_factory=list)
-                         
-                         parsed_final = final_response_parser.invoke(AIMessage(content="", tool_calls=[final_api_call]))
-                         if parsed_final:
-                             final_structure = parsed_final[0]
-                             logger.debug(f"[AgentNode] LLM returned valid FinalApiResponseStructure (contains {len(final_structure.chart_specs)} chart specs).")
-                             break # Success, exit retry loop
-                         else:
-                             failures.append(f"Attempt {attempt + 1}: FinalAPIStructure parser returned empty list")
-                     except ValidationError as e:
-                         failures.append(f"Attempt {attempt+1}: FinalAPIStructure validation fail: {e}")
-                     except Exception as e:
-                         failures.append(f"Attempt {attempt + 1}: Error parsing FinalAPIStructure: {e}")
-                 
-                 # If no final structure call, but operational calls exist, proceed with tools
-                 elif operational_calls:
-                      # --- Log ALL Received Operational Calls --- #
-                      logger.info(f"[AgentNode] Received {len(operational_calls)} operational tool call(s) from LLM.")
-                      for i, tc in enumerate(operational_calls):
-                          tool_name = tc.get("name", "Unknown")
-                          tool_args = tc.get("args", {})
-                          logger.debug(f"[AgentNode] Raw Call #{i+1}: Name='{tool_name}', Args={tool_args}") # Log basic info
-                          if tool_name == "execute_sql":
-                              generated_sql = tool_args.get("sql", "SQL not found in args")
-                              generated_params = tool_args.get("params", "Params not found in args")
-                              # Log the details here, clearly marking it's from the raw response
-                              logger.info(f"[AgentNode] Raw SQL Call #{i+1} Received: {generated_sql}")
-                              logger.info(f"[AgentNode] Raw Params #{i+1} Received: {generated_params}")
-
-                      # --- Smart Deduplication of Operational Tool Calls --- #
-                      unique_operational_calls = []
-                      discarded_duplicates = []
-                      seen_signatures = set()
-                      for tc in operational_calls:
-                          tool_name = tc.get("name")
-                          tool_args = tc.get("args", {})
-                          signature = None
-                          if tool_name == "execute_sql":
-                              signature = _get_sql_call_signature(tool_args)
-                          else:
-                              # For non-SQL tools, use simple name + args signature
-                              signature = (tool_name, json.dumps(tool_args, sort_keys=True))
-                              
-                          if signature not in seen_signatures:
-                              unique_operational_calls.append(tc)
-                              seen_signatures.add(signature)
-                              logger.debug(f"[AgentNode] Keeping unique call (ID: {tc.get('id')}, Signature: {signature})")
-                          else:
-                              discarded_duplicates.append(tc) # Track discarded functional duplicates
-                      # --- End Smart Deduplication --- #
-
-                      # --- Log Discarded Functional Duplicates --- #
-                      for discarded_tc in discarded_duplicates:
-                           logger.warning(f"[AgentNode] Discarded functionally duplicate operational tool call (ID: {discarded_tc.get('id')}): {discarded_tc.get('name')} with args {discarded_tc.get('args', {})}")
-
-                      # --- Check if any unique calls remain AFTER deduplication ---
-                      if not unique_operational_calls:
-                           failures.append(f"Attempt {attempt + 1}: No unique operational tool calls remaining after deduplication.")
-                           continue # Go to next retry attempt
-
-                      # --- Log Summary of Unique Calls Proceeding --- #
-                      logger.info(f"[AgentNode] Proceeding with {len(unique_operational_calls)} unique operational tool call(s): {[c.get('name') for c in unique_operational_calls]}")
-
-                      # Modify the AIMessage to only contain unique calls before adding to state
-                      llm_response.tool_calls = unique_operational_calls
-                      break # Exit retry loop to execute tools
-                 
-                 # If neither final structure nor operational calls found
-                 else:
-                      failures.append(f"Attempt {attempt + 1}: No operational tool calls or FinalApiResponseStructure found.")
-            else:
-                 failures.append(f"Attempt {attempt + 1}: Response not AIMessage or no tool calls.")
-
-        # --- Catch specific OpenAI errors, especially content filtering --- #
-        except openai.BadRequestError as e:
-            logger.error(f"[AgentNode] OpenAI BadRequestError during LLM invocation (Attempt {attempt + 1}): {e}", exc_info=False) # Log less verbosely for known errors
-            # Check if it's a content filter error
-            if e.body and e.body.get('code') == 'content_filter':
-                logger.warning(f"[AgentNode] Azure OpenAI Content Filter triggered (Attempt {attempt + 1}). Returning safe response.")
-                # Create a safe, generic fallback structure immediately
-                safe_fallback_structure = FinalApiResponseStructure(
-                    text="I cannot process this request due to content policies.", 
-                    include_tables=[],
-                    chart_specs=[] 
-                )
-                # Return immediately, bypassing further retries and standard fallback
-                return {
-                    "messages": [], 
-                    "final_response_structure": safe_fallback_structure,
-                    "prompt_tokens": 0, # Assume 0 tokens as the call failed before completion
-                    "completion_tokens": 0 
-                }
-            else:
-                # If it's a different BadRequestError, add to failures and potentially retry
-                failures.append(f"Attempt {attempt + 1}: OpenAI BadRequestError: {str(e)}")
-            llm_response = None # Invalidate response
-
-        except Exception as e:
-            logger.error(f"[AgentNode] Unhandled Exception during LLM invocation (Attempt {attempt + 1}): {e}", exc_info=True)
-            failures.append(f"Attempt {attempt + 1}: LLM invocation exception: {str(e)}")
-            llm_response = None # Invalidate response on exception
-
-    # --- Fallback Logic for FinalApiResponseStructure ---
-    # Trigger fallback only if the LLM was *supposed* to return the final structure but failed or returned plain text
-    needs_fallback_final = False
-    if llm_response and isinstance(llm_response, AIMessage):
-        if llm_response.tool_calls:
-             # If final call was detected in the loop but parsing failed
-             if any(tc.get("name") == FinalApiResponseStructure.__name__ for tc in llm_response.tool_calls) and final_structure is None:
-                 needs_fallback_final = True
-        else: # If LLM returned plain text when structure was expected (end of graph likely)
-             # This condition might need refinement depending on graph flow - how do we know structure was *expected*?
-             # Assuming for now that plain text from agent often means it *thinks* it's done.
-             needs_fallback_final = True 
-
-    if needs_fallback_final:
-        logger.warning(f"[AgentNode] Triggering fallback logic for FinalApiResponseStructure. Failures: {failures}")
-        fallback_text = "Could not generate final response structure. Check logs."
-        
-        # Try to extract text from the raw tool call args if parsing failed but call existed
-        if final_api_call and final_api_call.get("args") and isinstance(final_api_call["args"].get("text"), str):
-             raw_tool_text = final_api_call["args"]["text"].strip()
-             if raw_tool_text:
-                 logger.debug("[AgentNode] Using text from raw tool call arguments for fallback structure.")
-                 fallback_text = raw_tool_text
-             else:
-                 logger.debug("[AgentNode] Raw tool call text argument was empty.")
-        # Only use llm_response.content if the tool call text wasn't usable
-        elif llm_response and isinstance(llm_response.content, str) and llm_response.content.strip():
-             raw_content = llm_response.content.strip()
-             logger.debug(f"[AgentNode] Using LLM's plain text content for fallback structure as tool call text wasn't available/usable.")
-             # --- Attempt to clean up unwanted AIMessage string representation --- #
-             try:
-                 # Find the start of the unwanted representation
-                 split_index = raw_content.index("AIMessage(") 
-                 # Take the part before it
-                 fallback_text = raw_content[:split_index].strip()
-                 # If the part before is empty (e.g., only AIMessage was returned), use a generic message
-                 if not fallback_text:
-                     logger.warning("[AgentNode] Fallback content cleanup resulted in empty string. Using generic refusal. LLM Content: " + raw_content)
-                     fallback_text = "I cannot process this request due to content policies or an internal error."
-                 else:
-                    logger.debug(f"[AgentNode] Successfully cleaned AIMessage representation from fallback content.")
-             except ValueError: 
-                 # AIMessage( not found, use raw content as is
-                 logger.debug(f"[AgentNode] AIMessage representation not found in fallback content. Using raw content.")
-                 fallback_text = raw_content
-             # --- End Cleanup --- #
-
-        try:
-            # Fallback includes empty chart_specs list
-            final_structure = FinalApiResponseStructure(
-                text=fallback_text, 
-                include_tables=[True] * len(state.get("tables", [])), # Default to True for tables in fallback
-                chart_specs=[] 
-            )
-            logger.debug(f"[AgentNode] Created fallback FinalApiResponseStructure.")
-            # --- IMMEDIATE RETURN FOR FALLBACK ---
-            # If fallback structure was created, return it immediately with zero tokens for this turn.
-            return {
-                "messages": [], # No new LLM message to add in fallback
-                "final_response_structure": final_structure,
-                "prompt_tokens": 0, # No LLM call succeeded for this turn's final structure
-                "completion_tokens": 0 
-            }
-        except Exception as fallback_err:
-            logger.error(f"[AgentNode] Error creating fallback structure: {fallback_err}", exc_info=True)
-            # If even fallback creation fails, return a minimal error structure
-            return {
-                "messages": [],
-                "final_response_structure": FinalApiResponseStructure(
-                    text="An internal error occurred while generating the response.",
-                    include_tables=[],
-                    chart_specs=[]
-                ),
-                "prompt_tokens": 0,
-                "completion_tokens": 0
-            }
-
-
-    # --- This block is now only reached if fallback was NOT triggered and returned ---
-    logger.debug(f"[AgentNode] Exiting agent node (standard path).")
-    
-    # --- Construct Final Return Dictionary --- #
-    # Extract token usage if available (only relevant if LLM call was successful)
-    prompt_tokens_turn = 0
-    completion_tokens_turn = 0
-    if llm_response and hasattr(llm_response, 'usage_metadata') and llm_response.usage_metadata:
-        prompt_tokens_turn = llm_response.usage_metadata.get('prompt_tokens', 0)
-        completion_tokens_turn = llm_response.usage_metadata.get('completion_tokens', 0)
-        logger.debug(f"[AgentNode] Tokens used this turn: Prompt={prompt_tokens_turn}, Completion={completion_tokens_turn}")
-
-    # Return message for history, final structure, and token counts for accumulation
+    operational_calls = []
     return_dict: Dict[str, Any] = {
-        "messages": [llm_response] if llm_response else [],
-        "final_response_structure": final_structure,
-        "prompt_tokens": prompt_tokens_turn,          # Return counts for this turn
-        "completion_tokens": completion_tokens_turn   # Return counts for this turn
+        "messages": [],
+        "final_response_structure": None,
+        "prompt_tokens": 0, # Initialize, will be updated if call succeeds
+        "completion_tokens": 0
     }
 
+    # Parser for the final response structure
+    final_response_parser = PydanticToolsParser(tools=[FinalApiResponseStructure])
+
+    preprocessed_state = _preprocess_state_for_llm(state)
+
+    try:
+        llm_response = llm_with_structured_output.invoke(preprocessed_state)
+        # --- ADDED: Debugging logs for raw LLM output --- #
+        logger.debug(f"[AgentNode] Raw LLM response object type: {type(llm_response)}")
+        if isinstance(llm_response, AIMessage):
+             logger.debug(f"[AgentNode] Raw LLM response content: {llm_response.content!r}")
+             logger.debug(f"[AgentNode] Raw LLM response tool_calls: {llm_response.tool_calls}")
+             logger.debug(f"[AgentNode] Raw LLM usage_metadata: {getattr(llm_response, 'usage_metadata', None)}")
+        # --- END Debugging logs --- #
+
+        # --- Extract Token Usage --- #
+        prompt_tokens_turn = 0 # Initialize outside the if for safety in except blocks?
+        completion_tokens_turn = 0 # Initialize outside the if for safety in except blocks?
+        if llm_response and hasattr(llm_response, 'usage_metadata') and llm_response.usage_metadata:
+            metadata = llm_response.usage_metadata
+            # --- Map the correct keys: input_tokens → prompt_tokens, output_tokens → completion_tokens --- #
+            return_dict["prompt_tokens"] = metadata.get('input_tokens', 0)
+            return_dict["completion_tokens"] = metadata.get('output_tokens', 0)
+            # --- Log DIRECTLY from metadata OR the dict --- #
+            logger.debug(
+                f"[AgentNode] Tokens used this turn: "
+                f"Prompt={return_dict['prompt_tokens']}, "
+                f"Completion={return_dict['completion_tokens']}"
+            )
+        else:
+            # Ensure return_dict has 0s if metadata is missing
+            return_dict["prompt_tokens"] = 0
+            return_dict["completion_tokens"] = 0
+        # --- End Token Usage --- #
+
+        # --- Process LLM Response --- #
+        if isinstance(llm_response, AIMessage):
+            return_dict["messages"] = [llm_response] # Add message to history regardless
+            final_api_call = None
+
+            # --- REVISED LOGIC: Prioritize processing if tool_calls exist --- #
+            if llm_response.tool_calls:
+                # Separate final structure call from operational calls
+                for tc in llm_response.tool_calls:
+                    if tc.get("name") == FinalApiResponseStructure.__name__:
+                        if final_api_call is None: final_api_call = tc
+                        else: logger.warning(f"[AgentNode] Multiple FinalApiResponseStructure calls found, using first.")
+                    else:
+                        operational_calls.append(tc)
+
+                # CASE 1: FinalApiResponseStructure tool called by LLM
+                if final_api_call:
+                    logger.debug("[AgentNode] LLM called FinalApiResponseStructure tool.")
+                    try:
+                        # Add default for include_tables before parsing
+                        args = final_api_call.get("args", {})
+                        num_tables = len(state.get('tables', []))
+                        if "include_tables" not in args: args["include_tables"] = [False] * num_tables
+                        if isinstance(args.get("include_tables"), bool): args["include_tables"] = [args["include_tables"]] * max(1, num_tables)
+                        
+                        parsed_final = final_response_parser.invoke(AIMessage(content="", tool_calls=[final_api_call]))
+                        if parsed_final:
+                            final_structure = parsed_final[0]
+                            logger.debug(f"[AgentNode] Successfully parsed FinalApiResponseStructure from tool call.")
+                        else:
+                            logger.warning("[AgentNode] FinalAPIStructure parser returned empty list from tool call. Creating fallback.")
+                            final_structure = FinalApiResponseStructure(text="Error parsing final response structure.", include_tables=[], chart_specs=[]) # Fallback
+                    except ValidationError as e:
+                        logger.warning(f"[AgentNode] FinalAPIStructure validation failed from tool call: {e}. Creating fallback.")
+                        final_structure = FinalApiResponseStructure(text="Error validating final response structure.", include_tables=[], chart_specs=[]) # Fallback
+                    except Exception as e:
+                        logger.warning(f"[AgentNode] Error parsing FinalAPIStructure from tool call: {e}. Creating fallback.")
+                        final_structure = FinalApiResponseStructure(text="Error processing final response structure.", include_tables=[], chart_specs=[]) # Fallback
+
+                # CASE 2: Operational tool(s) called by LLM (NO FinalApiResponseStructure)
+                elif operational_calls:
+                    logger.debug(f"[AgentNode] LLM called {len(operational_calls)} operational tool(s). Applying deduplication.")
+                    unique_operational_calls = []
+                    discarded_duplicates = []
+                    seen_signatures = set()
+                    for tc in operational_calls:
+                        tool_name = tc.get("name")
+                        tool_args = tc.get("args", {})
+                        signature = None
+                        if tool_name == "execute_sql":
+                            signature = _get_sql_call_signature(tool_args)
+                        else:
+                            signature = (tool_name, json.dumps(tool_args, sort_keys=True))
+                            
+                        if signature not in seen_signatures:
+                            unique_operational_calls.append(tc)
+                            seen_signatures.add(signature)
+                        else:
+                            discarded_duplicates.append(tc)
+                    
+                    for discarded_tc in discarded_duplicates:
+                        logger.warning(f"[AgentNode] Discarded functionally duplicate operational tool call (ID: {discarded_tc.get('id')})")
+
+                    if unique_operational_calls:
+                        # Modify the AIMessage in the return dict to only contain unique calls
+                        llm_response.tool_calls = unique_operational_calls
+                        return_dict["messages"] = [llm_response]
+                        logger.info(f"[AgentNode] Proceeding with {len(unique_operational_calls)} unique operational tool call(s).")
+                        # No final_structure set here, graph proceeds to 'tools'
+                    else:
+                        # If all operational calls were duplicates
+                        logger.warning("[AgentNode] No unique operational tool calls remaining after deduplication. Creating fallback final structure.")
+                        final_structure = FinalApiResponseStructure(
+                            text="No valid actions could be performed after processing tool calls. Please try again.",
+                            include_tables=[], chart_specs=[]
+                        )
+                
+                # CASE 3: LLM response had tool_calls list, but it was empty or contained unknown calls
+                else: 
+                    logger.warning("[AgentNode] LLM response had tool_calls list, but contained no recognized Final or operational calls. Creating fallback final structure.")
+                    final_structure = FinalApiResponseStructure(
+                        text="Received an unexpected tool call format from the language model.",
+                        include_tables=[], chart_specs=[]
+                    )
+
+            # --- END Handling responses WITH tool_calls --- #
+
+            # --- NEW CASE 4: Plain AIMessage response (NO tool_calls list) --- #
+            else: 
+                logger.info("[AgentNode] LLM AIMessage has NO tool_calls. Coercing content into FinalApiResponseStructure.")
+                if isinstance(llm_response.content, str) and llm_response.content.strip():
+                    # --- RE-ADD Cleanup Logic HERE --- #
+                    raw_content = llm_response.content.strip()
+                    coerced_text = raw_content # Default to raw content
+                    try:
+                        split_index = raw_content.rfind("\nAIMessage(") 
+                        if split_index != -1:
+                            if len(raw_content) - split_index < 500: # Heuristic length check
+                                potential_text = raw_content[:split_index].strip()
+                                if potential_text: 
+                                    coerced_text = potential_text
+                                    logger.debug(f"[AgentNode] Successfully cleaned AIMessage representation from coerced text.")
+                                else:
+                                     logger.warning(f"[AgentNode] Coerced content cleanup resulted in empty string. Using original content. Raw: {raw_content}")
+                    except Exception as cleanup_err: 
+                        logger.warning(f"[AgentNode] Error during AIMessage cleanup: {cleanup_err}. Using raw content.")
+                    # --- END RE-ADD Cleanup Logic --- #
+
+                    try:
+                        # Use the potentially cleaned text for the final structure
+                        final_structure = FinalApiResponseStructure(
+                            text=coerced_text, # USE CLEANED TEXT
+                            include_tables=[], 
+                            chart_specs=[]      
+                        )
+                        logger.debug("[AgentNode] Successfully coerced plain text content into FinalApiResponseStructure.")
+                    except Exception as coerce_err:
+                        logger.error(f"[AgentNode] Error coercing plain text content: {coerce_err}", exc_info=True)
+                        final_structure = FinalApiResponseStructure(text="I encountered an issue processing the response.", include_tables=[], chart_specs=[])
+                else:
+                    # No tool calls and no content
+                    logger.warning("[AgentNode] LLM AIMessage had no tool calls and no content. Using safe fallback structure.")
+                    final_structure = FinalApiResponseStructure(text="I received an empty response.", include_tables=[], chart_specs=[])
+
+        # CASE 5: LLM response was not an AIMessage
+        else:
+            logger.error(f"[AgentNode] LLM response was not an AIMessage object (Type: {type(llm_response)}). Using safe fallback structure.")
+            final_structure = FinalApiResponseStructure(text="An internal error occurred communicating with the language model.", include_tables=[], chart_specs=[])
+
+    # --- Handle Specific Errors (e.g., Content Filter, Connection Error) --- #
+    except openai.BadRequestError as e:
+        logger.error(f"[AgentNode] OpenAI BadRequestError during LLM invocation: {e}", exc_info=False)
+        if e.body and e.body.get('code') == 'content_filter':
+            logger.warning(f"[AgentNode] Azure OpenAI Content Filter triggered. Returning safe response.")
+            final_structure = FinalApiResponseStructure(text="I cannot process this request due to content policies.", include_tables=[], chart_specs=[])
+        else:
+            # For other BadRequestErrors (potentially non-retryable client errors)
+            final_structure = FinalApiResponseStructure(text=f"An error occurred processing the request ({e.code or 'Unknown'}). Please check your input.", include_tables=[], chart_specs=[])
+        return_dict["prompt_tokens"] = 0
+        return_dict["completion_tokens"] = 0
+
+    # --- ADDED: Handle specific connection-related errors AFTER retries --- #
+    except APIConnectionError as e:
+        logger.error(f"[AgentNode] OpenAI APIConnectionError after retries: {e}", exc_info=False)
+        final_structure = FinalApiResponseStructure(
+            text="I'm having trouble connecting to the language model service right now. Please try your request again in a moment.",
+            include_tables=[], chart_specs=[]
+        )
+        return_dict["prompt_tokens"] = 0
+        return_dict["completion_tokens"] = 0
+    except (APITimeoutError, RateLimitError) as e:
+        # Handle timeouts and rate limits similarly after retries
+        logger.error(f"[AgentNode] OpenAI {type(e).__name__} after retries: {e}", exc_info=False)
+        final_structure = FinalApiResponseStructure(
+            text="The language model service is currently busy or timed out. Please try again shortly.",
+            include_tables=[], chart_specs=[]
+        )
+        return_dict["prompt_tokens"] = 0
+        return_dict["completion_tokens"] = 0
+    # --- END Specific Error Handling --- #
+
+    # --- Handle General Exceptions --- #
+    except Exception as e:
+        # This catches any other unexpected errors during the LLM call or node logic
+        logger.error(f"[AgentNode] Unhandled Exception during LLM invocation or node processing: {e}", exc_info=True)
+        final_structure = FinalApiResponseStructure(text="An unexpected internal error occurred.", include_tables=[], chart_specs=[])
+        return_dict["prompt_tokens"] = 0
+        return_dict["completion_tokens"] = 0
+
+    # --- Final Step: Update Return Dictionary --- #
+    if final_structure:
+        return_dict["final_response_structure"] = final_structure
+        if return_dict["messages"] and isinstance(return_dict["messages"][0], AIMessage):
+             original_message = return_dict["messages"][0]
+             # Clear tool calls from message history IF a final structure was set here
+             return_dict["messages"] = [AIMessage(content=original_message.content, id=original_message.id, usage_metadata=original_message.usage_metadata)]
+             # Ensure operational_calls list is empty if final structure is set
+             operational_calls = [] 
+
+    # If operational calls were identified and a final_structure was NOT set, they remain in return_dict["messages"][0].tool_calls
+    logger.debug(f"[AgentNode] Exiting agent node. Final Structure Set: {final_structure is not None}. Proceeding Tool Calls in Message History: {len(return_dict['messages'][0].tool_calls) if return_dict['messages'] and isinstance(return_dict['messages'][0], AIMessage) else 0}")
     return return_dict
 
 
@@ -1039,96 +932,61 @@ def _is_retryable_error(error: Exception) -> bool:
     # e.g., if "408" in error_str or isinstance(error, SpecificAzureError)
     return False
 
-# --- Node for Hierarchy Resolution ---
-async def resolve_hierarchy_node(state: AgentState, tools: List[Any]) -> Dict[str, Any]:
-    """Executes ONLY the hierarchy_name_resolver tool if called.
-    Simplified version of async_tools_node_handler.
-    """
-    request_id = state.get("request_id")
-    logger.debug(f"[ResolveHierarchyNode] Entering hierarchy resolver node.")
-    messages = state.get("messages", [])
-    last_message = messages[-1] if messages else None
-    resolver_tool_call = None
-    tool_name = HierarchyNameResolverTool.__name__ # Tool name is fixed
-
-    if isinstance(last_message, AIMessage) and last_message.tool_calls:
-         for tc in last_message.tool_calls:
-              if tc.get("name") == tool_name: resolver_tool_call = tc; break
-
-    if not resolver_tool_call:
-        logger.warning(f"[ResolveHierarchyNode] Expected {tool_name} call, not found.")
-        return {"messages": []}
-
-    tool_map = {tool.name: tool for tool in tools}
-    resolver_tool = tool_map.get(tool_name)
-    if not resolver_tool:
-         logger.error(f"[ResolveHierarchyNode] {tool_name} tool implementation not found.")
-         # Ensure error message has correct args
-         err_tool_id = resolver_tool_call.get('id', '') if resolver_tool_call else ''
-         return {"messages": [ToolMessage(content=f"Error: Tool {tool_name} not available.", tool_call_id=err_tool_id, name=tool_name)]}
-
-    tool_id = resolver_tool_call.get("id", "")
-    args = resolver_tool_call.get("args", {})
-    try:
-        logger.debug(f"[ResolveHierarchyNode] Executing {tool_name} (ID: {tool_id})")
-        content = await resolver_tool.ainvoke(args)
-        if asyncio.iscoroutine(content): content = await content
-        content_str = json.dumps(content) if isinstance(content, dict) else str(content)
-        logger.debug(f"[ResolveHierarchyNode] {tool_name} (ID: {tool_id}) completed successfully.")
-        return {"messages": [ToolMessage(content=content_str, tool_call_id=tool_id, name=tool_name)]}
-    except Exception as e:
-        error_msg_for_log = f"Error executing tool '{tool_name}' (ID: {tool_id}): {str(e)}";
-        logger.error(f"[ResolveHierarchyNode] {error_msg_for_log}", exc_info=True)
-        # Ensure error message has correct args
-        return {"messages": [ToolMessage(content=f"Tool execution failed: {str(e)}", tool_call_id=tool_id, name=tool_name)]}
-
-
 # --- Conditional Edge Logic (Updated for simpler flow) ---
 def should_continue(state: AgentState) -> str:
-    """Determines the next step based on the last message and state."""
+    """Determines the next step based on the last message and state.
+       Routes to END if a tool execution error is detected in the last message.
+    """
     request_id = state.get("request_id")
     messages = state.get("messages", [])
     last_message = messages[-1] if messages else None
     final_structure_in_state = state.get("final_response_structure")
 
-    # If the final structure is already set (by agent node or fallback), we end.
+    # If the final structure is already set (by agent node), we end.
     if final_structure_in_state:
         logger.debug("[ShouldContinue] Final response structure found in state. Routing to END.")
         return END
+
+    # --- ADDED: Check for Tool Execution Errors --- #
+    if isinstance(last_message, ToolMessage):
+        # Check if the tool message content indicates an error (simple check)
+        content_str = str(last_message.content).lower()
+        if content_str.startswith("error:") or "failed execution:" in content_str or "tool execution failed:" in content_str:
+            logger.warning(f"[ShouldContinue] Tool error detected in last message ({last_message.name}). Routing to END.")
+            return END
+    # --- END Tool Error Check --- #
         
-    # Analyze the last message from the agent node
+    # Analyze the last message from the agent node (if no tool error detected)
     if isinstance(last_message, AIMessage):
         if last_message.tool_calls:
-            # Check if ONLY the hierarchy resolver was called
-            is_resolver_only = len(last_message.tool_calls) == 1 and last_message.tool_calls[0].get("name") == HierarchyNameResolverTool.__name__
-            # Check if any operational tools (excluding FinalApiResponseStructure) were called
+            # Check if ANY operational tools (excluding FinalApiResponseStructure) were called
             has_operational_calls = any(
                 tc.get("name") != FinalApiResponseStructure.__name__ 
                 for tc in last_message.tool_calls
             )
-            # Check if FinalApiResponseStructure was called (shouldn't happen if final_structure_in_state is None, but check anyway)
+            # Check if FinalApiResponseStructure was called (should only happen if final_structure_in_state is already set)
             has_final_call = any(tc.get("name") == FinalApiResponseStructure.__name__ for tc in last_message.tool_calls)
 
             if has_final_call: 
                 logger.warning("[ShouldContinue] FinalApiResponseStructure tool call found, but structure not in state? Routing to END.")
-                return END # Should have been caught by final_structure_in_state check
-            elif is_resolver_only:
-                 logger.debug("[ShouldContinue] HierarchyResolverTool call found. Routing to 'resolve_hierarchy'.")
-                 return "resolve_hierarchy"
+                return END # Should be caught by final_structure_in_state check
             elif has_operational_calls:
+                 # This includes HierarchyNameResolverTool, SQLExecutionTool, SummarySynthesizerTool
                  logger.debug("[ShouldContinue] Operational tool call(s) found. Routing to 'tools'.")
                  return "tools" 
             else:
-                 # No operational calls, no final call in AIMessage. Should not happen with current agent logic?
-                 logger.warning("[ShouldContinue] AIMessage has tool calls but no recognized operational or final calls. Looping back to agent.")
-                 return "agent" # Loop back to agent to reconsider
+                 logger.warning("[ShouldContinue] AIMessage has tool_calls list but no recognized operational or final calls. Routing to END.")
+                 return END 
         else:
-             # If AIMessage has no tool calls, loop back to agent to generate final response.
-             logger.debug("[ShouldContinue] AIMessage with no tool calls. Looping back to 'agent'.")
-             return "agent"
+             logger.warning("[ShouldContinue] AIMessage with no tool calls reached here (should have been coerced/ended). Routing to END.")
+             return END
+    elif isinstance(last_message, ToolMessage): 
+        # If it was a ToolMessage but NOT an error, loop back to agent to process the result
+        logger.debug("[ShouldContinue] Tool message (non-error) found. Routing back to 'agent'.")
+        return "agent"
     else:
-        # If last message isn't AIMessage or state is unexpected, end.
-        logger.warning(f"[ShouldContinue] Last message not AIMessage or unexpected state ({type(last_message).__name__}), routing to END.")
+        # If last message isn't AIMessage or ToolMessage, or state is unexpected, end.
+        logger.warning(f"[ShouldContinue] Unexpected last message type ({type(last_message).__name__}) or state, routing to END.")
         return END
 
 
@@ -1136,8 +994,8 @@ def should_continue(state: AgentState) -> str:
 def create_graph_app(organization_id: str) -> StateGraph:
     """
     Create the updated LangGraph application.
-    Agent node generates operational tool calls or FinalApiResponseStructure (containing chart specs).
-    Tools node executes only operational tools.
+    Agent node generates operational tool calls or FinalApiResponseStructure.
+    Tools node executes all operational tools (including hierarchy resolver).
     """
     # LLM binding includes operational tools + FinalApiResponseStructure
     llm_with_bindings = create_llm_with_tools_and_final_response_structure(organization_id)
@@ -1151,16 +1009,12 @@ def create_graph_app(organization_id: str) -> StateGraph:
     # Create the tools node wrapper (passing ONLY operational tools)
     tools_handler_with_tools = functools.partial(async_tools_node_handler, tools=operational_tools)
 
-    # Create the hierarchy resolver node wrapper (passing ONLY operational tools)
-    resolver_handler_with_tools = functools.partial(resolve_hierarchy_node, tools=operational_tools)
-
     # --- Define the graph ---
     workflow = StateGraph(AgentState)
 
     # Add nodes
     workflow.add_node("agent", agent_node_wrapper)
-    workflow.add_node("tools", tools_handler_with_tools) # Node for general operational tools
-    workflow.add_node("resolve_hierarchy", resolver_handler_with_tools) # Dedicated node for resolver
+    workflow.add_node("tools", tools_handler_with_tools) # Node for ALL operational tools
 
     # Set the entry point
     workflow.set_entry_point("agent")
@@ -1170,16 +1024,13 @@ def create_graph_app(organization_id: str) -> StateGraph:
         "agent",
         should_continue,
         {
-            "resolve_hierarchy": "resolve_hierarchy",
-            "tools": "tools", 
-            "agent": "agent", # Loop back if agent needs to generate final response
+            "tools": "tools", # Route all operational tool calls here
             END: END
         }
     )
 
-    # Add edges from tool nodes back to the agent
+    # Add edge from the tools node back to the agent
     workflow.add_edge("tools", "agent")
-    workflow.add_edge("resolve_hierarchy", "agent")
 
     # Compile the graph
     logger.info("Compiling LangGraph workflow...")
@@ -1224,14 +1075,14 @@ async def process_chat_message(
         logger.warning(f"Initial message count ({len(initial_messages)}) exceeds limit ({settings.MAX_STATE_MESSAGES}). Pruning...")
         initial_messages = initial_messages[-settings.MAX_STATE_MESSAGES:]
 
-    # AgentState no longer includes 'visualizations'
+    # AgentState includes token counts again
     initial_state = AgentState(
         messages=initial_messages,
         tables=[],
         final_response_structure=None,
         request_id=req_id,
-        prompt_tokens=0,
-        completion_tokens=0
+        prompt_tokens=0, # Initialize prompt tokens
+        completion_tokens=0 # Initialize completion tokens
     )
 
     try:
@@ -1425,11 +1276,13 @@ async def process_chat_message(
 
             # Log final counts for verification
             logger.info(f"Final Response - Text: {len(final_text)} chars, Tables: {len(final_tables_for_api)}, Visualizations (Specs): {len(final_visualizations_for_api)}")
-
-            # --- Log Usage Data --- #
+            
+            # --- Add token usage log to main application logs ---
             total_prompt_tokens = final_state.get('prompt_tokens', 0)
             total_completion_tokens = final_state.get('completion_tokens', 0)
-            # Escape potential quotes/newlines in messages for cleaner single-line log
+            logger.info(f"Token Usage - Prompt: {total_prompt_tokens}, Completion: {total_completion_tokens}, Total: {total_prompt_tokens + total_completion_tokens}")
+            
+            # --- Log Usage Data --- #
             escaped_query = json.dumps(message)
             escaped_response = json.dumps(final_text)
             usage_logger.info(

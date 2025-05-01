@@ -60,17 +60,16 @@ def setup_logging():
     usage_logger.propagate = False # Don't send usage logs to root logger/other handlers
     # --- End Usage logger setup --- #
     
-    # Set specific logger levels, respecting the main debug level
     # Lower the level of noisy libraries unless LOG_LEVEL is DEBUG
-    default_external_level = logging.WARNING if log_level > logging.DEBUG else logging.INFO
+    default_external_level = logging.WARNING # Always set external libraries to WARNING
     logging.getLogger("httpx").setLevel(default_external_level)
     logging.getLogger("openai").setLevel(default_external_level) # Base OpenAI client
-    logging.getLogger("openai._base_client").setLevel(logging.WARNING) # Reduce spam from raw requests
-    logging.getLogger("httpcore").setLevel(logging.WARNING) # Reduce spam from HTTP library
+    logging.getLogger("openai._base_client").setLevel(default_external_level) # Reduce spam from raw requests
+    logging.getLogger("httpcore").setLevel(default_external_level) # Reduce spam from HTTP library
     logging.getLogger("langchain").setLevel(logging.INFO if log_level > logging.DEBUG else logging.DEBUG) # Langchain core
     logging.getLogger("langgraph").setLevel(logging.INFO if log_level > logging.DEBUG else logging.DEBUG) # Langgraph core
-    logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
-    logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING)
+    logging.getLogger("sqlalchemy.engine").setLevel(default_external_level)
+    logging.getLogger("matplotlib.font_manager").setLevel(default_external_level)
 
     # --- Configure Uvicorn Loggers --- #
     # Get Uvicorn loggers
