@@ -342,6 +342,10 @@ When generating SQL queries for the `execute_sql` tool, adhere strictly to these
 1.  **Parameters:** Use parameter placeholders (e.g., `:filter_value`, `:hierarchy_id`, `:branch_id`) for ALL dynamic values EXCEPT date/time calculations. The `params` dictionary MUST map placeholder names (without colons) to values and MUST include the correct `organization_id`.
 2.  **Use Resolved Hierarchy IDs:** If a previous step involved `hierarchy_name_resolver` and returned an ID for a location (e.g., in a `ToolMessage`), subsequent SQL queries filtering by that location **MUST** use the resolved ID via a parameter (e.g., `WHERE "hierarchyId" = :branch_id` or `WHERE hc."id" = :location_id`). **DO NOT** filter using the location name string (e.g., `WHERE hc."name" = 'Resolved Branch Name'`).
 3.  **Quoting & Naming:** Double-quote all table/column names (e.g., `"hierarchyCaches"`, `"createdAt"`). **CRITICAL: You MUST use the physical table names ('5' for events, '8' for footfall)** in your SQL, not logical names. Refer to the schema above. PostgreSQL is case-sensitive (e.g., use `"eventTimestamp"`, not `"EventTimestamp"`).
+    3b. **CRITICAL Table/Column Adherence:** You MUST strictly adhere to the columns available in each specific table as defined in the schema. 
+        - **Table "5" (events):** Contains event counts like borrows ("1"), returns ("3"), logins ("5"), renewals ("7"). **NEVER** select footfall columns ("39", "40") from table "5".
+        - **Table "8" (footfall):** Contains entry ("39") and exit ("40") counts. **NEVER** select event count columns (like "1", "3", "5", "7") from table "8".
+        - Generating SQL that attempts to select a column from the wrong table WILL cause errors.
 4.  **Mandatory Org Filtering:** ALWAYS filter by organization ID using `:organization_id`.
     *   Table '5' or '8': Add `WHERE "table_name"."organizationId" = :organization_id`.
     *   `hierarchyCaches` for org details: Filter `WHERE hc."id" = :organization_id`.
