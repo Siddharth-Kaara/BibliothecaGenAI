@@ -28,6 +28,7 @@ from app.langchain.tools.sql_tool import SQLExecutionTool
 from app.langchain.tools.summary_tool import SummarySynthesizerTool
 from app.langchain.tools.hierarchy_resolver_tool import HierarchyNameResolverTool
 from app.schemas.chat import ChatData, ApiChartSpecification, TableData
+from app.langchain.charting import ChartSpecFinalInstruction, process_and_validate_chart_specs
 
 logger = logging.getLogger(__name__)
 usage_logger = logging.getLogger("usage") 
@@ -73,21 +74,6 @@ def _get_schema_string(db_name: str = "report_management") -> str:
     return "\n".join(schema_info)
 
 
-# --- Instruction Structure included directly in FinalApiResponseStructure ---
-class ChartSpecFinalInstruction(BaseModel):
-    """Defines the specification for a chart to be rendered by the frontend.
-       This structure is generated directly by the LLM within the FinalApiResponseStructure.
-    """
-    source_table_index: int = Field(description="The 0-based index of the table in the agent's 'tables' state that contains the data for this chart.")
-    type_hint: str = Field(description="The suggested chart type for the frontend (e.g., 'bar', 'pie', 'line', 'scatter').")
-    title: str = Field(description="The title for the chart.")
-    x_column: str = Field(description="The name of the column from the source table to use for the X-axis or labels.")
-    y_column: str = Field(description="The name of the column from the source table to use for the Y-axis or values.")
-    color_column: Optional[str] = Field(default=None, description="Optional: The name of the column to use for grouping data by color/hue (e.g., for grouped bar charts).")
-    x_label: Optional[str] = Field(default=None, description="Optional: A descriptive label for the X-axis. Defaults to x_column if not provided.")
-    y_label: Optional[str] = Field(default=None, description="Optional: A descriptive label for the Y-axis. Defaults to y_column if not provided.")
-
-
 # --- Define Structure for LLM Final Response (Used as a Tool/Schema) ---
 class FinalApiResponseStructure(BaseModel):
     """Structure for the final API response. Call this function when you have gathered all necessary information and are ready to formulate the final response to the user.
@@ -98,9 +84,9 @@ class FinalApiResponseStructure(BaseModel):
         description="List of booleans indicating which tables from the agent state should be included in the final API response. Match the order of tables in the state.",
         default_factory=list
     )
-    # REMOVED: include_visualizations
-    # ADDED: chart_specs list containing full specifications
-    chart_specs: List[ChartSpecFinalInstruction] = Field(
+
+    # chart_specs list containing full specifications
+    chart_specs: List[ChartSpecFinalInstruction] = Field( # Uses imported ChartSpecFinalInstruction
         default_factory=list,
         description="List of chart specifications to be included in the final API response. The LLM generates these directly when calling this tool."
     )
@@ -232,75 +218,62 @@ Available Tools:
      - All parameters used in the SQL have a corresponding key in the params dictionary (e.g., if `:branch_id` is in the SQL, `params` must contain a `"branch_id"` key).
 
 7. **Chart Specification Strategy:** When formulating the final response using `FinalApiResponseStructure`:
-    a. **When to Include Charts:** Populate the `chart_specs` list within `FinalApiResponseStructure` ONLY if:
+    a. **When to Include Charts:** Populate the `chart_specs` list ONLY if:
         - The user explicitly requested a chart/visualization, OR
-        - You are presenting complex data (e.g., comparisons across >3 categories/metrics) where a visual representation significantly aids understanding.
-        - **CRITICAL EXCEPTION:** If the user **explicitly asked ONLY for a table** and *not* a chart, **DO NOT** generate any chart specifications, even if the data seems complex. Respect the user's request for a table format. Table(s) and chart(s) should be given simultaneously only in those rare cases where tables have some extra, non-redundant data which would add actual and extra value over the text + chart(s) combo.
-        - **AVOID charts for simple comparisons** (e.g., 2-3 items); prefer just the `text` summary unless a chart is explicitly requested.
-    b. **Data Prerequisite:** Ensure the data needed for any chart specification exists in the `state['tables']` list, typically from a preceding `execute_sql` call.
-    c. **Populating `chart_specs`:** For each chart you decide to include, add a `ChartSpecFinalInstruction` object to the `chart_specs` list within the `FinalApiResponseStructure` arguments.
-    d. **`ChartSpecFinalInstruction` Fields (CRITICAL):**
-        -   `source_table_index`: Specify the **0-based index** of the relevant table in the current `state['tables']` list. This is crucial for linking the specification to the correct data. (e.g., if the data is in the first table added, use `0`).
-        -   `type_hint`: Suggest a chart type (e.g., "bar", "pie", "line").
-        -   `title`: Provide a clear, descriptive title.
-        -   `x_column`, `y_column`: Specify the exact column names from the source table.
-        -   `color_column` (Optional): Specify the column for grouping/hue if relevant (e.g., comparing metrics in a bar chart).
-        -   `x_label`, `y_label` (Optional): Provide user-friendly axis labels if needed.
-    e. **Data Transformation Consideration (for "bar" `type_hint`):** If creating a bar chart to compare multiple metrics (e.g., borrows vs. renewals per branch) where the source table has columns like `Branch`, `Borrows`, `Renewals` ("wide" format), the backend might transform this into a "long" format (`Branch`, `Metric`, `Value`) before sending it to the frontend. Therefore, when populating the `ChartSpecFinalInstruction` fields:
-        *   Set `x_column` to the category column (e.g., "Branch Name").
-        *   Set `y_column` to the expected *transformed* value column name (conventionally **"Value"**).
-        *   Set `color_column` to the expected *transformed* metric name column (conventionally **"Metric"**).
-        *   Adjust `y_label` and `title` accordingly (e.g., `y_label="Count"`, `title="Comparison of Metrics by Branch"`).
-        *   **Example:** If the SQL query returns columns `["Location Name", "Total Borrows", "Total Returns"]`, and you want a bar chart comparing borrows and returns, the `ChartSpecFinalInstruction` **MUST** have: `type_hint: "bar"`, `x_column: "Location Name"`, `y_column: "Value"`, `color_column: "Metric"`. Failure to set `y_column` to "Value" and `color_column` to "Metric" in this multi-metric bar chart case will result in an incorrect chart.
-    f. **Consistency Check (MANDATORY):** Before finalizing the `FinalApiResponseStructure` call, **verify that:**
-        * `source_table_index` is a valid 0-based index for a table that exists in the current `state['tables']` list.
-        * `x_column`, `y_column`, and `color_column` (if used) in *each* `ChartSpecFinalInstruction` object within the `chart_specs` list EXACTLY match column names present in the source table specified by `source_table_index`, considering potential backend transformations (Guideline #5e).
-        * If any inconsistency is found, correct the column names or chart specifications before the final call.
-    g. **LLM Internal Verification Checklist (MANDATORY):** Before calling `FinalApiResponseStructure`, YOU MUST INTERNALLY VERIFY the following for EACH `ChartSpecFinalInstruction` you plan to include:
-        1.  **Index Valid?** Is `source_table_index` a valid index (0-based) corresponding to a table currently in `state['tables']`?
-        2.  **Columns Exist?** Do the specified `x_column`, `y_column`, and `color_column` (if used) exactly match column names present in that source table?
-        3.  **Multi-Metric Correct?** If `type_hint` is 'bar' and it's intended to compare multiple metrics (requiring transformation), are `y_column` correctly set to `"Value"` and `color_column` correctly set to `"Metric"`?
-        **ACTION:** If any check fails, FIX the `ChartSpecFinalInstruction` object or OMIT it from the `chart_specs` list before generating the `FinalApiResponseStructure` tool call.
-    h. **Examples of Correct `ChartSpecFinalInstruction`:**
-        *   **Simple Bar Chart (Top 3 Branches by Borrows):**
-            ```json
-            {{{{
-              "source_table_index": 0, // Assuming table 0 has columns: ["Branch Name", "Total Borrows"]
-              "type_hint": "bar",
-              "title": "Top 3 Branches by Borrows (Last 30 Days)",
-              "x_column": "Branch Name",
-              "y_column": "Total Borrows",
-              "color_column": null, // No grouping needed
-              "x_label": "Branch",
-              "y_label": "Borrows"
-            }}}}
-            ```
-        *   **Line Chart (Daily Footfall Entries):**
-            ```json
-            {{{{
-              "source_table_index": 1, // Assuming table 1 has columns: ["Date", "Total Entries"]
-              "type_hint": "line",
-              "title": "Daily Footfall Entries (Last 7 Days)",
-              "x_column": "Date",
-              "y_column": "Total Entries",
-              "color_column": null,
-              "x_label": "Date",
-              "y_label": "Entries"
-            }}}}
-            ```
-        *   **Multi-Metric Bar Chart (Borrows vs Returns by Branch - Requires Transformation):**
-            ```json
-            {{{{
-              "source_table_index": 2, // Assuming table 2 has columns: ["Location Name", "Total Borrows", "Total Returns"]
-              "type_hint": "bar",
-              "title": "Borrows vs Returns by Location (Last Month)",
-              "x_column": "Location Name",
-              "y_column": "Value", // <-- MUST be "Value"
-              "color_column": "Metric", // <-- MUST be "Metric"
-              "x_label": "Location",
-              "y_label": "Count"
-            }}}}
-            ```
+        - Presenting complex data (e.g., comparisons across >3 categories/metrics) where visuals aid understanding.
+        - **EXCEPTION:** If the user **explicitly asked ONLY for a table**, **DO NOT** generate chart specs.
+        - **AVOID charts for simple data** (e.g., 2-3 items); prefer `text` summary unless requested.
+    b. **Data Prerequisite:** Ensure data exists in `state['tables']`.
+    c. **Populating `chart_specs`:** Add a `ChartSpecFinalInstruction` object for each chart.
+    d. **`ChartSpecFinalInstruction` Fields (General):**
+        -   `source_table_index`: **0-based index** of the relevant table in `state['tables']`.
+        -   `type_hint`: Suggest chart type. **MUST be one of: "bar", "pie", "line"**. Do not use other types.
+        -   `title`: Clear, descriptive title.
+        -   `x_column`, `y_column`, `color_column` (Optional): Specify **exact column names** from source table.
+        -   `x_label`, `y_label` (Optional): User-friendly axis labels.
+            *   **Recommendation:** While optional, providing user-friendly `x_label` and `y_label` (e.g., using 'Branch Name' instead of just 'name', or 'Total Borrow Count' instead of 'total_borrows') significantly improves the chart's readability for the end-user. Please generate these descriptive labels when the context allows.
+
+    e. **Type-Specific Column Requirements (CRITICAL):**
+        *   **`type_hint: 'pie'`:**
+            -   Requires a source table with **exactly 2 columns**. 
+            -   `x_column`: Name of the column containing category labels (slice names).
+            -   `y_column`: Name of the column containing numeric values (slice sizes).
+            -   `color_column`: **MUST be `null`** (or omitted).
+            -   Example SQL Result Columns: `["Branch Name", "Total Borrows"]`
+            -   Example Spec: `x_column: "Branch Name", y_column: "Total Borrows", color_column: null`
+        *   **`type_hint: 'bar'` (Single Metric):**
+            -   `x_column`: Name of the column containing category labels (bar labels).
+            -   `y_column`: Name of the column containing numeric values (bar heights).
+            -   `color_column`: Typically `null` (or omitted) unless coloring bars by the x-axis category itself.
+            -   Example SQL Result Columns: `["Branch Name", "Total Borrows"]`
+            -   Example Spec: `x_column: "Branch Name", y_column: "Total Borrows", color_column: null`
+        *   **`type_hint: 'bar'` (Comparing Multiple Metrics - Requires Transformation):**
+            -   If the source table has metrics in separate columns (e.g., `["Branch Name", "Total Borrows", "Total Returns"]`) and you want bars grouped by metric:
+            -   `x_column`: **MUST be the category column** (e.g., `"Branch Name"`).
+            -   `y_column`: **MUST be the literal string `"Value"`** (representing the transformed value column).
+            -   `color_column`: **MUST be the literal string `"Metric"`** (representing the transformed metric name column).
+            -   Example Spec: `x_column: "Branch Name", y_column: "Value", color_column: "Metric"`
+            -   **CRITICAL REMINDER:** Failure to set `y_column` to **exactly** `"Value"` and `color_column` to **exactly** `"Metric"` in this multi-metric case *will* result in an incorrect/missing chart.
+        *   **`type_hint: 'line'`:**
+            -   Typically used for time series.
+            -   `x_column`: Name of the column containing time/date values or sequential categories.
+            -   `y_column`: Name of the column containing numeric values.
+            -   `color_column`: Specify if plotting multiple lines (e.g., different metrics or categories over time). If used, follow multi-metric bar chart logic (use `"Value"` for `y_column`, `"Metric"` or category name for `color_column`) if transformation applies. **Remember: If comparing multiple metrics via color, `y_column` MUST be `"Value"` and `color_column` MUST be `"Metric"`.**
+            -   Example SQL Result Columns: `["Date", "Total Entries"]`
+            -   Example Spec (Single Line): `x_column: "Date", y_column: "Total Entries", color_column: null`
+
+    f. **Consistency Check (MANDATORY):** Before finalizing the call, **verify that:**
+        * `source_table_index` is valid for `state['tables']`.
+        * `type_hint` is one of "bar", "pie", "line".
+        * `x_column`, `y_column`, `color_column` in *each* spec EXACTLY match column names present in the source table, OR match the required `"Value"`/`"Metric"` literals for transformed multi-metric charts (see 7e).
+        * **Pie charts** reference a 2-column table and have `color_column: null`.
+    g. **LLM Internal Verification Checklist (MANDATORY):** Before calling `FinalApiResponseStructure`, INTERNALLY VERIFY for EACH `ChartSpecFinalInstruction`:
+        1.  **Index Valid?** (Is `source_table_index` valid?)
+        2.  **Type Allowed?** (Is `type_hint` one of "bar", "pie", "line"?)
+        3.  **Columns Match?** (Do `x_column`, `y_column`, `color_column` match source OR `"Value"`/`"Metric"` if transformed?)
+        4.  **Pie Chart Rules?** (If `type_hint` is 'pie', does source have 2 columns & `color_column` is null?)
+        5.  **Multi-Metric Rules Met?** (If `type_hint` is 'bar'/'line' comparing metrics via color, are `y_column` **exactly** `"Value"` and `color_column` **exactly** `"Metric"`?)
+        **ACTION:** If any check fails, FIX the `ChartSpecFinalInstruction` or OMIT it.
 
 8. **CRITICAL TOOL CHOICE: `execute_sql` vs. `summary_synthesizer`:**
    - **Use Direct SQL Generation (`execute_sql`) IF AND ONLY IF:** The user asks for a comparison OR retrieval of **specific, quantifiable metrics** (e.g., counts, sums of borrows, returns, renewals, logins) for **specific, resolved entities** (e.g., Main Library [ID: xxx], Argyle Branch [ID: yyy]) over a **defined time period**. Your goal is to generate a single, efficient SQL query. The result table might be used for a chart specification later.
@@ -358,7 +331,7 @@ Available Tools:
    *   Call `summary_synthesizer`.
 8. **DECIDE** final response content (text, tables, mention defaults/resolved names).
 9. **DECIDE** if chart(s) needed.
-10. **IF** chart needed -> Prepare `ChartSpecFinalInstruction`(s).
+10. **IF** chart needed -> Prepare `ChartSpecFinalInstruction`(s) adhering to Guideline #7e.
 11. **ALWAYS** conclude with `FinalApiResponseStructure` call.
 # --- End Workflow Summary --- #
 
@@ -385,7 +358,11 @@ When generating SQL queries for the `execute_sql` tool, adhere strictly to these
     *   Entries (Footfall): `SUM("39") AS "Total Entries"`
     *   Exits (Footfall): `SUM("40") AS "Total Exits"`
     *   Ensure `GROUP BY` includes all non-aggregated selected columns.
-10. **Benchmarking:** For analysis/comparison queries (e.g., "compare branch X borrows"), use a CTE to calculate an organization-wide average or benchmark alongside the specific entity's metric. **CRITICAL:** The CTE must calculate the average of the **total metric per location**, not the average of the raw metric values across all events. Use a subquery with `SUM(...)` and `GROUP BY "hierarchyId"` inside the `AVG()` calculation. Ensure clear aliases. **Avoid nested aggregates** (like `AVG(SUM(...)) OVER ()`); use the CTE pattern:
+10. **Benchmarking (Org Average - ONLY WHEN EXPLICITLY REQUESTED):** 
+    *   **Use ONLY when** the user explicitly asks to compare an entity's performance *against the organizational average* or requests *benchmarking* (e.g., "compare branch X borrows *to the org average*", "*benchmark* all branches").
+    *   **DO NOT** add organizational averages simply because the user asks to compare two metrics (e.g., "compare borrows vs returns for branch X") unless they *also* explicitly ask for comparison to the organizational average.
+    *   **IF NEEDED:** Use a CTE to calculate the organization-wide average alongside the specific entity's metric. 
+    *   **CRITICAL:** The CTE must calculate the average of the **total metric per location**, not the average of the raw metric values across all events. Use a subquery with `SUM(...)` and `GROUP BY "hierarchyId"` inside the `AVG()` calculation. Ensure clear aliases. **Avoid nested aggregates**; use the CTE pattern:
     ```sql
     -- Example CTE Pattern for Benchmarking (Average of SUMs per location)
     WITH org_avg AS (
@@ -413,7 +390,7 @@ When generating SQL queries for the `execute_sql` tool, adhere strictly to these
     *   Calculate last working day based on `{current_day}`: If Today is Mon, use `CURRENT_DATE - INTERVAL '3 days'`; Tue-Fri use `CURRENT_DATE - INTERVAL '1 day'`. Filter like: `DATE_TRUNC('day', "eventTimestamp") = <calculated_date>`.
 12. **Date Aggregation:** For "daily" or "by date" metrics, include `DATE("eventTimestamp") AS "Date"` in SELECT and GROUP BY.
 13. **Footfall Queries (Table '8'):** For general footfall/visitor queries, calculate `SUM("39") AS "Total Entries"` AND `SUM("40") AS "Total Exits"`. If only entries or exits are asked for, sum only the specific column.
-14. **Combine Metrics:** **CRITICAL:** Generate a SINGLE `execute_sql` call if multiple related metrics (e.g., borrows & returns) from the same table/period are requested. **DO NOT** make separate calls for each metric. Also, do not make separate calls if queries differ only by presentation (e.g., `ORDER BY`).
+14. **Combine Metrics (SINGLE CALL MANDATORY):** **CRITICAL:** Generate a **SINGLE** `execute_sql` tool call if multiple related metrics (e.g., borrows & returns) from the *same table and time period* are requested. **ABSOLUTELY DO NOT** make separate tool calls for each metric in this situation. Combine them into one SQL query. Also, do not make separate calls if queries differ only by presentation (e.g., `ORDER BY`).
 15. **CTE Security Requirements:** **CRITICAL:** When using Common Table Expressions (CTEs) or subqueries, EACH component MUST include its own independent organization_id filter. The security system checks each SQL component separately, and failing to include the proper filter in any component will cause the entire query to be rejected.
     * Main query: `WHERE "tablename"."organizationId" = :organization_id`
     * Each CTE: `WHERE "tablename"."organizationId" = :organization_id`
@@ -1350,7 +1327,7 @@ async def process_chat_message(
     """
     Processes a user chat message using the refactored LangGraph agent.
     Extracts the final response structure, including chart specifications embedded within it.
-    Constructs the final API response, mapping chart specs to the 'visualizations' field.
+    Constructs the final API response, mapping chart specs to the 'visualizations' field using dedicated charting logic.
     """
     req_id = request_id or str(uuid.uuid4())
     logger.info(f"--- Starting request processing ---")
@@ -1455,11 +1432,11 @@ async def process_chat_message(
             elif len(include_tables_flags) < len(tables_from_state):
                 # Pad with False if too short
                 missing_count = len(tables_from_state) - len(include_tables_flags)
-                logger.debug(f"Padding include_tables with {missing_count} False values to match table count ({len(tables_from_state)})")
+                logger.debug(f"Padding include_tables with {missing_count} False values to match table count ({len(tables_from_state)})" )
                 include_tables_flags.extend([False] * missing_count)
             elif len(include_tables_flags) > len(tables_from_state):
                 # Truncate if too long
-                logger.debug(f"Truncating include_tables from {len(include_tables_flags)} to match table count ({len(tables_from_state)})")
+                logger.debug(f"Truncating include_tables from {len(include_tables_flags)} to match table count ({len(tables_from_state)})" )
                 include_tables_flags = include_tables_flags[:len(tables_from_state)]
             
             # Apply flags to filter tables
@@ -1468,50 +1445,38 @@ async def process_chat_message(
                 if idx < len(include_tables_flags) and include_tables_flags[idx]
             ]
         
-        # Process charts
+        # Process charts using the dedicated function from charting.py
         visualizations = []
-        chart_specs = getattr(structured_response, "chart_specs", [])
-        if chart_specs:
-            # Transform chart specs to API format
-            for chart_spec in chart_specs:
-                source_table_idx = getattr(chart_spec, "source_table_index", None)
-                if source_table_idx is not None and 0 <= source_table_idx < len(tables_from_state):
-                    # Create API visualization spec
-                    api_chart = ApiChartSpecification(
-                        type_hint=getattr(chart_spec, "type_hint", "bar"),
-                        title=getattr(chart_spec, "title", "Chart"),
-                        x_column=getattr(chart_spec, "x_column", ""),
-                        y_column=getattr(chart_spec, "y_column", ""),
-                        color_column=getattr(chart_spec, "color_column", None),
-                        x_label=getattr(chart_spec, "x_label", None),
-                        y_label=getattr(chart_spec, "y_label", None),
-                        data=tables_from_state[source_table_idx]
-                    )
-                    
-                    # Validate column references
-                    source_table = tables_from_state[source_table_idx]
-                    columns = source_table.get("columns", [])
-                    
-                    # Ensure column references are valid
-                    if api_chart.x_column not in columns and columns:
-                        logger.warning(f"x_column '{api_chart.x_column}' not found in source table. Using first column.")
-                        api_chart.x_column = columns[0]
-                    
-                    if api_chart.y_column not in columns and len(columns) > 1:
-                        logger.warning(f"y_column '{api_chart.y_column}' not found in source table. Using second column.")
-                        api_chart.y_column = columns[1]
-                    
-                    if api_chart.color_column and api_chart.color_column not in columns:
-                        logger.warning(f"color_column '{api_chart.color_column}' not found in source table. Setting to None.")
-                        api_chart.color_column = None
-                    
-                    visualizations.append(api_chart)
+        filtered_charts_info = [] # Initialize list for filtered info
+        chart_specs_from_llm = getattr(structured_response, "chart_specs", [])
+        if chart_specs_from_llm:
+            logger.debug(f"Processing {len(chart_specs_from_llm)} chart specs from LLM...")
+            # Capture both return values from the updated function
+            visualizations, filtered_charts_info = process_and_validate_chart_specs(chart_specs_from_llm, tables_from_state)
+            logger.debug(f"Validated {len(visualizations)} chart specs for API response. Filtered out {len(filtered_charts_info)} specs.")
+        else:
+             logger.debug("No chart specs found in the final response structure.")
+
+        # --- Modify text response if charts were filtered --- 
+        final_text = structured_response.text
+        if filtered_charts_info:
+            logger.info(f"Modifying text response as {len(filtered_charts_info)} chart(s) were filtered out.")
+            # Construct a message about the filtered charts
+            filtered_titles = [info.get('title', 'Untitled Chart') for info in filtered_charts_info]
+            if len(filtered_titles) == 1:
+                warning_suffix = f"\n\n(Note: A chart titled \"{filtered_titles[0]}\" was generated but could not be displayed due to data formatting issues.)"
+            else:
+                 warning_suffix = f"\n\n(Note: {len(filtered_titles)} charts (including \"{filtered_titles[0]}\") were generated but could not be displayed due to data formatting issues.)"
+            
+            # Append the warning to the original text
+            final_text += warning_suffix
+        # --- End text modification ---
         
         # Build successful response
         success_response["data"] = {
-            "text": structured_response.text,
+            "text": final_text, # Use the potentially modified text
             "tables": tables_to_include,
-            "visualizations": visualizations
+            "visualizations": visualizations # Use the validated list
         }
         
         # Log token usage
@@ -1655,53 +1620,6 @@ async def process_chat_message(
         }
         logger.info("--- Finished request processing with exception ---")
         return error_response
-
-
-# --- Helper function for Data Transformation --- #
-def _transform_wide_to_long(wide_table: TableData, id_column_name: str) -> TableData:
-    """Transforms TableData from wide to long format for grouped bar charts."""
-    logger.debug(f"[_transform_wide_to_long] Starting transformation for table with ID column: {id_column_name}")
-    long_rows = []
-    metric_col_name = "Metric" # Convention expected by prompt Guideline #5e
-    value_col_name = "Value"   # Convention expected by prompt Guideline #5e
-
-    if not wide_table.rows or not wide_table.columns:
-        logger.warning("[_transform_wide_to_long] Input table has no rows or columns. Returning empty.")
-        return TableData(columns=[id_column_name, metric_col_name, value_col_name], rows=[], metadata=wide_table.metadata)
-
-    try:
-        id_col_index = wide_table.columns.index(id_column_name)
-    except ValueError:
-        logger.error(f"[_transform_wide_to_long] ID column '{id_column_name}' not found in wide table columns: {wide_table.columns}. Returning original table as fallback.")
-        return wide_table # Fallback to original to prevent downstream errors
-
-    value_column_indices = {
-        i: col_name for i, col_name in enumerate(wide_table.columns) if i != id_col_index
-    }
-
-    if not value_column_indices:
-         logger.warning(f"[_transform_wide_to_long] No value columns found besides ID column '{id_column_name}'. Returning original table.")
-         return wide_table
-
-    for wide_row in wide_table.rows:
-        id_value = wide_row[id_col_index]
-        for index, metric_name in value_column_indices.items():
-            value = wide_row[index]
-            try:
-                # Let's try converting to float, falling back to None if not possible
-                numeric_value = float(value) if value is not None else None
-                long_rows.append([id_value, metric_name, numeric_value])
-            except (ValueError, TypeError):
-                 logger.warning(f"[_transform_wide_to_long] Could not convert value '{value}' for metric '{metric_name}' to float. Appending as None.")
-                 long_rows.append([id_value, metric_name, None])
-
-    long_columns = [id_column_name, metric_col_name, value_col_name]
-    logger.debug(f"[_transform_wide_to_long] Transformation complete. Produced {len(long_rows)} long format rows.")
-    
-    new_metadata = wide_table.metadata.copy() if wide_table.metadata else {}
-    new_metadata["transformed_from_wide"] = True
-
-    return TableData(columns=long_columns, rows=long_rows, metadata=new_metadata)
 
 
 # --- test_azure_openai_connection() ---
