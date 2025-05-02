@@ -1,22 +1,20 @@
 ﻿import json
 import re
-import uuid
 import logging
 import asyncio
 import statistics
-import time
-from datetime import datetime, timedelta
-from typing import Dict, List, Any, Optional, Tuple, TypedDict, Union
+from typing import Dict, List, Any, Optional, Tuple
+import inspect
 
 from pydantic import BaseModel, Field
 
-import pandas as pd
 from langchain.tools import BaseTool
 from langchain.prompts import PromptTemplate
 from langchain_openai import AzureChatOpenAI
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.messages import SystemMessage, HumanMessage
 from openai import APIConnectionError, APITimeoutError, RateLimitError
-from sqlalchemy import text, inspect
+from sqlalchemy import text
 
 from app.core.config import settings
 from app.db.connection import get_async_db_connection
@@ -26,7 +24,6 @@ from app.langchain.tools.hierarchy_resolver_tool import HierarchyNameResolverToo
 
 logger = logging.getLogger(__name__)
 
-# Define proper Pydantic models for structured SQL generation
 class SQLQueryParams(BaseModel):
     """Parameters for a SQL query."""
     organization_id: str = Field(description="Organization ID parameter value")
@@ -82,10 +79,28 @@ class InsightsResult(BaseModel):
 class CompositeMetricsResult(BaseModel):
     """Composite metrics calculated from data."""
     success_rates: List[Dict[str, Any]] = Field(default_factory=list, description="List of success rates")
-    cross_metric_ratios: List[Dict[str, Any]] = Field(default_factory=list, description="List of cross-metric ratios")
 
 class SummarySynthesizerTool(BaseTool):
-    """Tool for synthesizing high-level summaries from data, optimized for concurrent data retrieval."""
+    """
+    Tool for synthesizing high-level summaries from library data using concurrent query execution.
+    
+    This tool implements an enterprise-grade approach to data analysis and synthesis by:
+    1. Decomposing complex queries into subqueries using LLM
+    2. Executing subqueries concurrently for optimized performance
+    3. Processing results to detect trends, anomalies, and statistical patterns
+    4. Providing contextual location information by resolving hierarchy IDs
+    5. Generating human-readable summaries with actionable insights
+    
+    Key architectural patterns:
+    - Concurrent execution through asyncio for scalable performance
+    - Layered error handling with graceful degradation
+    - Clear separation of concerns between data fetching, analysis, and synthesis
+    - Robust LLM interaction with retry mechanisms and content validation
+    - Dynamic SQL generation with secure parameter handling
+    
+    This tool specializes in qualitative, open-ended data summaries where multiple data points
+    need to be analyzed together to extract meaningful insights beyond simple metric retrieval.
+    """
     
     name: str = "summary_synthesizer"
     description: str = """\
@@ -105,195 +120,14 @@ class SummarySynthesizerTool(BaseTool):
     
     organization_id: str
     
-    def _decompose_query(self, query: str) -> List[str]:
-        """Decompose a complex query into subqueries using LLM."""
-        log_prefix = f"[Org: {self.organization_id}] [SummaryTool] "
-        
-        try:
-            llm = AzureChatOpenAI(
-                openai_api_key=settings.AZURE_OPENAI_API_KEY,
-                azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
-                openai_api_version=settings.AZURE_OPENAI_API_VERSION,
-                deployment_name=settings.AZURE_OPENAI_DEPLOYMENT_NAME,
-                model_name=settings.LLM_MODEL_NAME,
-                temperature=0.1,
-                max_retries=settings.LLM_MAX_RETRIES,
-            )
-            
-            # Get schema info from schema definitions
-            schema_info = self._get_schema_info()
-            
-            # Check if schema_info is too long and truncate if needed
-            if len(schema_info) > 8000:  # Reasonable token limit to prevent issues
-                logger.warning(f"{log_prefix}Schema info exceeds 8000 chars, truncating for decomposition.")
-                # Keep the first part that describes general schema structure
-                first_part = schema_info[:3000]
-                # Keep some relevant table definitions based on query content
-                relevant_tables = []
-                for keyword in ["event", "borrow", "return", "renewal", "hierarchy", "location"]:
-                    if keyword in query.lower():
-                        # Find and extract relevant table definitions
-                        pattern = f"Table: [^\n]+{keyword}[^\n]*\nDescription:[^\n]*\nColumns:[^\n]*(?:\n  [^\n]+)*"
-                        matches = re.findall(pattern, schema_info, re.IGNORECASE)
-                        relevant_tables.extend(matches)
-                
-                # Combine and limit to reasonable size
-                relevant_tables_text = "\n\n".join(relevant_tables)[:4000]
-                schema_info = f"{first_part}\n\n{relevant_tables_text}"
-                logger.debug(f"{log_prefix}Truncated schema info to {len(schema_info)} chars")
-            
-            template = f"""
-            You are a data analyst. Given the following high-level query or analysis request,
-            break it down into specific, atomic subqueries that need to be executed to gather the necessary data.
-            **Aim for an efficient plan** to comprehensively answer the request while respecting concurrency limits.
-            The maximum number of subqueries you should ideally generate is **{{max_concurrent_tools}}**.
-
-            IMPORTANT - LOCATION NAMING GUIDELINES:
-            When location names (e.g., "Main Library", "Argyle Branch") appear in your subquery descriptions:
-            1. ALWAYS use the full, proper name of the location exactly as mentioned in the query
-            2. NEVER attempt to format location names as parameter placeholders or IDs
-            3. NEVER include raw UUIDs or IDs in your descriptions
-            4. DO use natural language expressions like "for Main Library" or "at Argyle Branch"
-            5. DO NOT use technical formatting like ":hierarchy_id_main_library" or "hierarchy_id_for_argyle"
-            6. The system will automatically handle parameter binding during SQL generation
-
-            DATABASE SCHEMA INFORMATION:
-            {schema_info}
-
-            IMPORTANT NOTES ON SCHEMA:
-            - The events table is called "5" and contains numbered columns ("1", "2", "3", etc.) for different event metrics.
-            - Column "1" = successful borrows
-            - Column "2" = unsuccessful borrows
-            - Column "3" = successful returns
-            - Column "4" = unsuccessful returns
-            - All tables use camelCase for column names (e.g., "organizationId", "eventTimestamp")
-            
-            **CRITICAL TIME-BASED QUERY HANDLING:**
-            - If the user query asks about **changes over time**, **trends**, how something has **changed**, or uses similar time-evolution language for a specific metric:
-                - Your subquery descriptions MUST specify grouping by a relevant time period (e.g., **"group by month"**, **"by day"**).
-                - Example: "Retrieve monthly total successful borrows (column \\"1\\" in table \\"5\\") for all branches over the past 6 months."
-            - Otherwise, if the query asks for an overall summary or specific totals without focusing on change over time, do *not* group by time.
-
-            High-level Query (potentially with context): {{query}}
-
-            Format your response as a JSON array of strings, each representing a specific subquery description suitable for the sql_query tool.
-            **IMPORTANT**: If a subquery retrieves a metric for a specific location (not org-wide), append **", including the organizational average for comparison"** to the subquery description string. This helps provide context later.
-
-            Example for a query about specific locations:
-            ["Retrieve total successful borrows (column \\"1\\" in events table \\"5\\") for Main Library last 30 days, including the organizational average for comparison",
-             "Retrieve total successful borrows (column \\"1\\" in events table \\"5\\") for Argyle Branch last 30 days, including the organizational average for comparison"]
-            
-            Example if no specific locations (org-wide):
-            ["Count total successful borrows (column \\"1\\" in events table \\"5\\") across the organization last month"]
-            
-            Example if time trend requested:
-            ["Retrieve monthly total successful borrows (column \\"1\\" in table \\"5\\") for all branches over the past 6 months."]
-
-            Return ONLY the JSON array without any explanation or comments.
-            """
-            
-            prompt = PromptTemplate(
-                input_variables=["query", "schema_info", "max_concurrent_tools"],
-                template=template
-            )
-            
-            # Implement retry mechanism with exponential backoff
-            max_retries = 3
-            base_delay = 1  # seconds
-            subqueries_str = ""
-            
-            for retry in range(max_retries):
-                try:
-                    logger.debug(f"{log_prefix}Decomposing query (attempt {retry+1}/{max_retries})")
-                    decompose_chain = prompt | llm | StrOutputParser()
-                    subqueries_str = decompose_chain.invoke({
-                        "query": query, 
-                        "schema_info": schema_info,
-                        "max_concurrent_tools": settings.MAX_CONCURRENT_TOOLS
-                    })
-                    
-                    # If we got here, the API call was successful
-                    break
-                    
-                except (APIConnectionError, APITimeoutError) as e:
-                    # Log the error
-                    logger.warning(f"{log_prefix}API error during decomposition attempt {retry+1}: {e}")
-                    
-                    # Check if we should retry
-                    if retry < max_retries - 1:
-                        # Calculate delay with exponential backoff
-                        delay = base_delay * (2 ** retry)
-                        logger.info(f"{log_prefix}Retrying in {delay} seconds...")
-                        time.sleep(delay)  # Use regular sleep since we're in a sync method
-                    else:
-                        # We've exhausted retries, propagate the error
-                        logger.error(f"{log_prefix}Failed to decompose query after {max_retries} attempts")
-                        raise
-            
-            # Clean and parse the JSON
-            subqueries_str = self._clean_json_response(subqueries_str)
-            
-            try:
-                subqueries = json.loads(subqueries_str)
-                if not isinstance(subqueries, list):
-                    logger.warning(f"{log_prefix}Decomposed query result is not a list. Got: {type(subqueries)}")
-                    raise ValueError("Subqueries must be a list")
-                # Ensure all items are strings
-                if not all(isinstance(sq, str) for sq in subqueries):
-                     logger.warning(f"{log_prefix}Not all items in subqueries list are strings")
-                     raise ValueError("All items in subqueries list must be strings")
-                
-                # Cap the number of subqueries for safety
-                if len(subqueries) > settings.MAX_CONCURRENT_TOOLS:
-                    logger.warning(f"{log_prefix}Too many subqueries ({len(subqueries)}), limiting to {settings.MAX_CONCURRENT_TOOLS}")
-                    subqueries = subqueries[:settings.MAX_CONCURRENT_TOOLS]
-                
-                return subqueries
-            except json.JSONDecodeError as e:
-                logger.error(f"{log_prefix}Error parsing subqueries JSON: {str(e)}")
-                logger.debug(f"{log_prefix}Raw subqueries string: {subqueries_str}")
-                # Fallback: return the original query as a single subquery
-                return [query]
-            except ValueError as e:
-                logger.error(f"{log_prefix}Error validating subqueries: {str(e)}")
-                logger.debug(f"{log_prefix}Problematic subqueries value: {subqueries_str}")
-                return [query]
-        except APIConnectionError as e:
-            logger.error(f"{log_prefix}OpenAI connection error during query decomposition: {e}", exc_info=False)
-            return [query]
-        except APITimeoutError as e:
-            logger.error(f"{log_prefix}OpenAI timeout during query decomposition: {e}", exc_info=False)
-            return [query]
-        except Exception as e:
-            logger.error(f"{log_prefix}Unexpected error during query decomposition: {e}", exc_info=True)
-            return [query]
-    
-    def _clean_json_response(self, response: str) -> str:
-        """Clean JSON response from LLM output."""
-        response = response.strip()
-        if response.startswith("```json"):
-            response = response[7:]
-        elif response.startswith("```"):
-            response = response[3:]
-            
-        if response.endswith("```"):
-            response = response[:-3]
-            
-        return response.strip()
-    
     def _get_schema_info(self) -> str:
-        """Gets schema information from predefined schema definitions as a formatted string.
-        This follows the same approach as agent.py's _get_schema_string method."""
-        from app.db.schema_definitions import SCHEMA_DEFINITIONS  # Keep import local
-        
+        """Get database schema information for SQL generation."""
+        logger.debug(f"[Org: {self.organization_id}] [SummaryTool] Fetching schema information")
         db_name = "report_management"
-        log_prefix = f"[Org: {self.organization_id}] [SummaryTool] "
-        logger.debug(f"{log_prefix}Fetching schema for database: {db_name}")
         
         if db_name not in SCHEMA_DEFINITIONS:
-            error_msg = f"No schema definition found for database {db_name}."
-            logger.warning(f"{log_prefix}{error_msg}")
-            return error_msg
+            logger.warning(f"[Org: {self.organization_id}] [SummaryTool] No schema definition found for database {db_name}")
+            return "Schema information not available."
         
         db_info = SCHEMA_DEFINITIONS[db_name]
         schema_info = [
@@ -320,22 +154,17 @@ class SummarySynthesizerTool(BaseTool):
             
             schema_info.append("")  # Empty line between tables
         
-        logger.debug(f"{log_prefix}Successfully retrieved schema for {db_name}")
+        logger.debug(f"[Org: {self.organization_id}] [SummaryTool] Successfully retrieved schema information")
         return "\n".join(schema_info)
     
-    async def _verify_query_tables_and_columns(self, sql: str, db_name: str = "report_management") -> Tuple[bool, Optional[str]]:
-        """
-        Simple verification that just logs the query.
-        We're using the schema directly, so no need for complex validation.
-        """
+    def _decompose_query(self, query: str) -> List[Dict[str, Any]]:
+        """Decompose a complex query into subqueries using LLM, identifying location names."""
         log_prefix = f"[Org: {self.organization_id}] [SummaryTool] "
-        logger.debug(f"{log_prefix}Query validated against schema definitions")
-        return True, None
-    
-    async def _generate_sql_from_description(self, query_description: str) -> Tuple[str, Dict[str, Any]]:
-        """Generate SQL query and parameters from a natural language description."""
-        log_prefix = f"[Org: {self.organization_id}] [SummaryTool] "
+        
         try:
+            # Get schema information
+            schema_info = self._get_schema_info()
+            
             llm = AzureChatOpenAI(
                 openai_api_key=settings.AZURE_OPENAI_API_KEY,
                 azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
@@ -343,683 +172,706 @@ class SummarySynthesizerTool(BaseTool):
                 deployment_name=settings.AZURE_OPENAI_DEPLOYMENT_NAME,
                 model_name=settings.LLM_MODEL_NAME,
                 temperature=0.1,
+                # Rely on AzureChatOpenAI's default retries
                 max_retries=settings.LLM_MAX_RETRIES,
             )
             
-            # Get schema info from schema definitions
-            schema_info = self._get_schema_info()
-            
-            # Enhanced pattern to extract location references with possible abbreviations
-            location_patterns = [
-                # Standard pattern: locations after prepositions (for/at/in/from/to)
-                r"(?:for|at|in|from|to)\s+(?:the\s+)?([A-Z][a-zA-Z\s]+(?:\s*\([A-Z]+\))?)(?:\s+(?:branch|library|location))?(?!\s+(?:and|or))",
-                
-                # Direct mentions with branch/library suffix
-                r"([A-Z][a-zA-Z\s]+(?:\s*\([A-Z]+\))?)\s+(?:branch|library|location)(?!\s+(?:and|or))",
-                
-                # Possessive forms: "Branch's" or "Library's"
-                r"([A-Z][a-zA-Z\s]+(?:\s*\([A-Z]+\))?)'s\s+(?:branch|library|location|activity|metrics|data|statistics)(?!\s+(?:and|or))"
-            ]
-            
-            # Extract location references using multiple patterns
-            location_matches = []
-            for pattern in location_patterns:
-                matches = re.findall(pattern, query_description)
-                if matches:
-                    location_matches.extend(matches)
-            
-            # Remove duplicates and clean up
-            location_matches = [match.strip() for match in location_matches]
-            location_matches = list(dict.fromkeys(location_matches))  # Remove duplicates while preserving order
-            
-            if location_matches:
-                logger.debug(f"{log_prefix}Extracted location references: {location_matches}")
-            
-            # Prepare the template with schema information and updated SQL generation guidance
+            # Updated template to extract descriptions and location names
             template = """
-            You are an expert PostgreSQL query generator. Given the schema definition and the query requirement below, 
-            generate a syntactically correct PostgreSQL query focused *only* on retrieving the primary data requested.
+            You are a data analyst. Given the high-level query below, break it down into atomic subqueries.
+            Identify any specific location names (like "Main Library", "Argyle Branch") mentioned in relation to the data needed for each subquery.
+            **Aim for an efficient plan** respecting concurrency limits (max {max_concurrent_tools} subqueries).
 
-            DATABASE SCHEMA:
+            HIGH-LEVEL QUERY:
+            {query}
+
+            DATABASE SCHEMA INFORMATION:
             {schema_info}
 
-            QUERY REQUIREMENT:
-            {query_description}
-
             CRITICAL REQUIREMENTS:
-            1. Generate SQL to retrieve ONLY the specific metric(s) or data described in the QUERY REQUIREMENT.
-            2. **DO NOT** attempt to calculate organizational averages (e.g., using `AVG(...) OVER ()`) within this *same* query if the main goal is aggregation (like SUM or COUNT). Comparisons and averages will be handled separately if needed. Focus on getting the core data accurately.
-            3. ALWAYS include the organization_id filter condition using the `:organization_id` parameter.
-            4. The organization_id parameter value is: {organization_id}
-            5. Use exact table names (e.g., "5", "8") and column names (e.g., "eventTimestamp", "1") as shown in the schema, ensuring they are double-quoted.
-            6. Use descriptive, user-friendly aliases for calculated columns (e.g., `SUM("1") AS "Total Borrows"`).
-            7. If the query involves grouping (e.g., by branch, by date), ensure the `GROUP BY` clause is correct and includes all non-aggregated selected columns.
-            8. Apply appropriate time filters based on the QUERY REQUIREMENT using functions like `NOW()`, `INTERVAL`, etc. (Refer to schema for timestamp columns).
-            9. **NEVER** use raw UUID strings in WHERE conditions. ALWAYS use parameter binding (e.g., `:hierarchy_id_main_library`) for any ID conditions.
-            10. If the query mentions filtering by a specific branch, hierarchy, or location, ALWAYS use a parameterized condition like `"hierarchyId" = :hierarchy_id_argyle_branch` in the WHERE clause, where the parameter name is derived from the location name.
-            11. IMPORTANT: For location parameters, use the format `:hierarchy_id_location_name` where location_name is the lowercase version of the location with spaces replaced by underscores (e.g., `:hierarchy_id_main_library`, `:hierarchy_id_central_branch`).
-            
-            JSON OUTPUT FORMAT:
+            - For each subquery needed, provide a clear natural language description.
+            - For each subquery description, also list any specific location names (e.g., "Main Library", "Downtown Branch (DTB)") that the subquery relates to. Use the exact names as mentioned in the original query.
+            - If a subquery is organizational-wide or doesn't refer to a specific location, provide an empty list for location_names.
+            - Focus on the core data needed. Comparisons or complex calculations will be handled later.
+            - **Do NOT include UUIDs or parameter placeholders** in the descriptions or location names.
+            - Handle time-based queries appropriately by mentioning grouping periods (e.g., "monthly", "daily") in the description if trends are requested.
+
+            OUTPUT FORMAT:
+            Return ONLY a valid JSON array of objects. Each object must have two keys:
+            1. "description": A string containing the natural language description of the subquery.
+            2. "location_names": An array of strings, containing the exact location names relevant to this subquery (or an empty array [] if none).
+
+            EXAMPLE OUTPUT for query "Compare borrows for Main Library and Downtown Branch (DTB) last month":
             ```json
-            {{
-                "sql": "your PostgreSQL query with :organization_id and other needed parameters",
-                "params": {{
-                    "organization_id": "{organization_id}"
-                    // Add other necessary parameters here if used in the SQL, especially hierarchy_id parameters
-                }}
-            }}
+            [
+              {{
+                "description": "Retrieve total successful borrows (column \\"1\\" in events table \\"5\\") for Main Library last month",
+                "location_names": ["Main Library"]
+              }},
+              {{
+                "description": "Retrieve total successful borrows (column \\"1\\" in events table \\"5\\") for Downtown Branch (DTB) last month",
+                "location_names": ["Downtown Branch (DTB)"]
+              }}
+            ]
             ```
             
-            Write only the JSON output without any additional explanation.
+            EXAMPLE OUTPUT for query "Summarize total renewals across the organization last week":
+            ```json
+            [
+              {{
+                "description": "Calculate the total number of renewals across the entire organization last week",
+                "location_names": []
+              }}
+            ]
+            ```
+            
+            Ensure the output is ONLY the JSON array, without any preamble or explanation.
             """
             
             prompt = PromptTemplate(
-                input_variables=["query_description", "schema_info", "organization_id"],
+                input_variables=["query", "schema_info", "max_concurrent_tools"],
                 template=template
             )
             
-            # Create a chain for SQL generation
-            sql_chain = prompt | llm | StrOutputParser()
+            logger.debug(f"{log_prefix}Decomposing query with schema information...")
+            decompose_chain = prompt | llm | StrOutputParser()
             
-            # Invoke the chain with inputs
-            inputs = {
-                "query_description": query_description,
-                "schema_info": schema_info,
-                "organization_id": self.organization_id
-            }
-            response = sql_chain.invoke(inputs)
-            
-            # Clean and parse the JSON response
-            cleaned_response = self._clean_json_response(response)
+            subqueries_str = decompose_chain.invoke({
+                "query": query, 
+                "schema_info": schema_info,  # Use the actual schema information
+                "max_concurrent_tools": settings.MAX_CONCURRENT_TOOLS
+            })
+                
+            # Clean and parse the JSON
+            subqueries_str = self._clean_json_response(subqueries_str)
             
             try:
-                result_dict = json.loads(cleaned_response)
-                
-                # Extract SQL query and parameters
-                sql = result_dict.get("sql", "")
-                params = result_dict.get("params", {"organization_id": self.organization_id})
-                
-                # Ensure organization_id parameter exists
-                if "organization_id" not in params:
-                    params["organization_id"] = self.organization_id
-                
-                # Standardized parameter handling - detect all parameters in SQL
-                param_pattern = r':([a-zA-Z_][a-zA-Z0-9_]*)'
-                sql_params = re.findall(param_pattern, sql)
-                
-                # Check for location-related parameters that need placeholder values
-                for param_name in sql_params:
-                    # Skip organization_id as it's already handled
-                    if param_name == "organization_id":
-                        continue
-                        
-                    # Check if this is a hierarchy/location parameter that's missing from the params dict
-                    if param_name not in params and any(term in param_name for term in ["hierarchy", "branch", "location"]):
-                        # Extract the location name from the parameter
-                        loc_name_pattern = r'(?:hierarchy|branch|location)_id_(.+)'
-                        loc_name_match = re.search(loc_name_pattern, param_name)
-                        
-                        if loc_name_match:
-                            # Get a clean location name for resolution
-                            clean_loc_name = loc_name_match.group(1).replace('_', ' ')
-                            
-                            # Create a placeholder marker without colon
-                            # Important: Do NOT include a colon in the parameter value!
-                            params[param_name] = f"PLACEHOLDER_ID_{clean_loc_name.upper()}"
-                            logger.debug(f"{log_prefix}Added placeholder for parameter '{param_name}': location '{clean_loc_name}'")
+                subquery_data = json.loads(subqueries_str)
+                # Validate the structure
+                if not isinstance(subquery_data, list):
+                    raise ValueError("Expected a list of subquery objects")
+                for item in subquery_data:
+                    if not isinstance(item, dict) or "description" not in item or "location_names" not in item:
+                        raise ValueError("Each item must be a dict with 'description' and 'location_names' keys")
+                    if not isinstance(item["description"], str):
+                        raise ValueError("'description' must be a string")
+                    if not isinstance(item["location_names"], list) or not all(isinstance(name, str) for name in item["location_names"]):
+                        raise ValueError("'location_names' must be a list of strings")
 
-                # Log and return the results
-                logger.debug(f"{log_prefix}Generated SQL with {len(params)} parameters")
-                return sql, params
+                # Cap the number of subqueries
+                if len(subquery_data) > settings.MAX_CONCURRENT_TOOLS:
+                    logger.warning(f"{log_prefix}Too many subqueries ({len(subquery_data)}), limiting to {settings.MAX_CONCURRENT_TOOLS}")
+                    subquery_data = subquery_data[:settings.MAX_CONCURRENT_TOOLS]
+                
+                logger.info(f"{log_prefix}Query decomposed into {len(subquery_data)} subqueries with location extraction.")
+                return subquery_data # Return list of dictionaries
                 
             except json.JSONDecodeError as e:
-                logger.error(f"{log_prefix}Error parsing JSON from LLM response: {e}")
-                logger.debug(f"{log_prefix}Raw response: {cleaned_response}")
-                raise ValueError(f"Invalid JSON format in LLM response: {e}")
+                logger.error(f"{log_prefix}Error parsing subqueries JSON: {e}. Raw response: {subqueries_str}")
+                # Fallback: Treat original query as one subquery with no specific locations
+                return [{"description": query, "location_names": []}]
+            except ValueError as e:
+                logger.error(f"{log_prefix}Error validating subquery structure: {e}. Raw response: {subqueries_str}")
+                return [{"description": query, "location_names": []}]
                 
         except (APIConnectionError, APITimeoutError, RateLimitError) as e:
-            logger.error(f"{log_prefix}OpenAI API error in SQL generation: {e}")
-            raise ValueError(f"Error communicating with OpenAI: {str(e)}")
+            logger.error(f"{log_prefix}OpenAI API error during query decomposition: {e}", exc_info=False)
+            # Fallback on API error
+            return [{"description": query, "location_names": []}]
+        except KeyError as e:
+             logger.error(f"{log_prefix}Missing key during decomposition invoke (likely 'schema_info'): {e}")
+             # Fallback if schema_info wasn't provided
+             return [{"description": query, "location_names": []}] 
         except Exception as e:
-            logger.error(f"{log_prefix}Unexpected error in SQL generation: {e}", exc_info=True)
-            raise ValueError(f"Error generating SQL: {str(e)}")
+            logger.error(f"{log_prefix}Unexpected error during query decomposition: {e}", exc_info=True)
+            # General fallback
+            return [{"description": query, "location_names": []}]
     
-    async def _execute_subqueries_concurrently(self, subqueries: List[str]) -> List[SubqueryResult]:
+    def _clean_json_response(self, response: str) -> str:
+        """Clean JSON response from LLM output."""
+        response = response.strip()
+        if response.startswith("```json"):
+            response = response[7:]
+        elif response.startswith("```"):
+            response = response[3:]
+            
+        if response.endswith("```"):
+            response = response[:-3]
+            
+        return response.strip()
+    
+    async def _resolve_locations(self, subquery_data: List[Dict[str, Any]]) -> Dict[str, str]:
+        """Resolve all unique location names found across subqueries.
+        
+        Args:
+            subquery_data: List of dicts from _decompose_query, 
+                           each with 'description' and 'location_names'.
+                           
+        Returns:
+            A dictionary mapping original location names (lowercase) to their resolved UUIDs.
+            Returns an empty dict if no locations were found or resolution failed.
+            Raises ValueError if any required location name could not be resolved.
+        """
+        log_prefix = f"[Org: {self.organization_id}] [SummaryTool] "
+        all_location_names = set()
+        required_location_names = set() # Track names explicitly mentioned in subqueries
+
+        for item in subquery_data:
+            locations = item.get("location_names", [])
+            if locations:
+                for name in locations:
+                    if name:
+                        all_location_names.add(name)
+                        required_location_names.add(name) # Assume names from decomposition are required
+
+        if not all_location_names:
+            logger.debug(f"{log_prefix}No location names found in subqueries to resolve.")
+            return {}
+
+        logger.info(f"{log_prefix}Attempting to resolve {len(all_location_names)} unique location names: {list(all_location_names)}")
+        resolved_name_to_id_map = {}
+        failed_to_resolve = []
+        
+        try:
+            resolver = HierarchyNameResolverTool(organization_id=self.organization_id)
+            # Resolve all unique names found
+            resolution_result = await resolver.ainvoke({"name_candidates": list(all_location_names)})
+            resolution_data = resolution_result.get("resolution_results", {})
+
+            successfully_resolved_count = 0
+            # Create map from original name (lowercase) to ID
+            for original_name in all_location_names:
+                result = resolution_data.get(original_name, {})
+                if result.get("status") == "found" and result.get("id"):
+                    resolved_id = str(result.get("id"))
+                    resolved_name_for_log = result.get("resolved_name", original_name)
+                    resolved_name_to_id_map[original_name.lower()] = resolved_id
+                    logger.debug(f"{log_prefix}Resolved '{original_name}' -> '{resolved_name_for_log}' (ID: {resolved_id})")
+                    successfully_resolved_count += 1
+                else:
+                    # If this name was required (i.e., explicitly extracted by decomposition)
+                    if original_name in required_location_names:
+                         failed_to_resolve.append(original_name)
+                    logger.warning(f"{log_prefix}Failed to resolve location name: '{original_name}' (Status: {result.get('status', 'unknown')})")
+            
+            logger.info(f"{log_prefix}Location resolution finished. Successfully resolved {successfully_resolved_count}/{len(all_location_names)} names.")
+            
+            # If any required names failed to resolve, raise an error
+            if failed_to_resolve:
+                raise ValueError(f"Could not resolve the required location(s): {', '.join(set(failed_to_resolve))}")
+                
+            return resolved_name_to_id_map
+
+        except Exception as e:
+            logger.error(f"{log_prefix}Error during location name resolution: {e}", exc_info=True)
+            # If resolution fails catastrophically, raise the error to stop processing
+            raise ValueError(f"Failed to resolve location names due to an error: {str(e)}") from e
+
+    async def _generate_sql_and_params(
+        self,
+        query_description: str,
+        resolved_location_map: Dict[str, str],
+        schema_info: str
+    ) -> Tuple[str, Dict[str, Any]]:
+        """
+        Generate SQL from a query description with proper parameter bindings.
+        Uses Azure OpenAI API with retry logic for reliability.
+        Returns: (sql, params dictionary with organization_id and location IDs properly set)
+        """
+        log_prefix = f"[Org: {self.organization_id}] [SummaryTool] "
+        logger.debug(f"{log_prefix}Generating SQL for: {query_description}")
+        
+        # --- Preprocessing: Map original names to standardized param names and UUIDs ---
+        location_param_context = []
+        param_name_to_uuid_map = {}
+        if resolved_location_map:
+            for original_name, resolved_uuid in resolved_location_map.items():
+                # Create a safe parameter name (lowercase, underscore spaces, add _id)
+                safe_name_part = re.sub(r'[^a-z0-9_]', '', original_name.lower().replace(' ', '_'))
+                param_name_for_llm = f"{safe_name_part}_id"
+                
+                # Store mapping for later substitution
+                param_name_to_uuid_map[param_name_for_llm] = resolved_uuid
+                
+                # Create context string for the prompt
+                location_param_context.append(f"- For location '{original_name}', use the parameter name ':{param_name_for_llm}' in your SQL WHERE clause.")
+        
+        location_context_str = "\n".join(location_param_context) if location_param_context else "No specific locations identified for this query."
+        # --- End Preprocessing ---
+        
+        # --- System Message Updated ---
+        system_message = f"""
+        You are an expert SQL query generation assistant. Convert the natural language query description into a PostgreSQL compatible SQL query.
+
+        **CRITICAL Instructions:**
+        1.  **Use ONLY the provided schema.** Do not assume tables/columns exist.
+        2.  **Table Specificity:** 
+            - Footfall data (columns \"39\", \"40\") is ONLY in table \"8\".
+            - Event metrics (borrows, returns, logins, etc.) are ONLY in table \"5\".
+            - DO NOT mix columns between these tables.
+        3.  **Quoting:** Double-quote ALL table and column names (e.g., \"5\", \"organizationId\").
+        4.  **Mandatory Filtering:** 
+            - Your query MUST ALWAYS filter by organization ID using `:organization_id`.
+            - Add `WHERE \"tableName\".\"organizationId\" = :organization_id`.
+            - If using CTEs or subqueries, EACH component MUST include its own independent `:organization_id` filter.
+        5.  **Location Filtering (Use Provided Parameter Names):**
+            {location_context_str}
+            - Ensure you use these exact parameter names (e.g., `:{param_name_for_llm}`) in your SQL `WHERE` clauses when filtering by location.
+        6.  **Parameters:** Use parameter placeholders (e.g., `:parameter_name`) for all dynamic values EXCEPT date/time functions.
+        7.  **SELECT Clause:** Select specific columns with descriptive aliases (e.g., `SUM(\"1\") AS \"Total Borrows\"`). Avoid `SELECT *`.
+        8.  **Performance:** Use appropriate JOINs, aggregations, and date functions. Add `LIMIT 50` to queries expected to return multiple rows.
+
+        **Database Schema:**
+        {schema_info}
+
+        **Output Format (JSON):**
+        Return ONLY a valid JSON object with 'sql' and 'params' keys.
+        ```json
+        {{
+          "sql": "Your SQL query using the specified parameter names (e.g., :organization_id, :{param_name_for_llm})",
+          "params": {{
+            "organization_id": "SECURITY_PARAM_ORG_ID",
+            "{param_name_for_llm}": "placeholder"  // The exact value here doesn't matter, it will be replaced
+            // Include other necessary parameter keys with placeholder values if needed
+          }}
+        }}
+        ```
+        **IMPORTANT:** In the `params` dictionary you return, include keys for `organization_id` and *all* the required location parameter names (e.g., `{param_name_for_llm}`). The *values* for these keys in your returned JSON can be simple placeholders like \"placeholder\" or \"value\"; they will be replaced correctly later.
+        """
+        # --- End System Message Update ---
+        
+        logger.debug(f"{log_prefix}LLM System Message for SQL Generation:\n{system_message}") # Log updated message
+        logger.debug(f"{log_prefix}LLM Human Message (Query Description): {query_description}")
+        
+        try:
+            llm = AzureChatOpenAI(
+                openai_api_key=settings.AZURE_OPENAI_API_KEY,
+                azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
+                openai_api_version=settings.AZURE_OPENAI_API_VERSION,
+                deployment_name=settings.AZURE_OPENAI_DEPLOYMENT_NAME,
+                model_name=settings.LLM_MODEL_NAME,
+                temperature=0.0,
+                max_retries=settings.LLM_MAX_RETRIES,
+            )
+            
+            messages = [
+                SystemMessage(content=system_message),
+                HumanMessage(content=f"Generate SQL for this query description: {query_description}")
+            ]
+            
+            sql_result = await llm.ainvoke(messages)
+            sql_text = sql_result.content
+            
+            logger.debug(f"{log_prefix}Raw LLM Output (SQL Generation):\n{sql_text}")
+            
+            sql_text = self._clean_json_response(sql_text)
+            
+            try:
+                result_json = json.loads(sql_text)
+                if not isinstance(result_json, dict) or not all(key in result_json for key in ["sql", "params"]):
+                    raise ValueError("Invalid SQL generation output format. Expected 'sql' and 'params' keys.")
+                
+                sql = result_json["sql"]
+                params_from_llm = result_json.get("params", {})
+                
+                # --- Postprocessing: Construct final params using precomputed map ---
+                params_for_execution = {
+                    "organization_id": self.organization_id # Set the correct org ID
+                }
+                
+                # Substitute actual UUIDs for location parameters based on the map
+                # created during preprocessing, ignoring placeholder values from LLM.
+                for param_name, resolved_uuid in param_name_to_uuid_map.items():
+                    # Check if the LLM included the expected parameter key
+                    if param_name in params_from_llm:
+                        params_for_execution[param_name] = resolved_uuid
+                    else:
+                        # Log if LLM forgot a parameter it was asked to include
+                        logger.warning(f"{log_prefix}LLM forgot to include expected parameter key '{param_name}' in its generated params dictionary.")
+                        # Attempt to add it anyway, hoping the SQL uses it.
+                        params_for_execution[param_name] = resolved_uuid 
+                        
+                # Add any other non-location, non-org parameters the LLM might have generated
+                for key, value in params_from_llm.items():
+                    if key != "organization_id" and key not in param_name_to_uuid_map:
+                         params_for_execution[key] = value # Trust LLM's value for non-location params
+                # --- End Postprocessing ---
+                
+                logger.debug(f"{log_prefix}Generated SQL (Parsed): {sql}")
+                logger.debug(f"{log_prefix}Parameters (Final for Execution): {params_for_execution}")
+                
+                return sql, params_for_execution # Return the final parameters
+                
+            except json.JSONDecodeError as e:
+                logger.error(f"{log_prefix}Failed to parse SQL generation output as JSON: {e}", exc_info=False)
+                logger.debug(f"{log_prefix}Raw SQL generation output (at error): {sql_text}")
+                raise ValueError(f"Failed to parse SQL generation output: {e}")
+                
+        except (APIConnectionError, APITimeoutError, RateLimitError) as e:
+            logger.error(f"{log_prefix}OpenAI API error during SQL generation: {e}", exc_info=False)
+            raise ValueError(f"Service unavailable during SQL generation: {e.__class__.__name__}")
+        except ValueError as ve:
+            raise ve
+        except Exception as e:
+            logger.error(f"{log_prefix}Unexpected error during SQL generation: {e}", exc_info=True)
+            raise ValueError(f"Unexpected error during SQL generation: {e.__class__.__name__}: {str(e)}")
+    
+    async def _execute_subqueries_concurrently(
+        self, 
+        subquery_data: List[Dict[str, Any]], 
+        resolved_location_map: Dict[str, str],
+        schema_info: str
+    ) -> List[SubqueryResult]:
         """Execute multiple subqueries concurrently and return their results."""
         log_prefix = f"[Org: {self.organization_id}] [SummaryTool] "
-        logger.debug(f"{log_prefix}Executing {len(subqueries)} subqueries concurrently")
+        logger.info(f"{log_prefix}Executing {len(subquery_data)} subqueries concurrently")
         
-        # Execute all subqueries concurrently to speed up data gathering
-        tasks = [self._run_single_query(subquery) for subquery in subqueries]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Process results and handle any exceptions
-        processed_results = []
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error(f"{log_prefix}Error executing subquery {i+1}: {result}")
-                processed_results.append(SubqueryResult(
-                    query=subqueries[i],
-                    result={},
-                    error=f"Failed to execute: {str(result)}"
-                ))
-            else:
-                processed_results.append(result)
-        
-        return processed_results
-    
-    async def _run_single_query(self, subquery: str) -> SubqueryResult:
-        """Execute a single subquery and return its result."""
-        log_prefix = f"[Org: {self.organization_id}] [SummaryTool] "
-        try:
-            # Generate SQL from the subquery description
-            sql, params = await self._generate_sql_from_description(subquery)
+        if not subquery_data:
+            return []
             
-            # Security check for organization_id (similar to sql_tool.py)
-            if "organization_id" not in params:
-                error_msg = "SECURITY CHECK FAILED: organization_id missing from parameters"
-                logger.error(f"{log_prefix}{error_msg}")
-                return SubqueryResult(
-                    query=subquery,
-                    result={},
-                    error=error_msg
+        sql_tool = SQLExecutionTool(organization_id=self.organization_id)
+        
+        tasks = []
+        for i, subquery in enumerate(subquery_data):
+            description = subquery.get("description", f"Subquery {i+1}")
+            task = asyncio.create_task(
+                self._generate_and_execute_single(
+                    sql_tool, 
+                    description, 
+                    resolved_location_map,
+                    schema_info
                 )
-            
-            if params["organization_id"] != self.organization_id:
-                error_msg = f"SECURITY CHECK FAILED: organization_id mismatch in parameters. Expected {self.organization_id}"
-                logger.error(f"{log_prefix}{error_msg}")
-                return SubqueryResult(
-                    query=subquery,
-                    result={},
-                    error=error_msg
-                )
-            
-            # Process placeholder parameters
-            placeholder_params = {}
-            location_names = []
-            
-            # Extract and handle any hierarchy ID placeholders
-            for key, value in list(params.items()):
-                # Skip the organization_id parameter
-                if key == "organization_id":
-                    continue
-                    
-                # Check for placeholder values (that need resolution to actual UUIDs)
-                if isinstance(value, str) and value.startswith("PLACEHOLDER_ID_"):
-                    # Extract the location name from the placeholder
-                    raw_location_name = value.replace("PLACEHOLDER_ID_", "").lower()
-                    
-                    # Process the location name to handle abbreviations
-                    location_name = raw_location_name
-                    
-                    # Check for abbreviation pattern: "name (abbr)" or similar formats
-                    abbr_pattern = r'(.+?)\s*\(([a-z]+)\)'
-                    abbr_match = re.search(abbr_pattern, location_name)
-                    
-                    if abbr_match:
-                        # Store both the full name and the abbreviation for better matching
-                        full_name = abbr_match.group(1).strip()
-                        abbreviation = abbr_match.group(2).strip()
-                        
-                        logger.debug(f"{log_prefix}Extracted location name '{full_name}' with abbreviation '{abbreviation}'")
-                        
-                        # Add both forms to increase chances of resolution
-                        location_names.append(full_name)
-                        location_names.append(abbreviation)
-                        placeholder_params[key] = full_name  # Use the full name as primary
-                    else:
-                        # Standard case - no abbreviation
-                        placeholder_params[key] = location_name
-                        location_names.append(location_name)
-                    
-                    # Remove the parameter temporarily (we'll add back the resolved UUID)
-                    # Important: Use None as temporary value to ensure it doesn't get passed to SQL as-is
-                    params[key] = None
-            
-            # Resolve location names to UUIDs if needed
-            if location_names:
-                try:
-                    # Create a resolver instance with our organization_id
-                    resolver = HierarchyNameResolverTool(organization_id=self.organization_id)
-                    
-                    # Remove duplicates while preserving order
-                    unique_location_names = list(dict.fromkeys(location_names))
-                    
-                    # Batch resolve all location names
-                    logger.debug(f"{log_prefix}Resolving {len(unique_location_names)} location names: {unique_location_names}")
-                    resolution_result = await resolver.ainvoke({"name_candidates": unique_location_names})
-                    resolution_data = resolution_result.get("resolution_results", {})
-                    
-                    # Log the resolution results for debugging
-                    if logger.isEnabledFor(logging.DEBUG):
-                        for name, result in resolution_data.items():
-                            status = result.get("status", "unknown")
-                            score = result.get("score", 0)
-                            resolved_name = result.get("resolved_name", "N/A")
-                            logger.debug(f"{log_prefix}Resolution for '{name}': status={status}, score={score}, resolved to '{resolved_name}'")
-                    
-                    # Process resolution results
-                    resolution_failed = False
-                    failed_locations = []
-                    
-                    # Update params with the resolved IDs
-                    for param_key, location_name in placeholder_params.items():
-                        # Check if we have a direct match first
-                        resolution_info = resolution_data.get(location_name, {})
-                        
-                        # If no direct match, try other forms of the name if we extracted an abbreviation
-                        if resolution_info.get("status") != "found":
-                            # Try to find a match from any of the names we submitted for this parameter
-                            for candidate_name in location_names:
-                                candidate_info = resolution_data.get(candidate_name, {})
-                                if candidate_info.get("status") == "found" and candidate_info.get("id"):
-                                    resolution_info = candidate_info
-                                    logger.debug(f"{log_prefix}Found match for '{param_key}' using alternative name '{candidate_name}'")
-                                    break
-                        
-                        if resolution_info.get("status") == "found" and resolution_info.get("id"):
-                            # We have a successful resolution - use the UUID
-                            resolved_uuid = resolution_info["id"]
-                            params[param_key] = resolved_uuid
-                            
-                            # Include the resolved name in the log for clarity
-                            resolved_name = resolution_info.get("resolved_name", "unknown")
-                            method = resolution_info.get("method", "unknown")
-                            score = resolution_info.get("score", 0)
-                            
-                            logger.debug(
-                                f"{log_prefix}Successfully resolved '{location_name}' to "
-                                f"'{resolved_name}' (UUID: {resolved_uuid}) with "
-                                f"method={method}, score={score}"
-                            )
-                        else:
-                            # Resolution failed for this location
-                            resolution_failed = True
-                            failed_locations.append(location_name)
-                            logger.warning(
-                                f"{log_prefix}Failed to resolve location '{location_name}' "
-                                f"(status: {resolution_info.get('status', 'unknown')})"
-                            )
-                    
-                    # If any resolutions failed, return an error
-                    if resolution_failed:
-                        error_msg = f"Could not resolve the following location(s): {', '.join(failed_locations)}"
-                        logger.error(f"{log_prefix}{error_msg}")
-                        return SubqueryResult(
-                            query=subquery,
-                            result={},
-                            error=error_msg
-                        )
-                        
-                except Exception as e:
-                    # Handle any errors during resolution
-                    logger.error(f"{log_prefix}Error resolving location names: {e}", exc_info=True)
-                    return SubqueryResult(
-                        query=subquery,
-                        result={},
-                        error=f"Error resolving location names: {str(e)}"
-                    )
-            
-            # Clean up params - remove any None values (unresolved parameters)
-            for key in list(params.keys()):
-                if params[key] is None:
-                    logger.warning(f"{log_prefix}Removing unresolved parameter: {key}")
-                    del params[key]
-            
-            # Execute the SQL query
+            )
+            tasks.append((description, task))
+        
+        # Gather results as they complete
+        results = []
+        for description, task in tasks:
             try:
-                # Get a database connection
-                async with get_async_db_connection(db_name="report_management") as conn:
-                    # Log the SQL and parameters (for debugging)
-                    logger.debug(f"{log_prefix}Executing SQL: {sql}")
-                    
-                    # Safer parameter logging that masks potential sensitive values
-                    safe_params = {
-                        k: (
-                            "***" if k == "organization_id" else 
-                            str(v)[:8] + "..." if isinstance(v, str) and len(str(v)) > 10 else
-                            str(v)
-                        ) for k, v in params.items()
-                    }
-                    logger.debug(f"{log_prefix}With params: {json.dumps(safe_params)}")
-                    
-                    # Execute the SQL query
-                    result = await conn.execute(text(sql), params)
-                    
-                    # Extract column names
-                    columns = list(result.keys())
-                    
-                    # Fetch and process rows
-                    rows = result.fetchall()
-                    processed_rows = []
-                    
-                    # Process each row to ensure proper JSON serialization
-                    for row in rows:
-                        row_dict = {}
-                        for col_name, value in zip(columns, row):
-                            # Handle special data types
-                            if isinstance(value, uuid.UUID):
-                                row_dict[col_name] = str(value)  # Convert UUID to string
-                            elif isinstance(value, datetime):
-                                row_dict[col_name] = value.isoformat()  # Convert datetime to ISO string
-                            else:
-                                row_dict[col_name] = value
-                        processed_rows.append(row_dict)
-                    
-                    # Log the row count for debugging
-                    logger.debug(f"{log_prefix}Query returned {len(processed_rows)} rows")
-                    
-                    # Return successful result
-                    return SubqueryResult(
-                        query=subquery,
-                        result={"table": {"columns": columns, "rows": processed_rows}},
-                        error=None
-                    )
-                    
-            except Exception as e:
-                # Handle SQL execution errors
-                error_msg = str(e)
-                logger.error(f"{log_prefix}Error executing SQL: {error_msg}", exc_info=True)
+                result = await task
                 
-                # Provide more specific error message for common DB errors
-                if "invalid input syntax for type uuid" in error_msg:
-                    enhanced_error = "Database error: Invalid UUID format in the query parameters. This may be due to a problem with hierarchy ID resolution."
-                    logger.error(f"{log_prefix}{enhanced_error}")
-                    return SubqueryResult(
-                        query=subquery,
-                        result={},
-                        error=enhanced_error
-                    )
-                
-                return SubqueryResult(
-                    query=subquery,
-                    result={},
-                    error=f"Database error: {error_msg}"
+                # --- Check if the result dictionary indicates an error from SQLExecutionTool --- 
+                is_error_structure = (
+                    isinstance(result, dict) and 
+                    isinstance(result.get("table"), dict) and
+                    result["table"].get("columns") == ["Error"]
                 )
                 
-        except ValueError as e:
-            # Handle SQL generation errors
-            logger.error(f"{log_prefix}SQL generation error: {e}")
-            return SubqueryResult(
-                query=subquery,
-                result={},
-                error=f"SQL generation error: {str(e)}"
-            )
+                if is_error_structure:
+                    # This indicates _execute_sql caught an error (like security check or DB error)
+                    error_message = result.get("text", "Unknown error from SQL execution")
+                    logger.warning(f"{log_prefix}Subquery '{description}' failed during execution: {error_message}")
+                    results.append(SubqueryResult(query=description, result={}, error=error_message))
+                elif isinstance(result, dict):
+                    # If await task SUCCEEDS (returns a valid data dict), append a successful result
+                    results.append(SubqueryResult(query=description, result=result, error=None))
+                else:
+                    # Handle unexpected return types from _generate_and_execute_single
+                    logger.error(f"{log_prefix}Subquery '{description}' returned unexpected type: {type(result)}")
+                    results.append(SubqueryResult(query=description, result={}, error=f"Unexpected result type: {type(result)}"))
+
+            except ValueError as ve:
+                # Handle SQL generation/validation errors (expected errors from _generate_and_execute_single)
+                logger.warning(f"{log_prefix}Subquery '{description}' failed: {ve}")
+                results.append(SubqueryResult(query=description, result={}, error=str(ve)))
+            except asyncio.TimeoutError:
+                logger.error(f"{log_prefix}Subquery '{description}' timed out.")
+                results.append(SubqueryResult(query=description, result={}, error="Query execution timed out"))
+            except Exception as e:
+                # Catch any other unexpected errors during the await task or processing
+                logger.error(f"{log_prefix}Unexpected error processing subquery '{description}': {e}", exc_info=True)
+                results.append(SubqueryResult(query=description, result={}, error=f"Unexpected error: {str(e)}"))
+
+        # Log a summary of results
+        successful_queries = sum(1 for r in results if r.successful)
+        logger.info(f"{log_prefix}Completed {len(results)} subqueries. Success rate: {successful_queries}/{len(results)}")
+        return results
+
+    async def _generate_and_execute_single(
+        self, 
+        sql_tool: SQLExecutionTool, 
+        description: str, 
+        resolved_location_map: Dict[str, str],
+        schema_info: str
+    ) -> Dict[str, Any]:
+        """Generate and execute a single SQL query using SQLExecutionTool."""
+        log_prefix = f"[Org: {self.organization_id}] [SummaryTool] "
+        
+        try:
+            # Generate SQL query with parameter placeholders
+            sql, params = await self._generate_sql_and_params(description, resolved_location_map, schema_info)
+            
+            # Execute SQL using SQLExecutionTool
+            # ainvoke now guarantees returning the awaited result due to explicit implementation
+            result_json_str = await sql_tool.ainvoke({
+                "sql": sql,
+                "params": params
+            })
+            
+            # Parse JSON string result into dictionary
+            if not isinstance(result_json_str, str):
+                 # If it's already a dict (shouldn't happen if _run returns str, but check)
+                if isinstance(result_json_str, dict):
+                    logger.warning(f"{log_prefix}SQL tool returned dict directly, expected JSON string.")
+                    result = result_json_str 
+                else:
+                    # Handle unexpected non-string, non-dict types
+                    raise ValueError(f"Expected JSON string from sql_tool, got {type(result_json_str)}")
+            else:
+                # Parse the JSON string returned by the tool
+                try:
+                    result = json.loads(result_json_str)
+                except json.JSONDecodeError as json_err:
+                    logger.error(f"{log_prefix}Failed to parse result from sql_tool: {json_err}. Raw: {result_json_str[:200]}...")
+                    raise ValueError(f"Failed to parse result from SQL tool: {json_err}")
+            
+            # Process and return the result dictionary
+            if not isinstance(result, dict):
+                raise ValueError(f"Parsed result from sql_tool is not a dict: {type(result)}")
+                
+            return result
+            
+        except ValueError as ve:
+            # For expected errors like SQL generation/validation issues
+            logger.warning(f"{log_prefix}Error generating/executing query for '{description}': {ve}")
+            raise ValueError(f"Generation/Validation Error: {str(ve)}")
+        except (APIConnectionError, APITimeoutError) as api_e:
+            # For API service availability issues
+            logger.warning(f"{log_prefix}Service error for '{description}': {api_e}")
+            raise ValueError(f"Service Unavailable: {api_e.__class__.__name__}")
         except Exception as e:
-            # Handle any other unexpected errors
-            logger.error(f"{log_prefix}Unexpected error processing subquery: {e}", exc_info=True)
-            return SubqueryResult(
-                query=subquery,
-                result={},
-                error=f"Unexpected error: {str(e)}"
-            )
+            # Catch unexpected errors during the process
+            logger.error(f"{log_prefix}Unexpected error in '{description}': {e}", exc_info=True)
+            raise ValueError(f"Unexpected Error: {e.__class__.__name__}: {str(e)}")
+    
     
     async def _resolve_and_inject_names(self, subquery_results: List[SubqueryResult]) -> List[SubqueryResult]:
-        """Resolves hierarchy IDs to names and injects them into results."""
+        """
+        Resolves hierarchy IDs found in successful subquery results to names using HierarchyNameResolverTool.
+        Efficiently injects location names into results for better readability.
+        """
         log_prefix = f"[Org: {self.organization_id}] [SummaryTool] "
-        logger.debug(f"{log_prefix}Attempting to resolve hierarchy IDs to names.")
+        logger.debug(f"{log_prefix}Resolving hierarchy IDs to names.")
         
         ids_to_resolve = set()
         results_with_id_col = [] # Store indices of results containing 'hierarchyId'
         
-        # Gather all unique IDs from successful results that have a 'hierarchyId' column
+        # Step 1: Gather all unique IDs from successful results that have a 'hierarchyId' column
         for idx, result in enumerate(subquery_results):
-            if result.successful and "table" in result.result:
-                columns = result.result["table"].get("columns", [])
-                rows = result.result["table"].get("rows", [])
-                if "hierarchyId" in columns and rows:
-                    results_with_id_col.append(idx)
-                    for row in rows:
-                        if "hierarchyId" in row and row["hierarchyId"]:
-                            ids_to_resolve.add(row["hierarchyId"])
+            if not result.successful or "table" not in result.result:
+                continue
+                
+            columns = result.result["table"].get("columns", [])
+            rows = result.result["table"].get("rows", [])
+            
+            # Find the index of the 'hierarchyId' column
+            hierarchy_id_index = -1
+            if "hierarchyId" in columns:
+                hierarchy_id_index = columns.index("hierarchyId")
+            
+            # Only process if the column exists and we have rows
+            if hierarchy_id_index != -1 and rows:
+                results_with_id_col.append(idx)
+                for row in rows:
+                    if hierarchy_id_index < len(row): # Check index bounds
+                        hierarchy_id = row[hierarchy_id_index] # Access by index
+                        if hierarchy_id:
+                            ids_to_resolve.add(str(hierarchy_id))
         
+        # If no IDs to resolve, return the original results unchanged
         if not ids_to_resolve:
-            logger.debug(f"{log_prefix}No hierarchy IDs found in results to resolve.")
-            return subquery_results # Nothing to do
+            logger.debug(f"{log_prefix}No hierarchy IDs found to resolve.")
+            return subquery_results
             
         logger.debug(f"{log_prefix}Found {len(ids_to_resolve)} unique hierarchy IDs to resolve.")
         
-        # Fetch names from hierarchyCaches
+        # Step 2: Resolve IDs to names in a single batch call
+        resolver = HierarchyNameResolverTool(organization_id=self.organization_id)
         id_name_map = {}
+        
         try:
-            async with get_async_db_connection(db_name="report_management") as conn:
-                # Enhanced SQL to fetch both name and shortName for better display options
-                sql = text('''
-                    SELECT "id", "name", "shortName", "parentId" 
-                    FROM "hierarchyCaches" 
-                    WHERE "id" = ANY(:ids)
-                    AND "deletedAt" IS NULL
-                    AND "organizationId" = :organization_id
-                ''')
-                # Convert set to list for parameter binding
-                params = {
-                    "ids": list(ids_to_resolve),
-                    "organization_id": self.organization_id
-                }
-                db_result = await conn.execute(sql, params)
-                fetched_names = await db_result.fetchall()
-                
-                # Create a comprehensive mapping with multiple name options
-                for row in fetched_names:
-                    hierarchy_id = str(row[0])
-                    full_name = row[1]
-                    short_name = row[2]
-                    parent_id = row[3]
-                    
-                    # Store both name formats for display flexibility
+            resolution_result = await resolver.ainvoke({"name_candidates": list(ids_to_resolve)})
+            resolution_data = resolution_result.get("resolution_results", {})
+            
+            # Build lookup map of ID → Name information
+            for hierarchy_id, result_info in resolution_data.items():
+                if result_info.get("status") == "found":
                     id_name_map[hierarchy_id] = {
-                        "name": full_name,
-                        "shortName": short_name,
-                        "parentId": str(parent_id) if parent_id else None,
-                        "displayName": full_name
+                        "displayName": result_info.get("name"),
+                        "parentName": result_info.get("parent_name")
                     }
-                    
-                    # For better display, if shortName is available, use "name (shortName)" format
-                    if short_name:
-                        id_name_map[hierarchy_id]["displayName"] = f"{full_name} ({short_name})"
-                
-                logger.debug(f"{log_prefix}Successfully fetched {len(id_name_map)} names for IDs.")
-                
-                # If we have parent IDs, we might need to fetch parent names too for context
-                parent_ids = {entry.get("parentId") for entry in id_name_map.values() 
-                             if entry.get("parentId") and entry.get("parentId") not in id_name_map}
-                
-                if parent_ids:
-                    logger.debug(f"{log_prefix}Fetching {len(parent_ids)} parent names for context.")
-                    parent_sql = text('''
-                        SELECT "id", "name", "shortName"
-                        FROM "hierarchyCaches" 
-                        WHERE "id" = ANY(:parent_ids)
-                        AND "deletedAt" IS NULL
-                        AND "organizationId" = :organization_id
-                    ''')
-                    parent_params = {
-                        "parent_ids": list(parent_ids),
-                        "organization_id": self.organization_id
-                    }
-                    parent_result = await conn.execute(parent_sql, parent_params)
-                    parent_names = await parent_result.fetchall()
-                    
-                    # Add parent info to our mapping
-                    for row in parent_names:
-                        parent_id = str(row[0])
-                        parent_name = row[1]
-                        parent_short_name = row[2]
-                        
-                        id_name_map[parent_id] = {
-                            "name": parent_name,
-                            "shortName": parent_short_name,
-                            "displayName": f"{parent_name} ({parent_short_name})" if parent_short_name else parent_name
-                        }
-
         except Exception as e:
-            logger.error(f"{log_prefix}Error fetching hierarchy names: {e}", exc_info=True)
-            # Proceed without names if lookup fails
-            return subquery_results 
-
-        # Inject names into the relevant results
+            logger.warning(f"{log_prefix}Error resolving hierarchy IDs: {e}", exc_info=False)
+            # Continue with what we have (might be empty)
+        
+        # If no names were resolved, return original results
+        if not id_name_map:
+            logger.debug(f"{log_prefix}No names could be resolved for the hierarchy IDs.")
+            return subquery_results
+            
+        # Step 3: Inject resolved names into result tables
         updated_results = list(subquery_results) # Create a copy
-        name_col = "Location Name" # Define the new column name
-        parent_col = "Parent Location" # Define column for parent info
-
+        
+        # Column names for location info
+        name_col = "Location Name"
+        parent_col = "Parent Location"
+        
         for idx in results_with_id_col:
             original_result = updated_results[idx]
-            if original_result.successful: # Double-check success
-                original_table = original_result.result.get("table", {})
-                original_columns = original_table.get("columns", [])
-                original_rows = original_table.get("rows", [])
+            if not original_result.successful:
+                continue
                 
-                # Define new columns we'll add
-                new_columns = list(original_columns)
+            original_table = original_result.result.get("table", {})
+            original_columns = original_table.get("columns", [])
+            original_rows = original_table.get("rows", [])
+            
+            # Skip if no rows to process
+            if not original_rows:
+                continue
                 
-                # Add Location Name column if not present
-                if name_col not in original_columns:
-                    new_columns.append(name_col)
+            # Define updated columns list - add name columns if not present
+            need_name_col = name_col not in original_columns
+            need_parent_col = parent_col not in original_columns
+            
+            # If neither column needs to be added, skip this result
+            if not need_name_col and not need_parent_col:
+                continue
                 
-                # Add Parent Location column for additional context
-                has_parent_col = False
-                if parent_col not in original_columns:
-                    new_columns.append(parent_col)
-                    has_parent_col = True
+            new_columns = list(original_columns)
+            if need_name_col:
+                new_columns.append(name_col)
+            if need_parent_col:
+                new_columns.append(parent_col)
+            
+            # Process rows to add name information
+            new_rows = []
+            for row in original_rows:
+                # Find index of hierarchyId again for this specific result
+                hierarchy_id_index = -1
+                if "hierarchyId" in original_columns:
+                    hierarchy_id_index = original_columns.index("hierarchyId")
                 
-                new_rows = []
+                # Get the hierarchy ID using the index
+                hierarchy_id_str = ""
+                if hierarchy_id_index != -1 and hierarchy_id_index < len(row):
+                    hierarchy_id_str = str(row[hierarchy_id_index])
                 
-                for row in original_rows:
-                    new_row = row.copy()
-                    hierarchy_id = new_row.get("hierarchyId")
+                # Convert the list row to a dict for easier manipulation/adding columns
+                new_row_dict = dict(zip(original_columns, row))
+                
+                # Only process if we have this ID in our resolved map
+                if hierarchy_id_str and hierarchy_id_str in id_name_map:
+                    location_info = id_name_map[hierarchy_id_str]
                     
-                    # Use fetched name info if available
-                    location_info = id_name_map.get(hierarchy_id, {})
+                    # Add location name if needed column exists and isn't already filled
+                    if need_name_col and not new_row_dict.get(name_col):
+                        new_row_dict[name_col] = location_info.get("displayName")
                     
-                    # Add location name
-                    if name_col not in new_row or not new_row[name_col]:
-                        display_name = location_info.get("displayName")
-                        new_row[name_col] = display_name
-                    
-                    # Add parent location info if we have it
-                    if has_parent_col:
-                        parent_id = location_info.get("parentId")
-                        parent_info = id_name_map.get(parent_id, {}) if parent_id else {}
-                        parent_name = parent_info.get("displayName")
-                        new_row[parent_col] = parent_name
-                    
-                    new_rows.append(new_row)
+                    # Add parent location info if needed column exists
+                    if need_parent_col:
+                        new_row_dict[parent_col] = location_info.get("parentName")
                 
-                # Update the result object in the list
-                updated_results[idx] = SubqueryResult(
-                    query=original_result.query,
-                    result={"table": {"columns": new_columns, "rows": new_rows}},
-                    error=original_result.error
-                )
-                
-                # Log what we did for debugging
-                added_cols = []
-                if name_col not in original_columns:
-                    added_cols.append(name_col)
-                if has_parent_col:
-                    added_cols.append(parent_col)
-                
-                if added_cols:
-                    logger.debug(f"{log_prefix}Injected columns {added_cols} into subquery result index {idx}.")
+                # Convert back to list in the new column order
+                final_row_list = [new_row_dict.get(col_name) for col_name in new_columns]
+                new_rows.append(final_row_list)
+            
+            # Update the result with the enhanced data
+            updated_results[idx] = SubqueryResult(
+                query=original_result.query,
+                result={"table": {"columns": new_columns, "rows": new_rows}},
+                error=original_result.error
+            )
+            
+            logger.debug(f"{log_prefix}Enhanced result {idx} with location names for {len(new_rows)} rows.")
 
         return updated_results
 
     def _calculate_composite_metrics(self, subquery_results: List[SubqueryResult]) -> CompositeMetricsResult:
         """
-        Calculate derived and composite metrics from the raw data results, potentially combining data across subqueries.
-        This specialized function provides business intelligence by:
-        1. Calculating success rates (e.g., borrow success rate) by combining success/failure counts from potentially different subqueries for the same entity.
-        2. Creating efficiency metrics (e.g., borrows per active user).
-        3. Identifying correlations between different metrics.
-        4. Computing growth rates and change velocities.
+        Calculate derived metrics like success rates or ratios from aggregated data.
+        Focuses on common patterns like success/failure pairs.
+        Handles results where rows are lists of values.
         """
         log_prefix = f"[Org: {self.organization_id}] [SummaryTool] "
-        logger.info(f"{log_prefix}Calculating composite metrics from {len(subquery_results)} result sets (cross-query aggregation enabled)")
+        logger.info(f"{log_prefix}Calculating composite metrics.")
         
-        composite_metrics = CompositeMetricsResult(
-            success_rates=[],
-            cross_metric_ratios=[]
-        )
+        composite_metrics = CompositeMetricsResult()
+        aggregated_data = {}
+        entity_key_preference = ["Location Name", "hierarchyId"] # Preference for entity grouping
+
+        for result in subquery_results:
+            if result.successful and "table" in result.result:
+                table = result.result["table"]
+                columns = table.get("columns", [])
+                rows = table.get("rows", [])
+                if not rows or not columns:
+                    continue
+
+                # Find the best entity key column present
+                entity_col = next((col for col in entity_key_preference if col in columns), None)
+                entity_col_index = columns.index(entity_col) if entity_col else -1
+                
+                # Find the index of 'Location Name' if different from entity_col, for display purposes
+                display_name_col_index = -1
+                if "Location Name" in columns:
+                    display_name_col_index = columns.index("Location Name")
+
+                # Identify numeric columns and their indices
+                numeric_col_indices = {}
+                sample_row = rows[0] # First row to check types
+                for idx, col_name in enumerate(columns):
+                    if idx != entity_col_index and idx < len(sample_row):
+                        sample_val = sample_row[idx]
+                        if isinstance(sample_val, (int, float)):
+                            numeric_col_indices[col_name] = idx
+                
+                if not numeric_col_indices: continue # Skip if no numeric data
+
+                # Aggregate data using indices
+                for row in rows:
+                    if len(row) < len(columns): continue # Skip malformed rows
+                    
+                    # Determine Entity ID and Display Name
+                    entity_id = "_org_wide_"
+                    entity_display_name = "Organization Wide"
+                    if entity_col_index != -1:
+                        entity_id = str(row[entity_col_index]) # Use string representation for safety
+                        # Use Location Name for display if available, otherwise use the entity ID itself
+                        if display_name_col_index != -1:
+                            entity_display_name = str(row[display_name_col_index])
+                        else:
+                            entity_display_name = entity_id 
+                    
+                    if entity_id not in aggregated_data:
+                        aggregated_data[entity_id] = {"_entity_display_name_": entity_display_name}
+                             
+                    # Aggregate numeric columns by index
+                    for num_col, num_idx in numeric_col_indices.items():
+                        if num_idx < len(row): # Check index bounds again for safety
+                            value = row[num_idx]
+                            if isinstance(value, (int, float)): # Ensure it's numeric
+                                aggregated_data[entity_id][num_col] = aggregated_data[entity_id].get(num_col, 0) + value
+                            else:
+                                # Log unexpected non-numeric value
+                                logger.debug(f"{log_prefix}Skipping non-numeric value '{value}' for column '{num_col}' in entity '{entity_id}'")
         
-        # --- Step 1: Aggregate data by entity (Location Name or hierarchyId) across all results --- #
-        entity_aggregated_data = {}
-        all_numeric_metrics = set() # Track all numeric metric names encountered
-        entity_key_col = None # Track which column is used as the primary entity key ("Location Name" preferred)
-
-        for subquery_result in subquery_results:
-            if subquery_result.successful:
-                table_data = subquery_result.result.get("table", {})
-                if isinstance(table_data, dict) and "columns" in table_data and "rows" in table_data:
-                    columns = table_data.get("columns", [])
-                    rows = table_data.get("rows", [])
-                    
-                    # Determine the best entity identifier column for this table
-                    current_entity_col = None
-                    if "Location Name" in columns:
-                        current_entity_col = "Location Name"
-                        if entity_key_col is None: entity_key_col = "Location Name"
-                    elif "hierarchyId" in columns:
-                        current_entity_col = "hierarchyId"
-                        if entity_key_col is None: entity_key_col = "hierarchyId"
-                    # Add other potential entity columns if needed (e.g., "Branch Code")
-                    
-                    if not current_entity_col:
-                        # If no entity column, treat as organization-wide aggregate (use a placeholder key)
-                        entity_id = "_org_wide_"
-                        if entity_id not in entity_aggregated_data:
-                            entity_aggregated_data[entity_id] = {}
-                        for row in rows:
-                            for col in columns:
-                                if col not in ["Location Name", "hierarchyId"] and col in row and row[col] is not None: # Exclude entity keys
-                                    try:
-                                        value = float(row[col])
-                                        # Sum org-wide metrics
-                                        entity_aggregated_data[entity_id][col] = entity_aggregated_data[entity_id].get(col, 0) + value
-                                        all_numeric_metrics.add(col)
-                                    except (ValueError, TypeError): pass
-                        continue # Move to next subquery result
-
-                    # Process rows with an entity column
-                    for row in rows:
-                        entity_id = row.get(current_entity_col)
-                        if entity_id:
-                            if entity_id not in entity_aggregated_data:
-                                entity_aggregated_data[entity_id] = {}
-                                # Store the preferred entity name if available
-                                if current_entity_col == "Location Name":
-                                    entity_aggregated_data[entity_id]["_entity_display_name_"] = entity_id
-                                elif "Location Name" in row and row["Location Name"]:
-                                     entity_aggregated_data[entity_id]["_entity_display_name_"] = row["Location Name"]
-                                else:
-                                     entity_aggregated_data[entity_id]["_entity_display_name_"] = entity_id # Fallback to ID
-                            
-                            # Aggregate numeric metrics for this entity
-                            for col in columns:
-                                if col != current_entity_col and "Location Name" not in col and "hierarchyId" not in col and col in row and row[col] is not None:
-                                    try:
-                                        value = float(row[col])
-                                        entity_aggregated_data[entity_id][col] = entity_aggregated_data[entity_id].get(col, 0) + value
-                                        all_numeric_metrics.add(col)
-                                    except (ValueError, TypeError): pass
-
-        logger.debug(f"{log_prefix}Aggregated data for {len(entity_aggregated_data)} entities across subqueries.")
-        # --- End Step 1 --- #
-
-        # --- Step 2: Calculate Success Rates --- #
-        # Define pairs of success/failure columns (using aliases generated by SQL)
+        # Define potential success/failure pairs (using common aliases)
         success_failure_pairs = [
-            ("Total Borrows", "Total Unsuccessful Borrows", "Borrow Success Rate"),
-            ("Total Successful Borrows", "Total Unsuccessful Borrows", "Borrow Success Rate"),
-            ("Total Successful Returns", "Total Unsuccessful Returns", "Return Success Rate"),
-            # Add other potential pairs like logins, etc.
+            (("Total Borrows", "Total Successful Borrows"), ("Total Unsuccessful Borrows",), "Borrow Success Rate"),
+            (("Total Successful Returns",), ("Total Unsuccessful Returns",), "Return Success Rate"),
+            # Add more pairs as needed
         ]
 
-        for entity_id, metrics in entity_aggregated_data.items():
-            entity_display_name = metrics.get("_entity_display_name_", entity_id if entity_id != "_org_wide_" else "Organization Wide")
-            for success_col, failure_col, rate_name in success_failure_pairs:
-                if success_col in metrics and failure_col in metrics:
-                    success_val = metrics[success_col]
-                    failure_val = metrics[failure_col]
+        # Calculate success rates where data is available
+        for entity_id, metrics in aggregated_data.items():
+            entity_display_name = metrics.get("_entity_display_name_", str(entity_id))
+            for success_aliases, failure_aliases, rate_name in success_failure_pairs:
+                success_col = next((alias for alias in success_aliases if alias in metrics), None)
+                failure_col = next((alias for alias in failure_aliases if alias in metrics), None)
+                
+                if success_col and failure_col:
+                    success_val = metrics.get(success_col, 0)
+                    failure_val = metrics.get(failure_col, 0)
                     total = success_val + failure_val
                     if total > 0:
                         success_rate = (success_val / total) * 100
@@ -1030,278 +882,279 @@ class SummarySynthesizerTool(BaseTool):
                             "failure_count": failure_val,
                             "success_rate": round(success_rate, 1),
                         })
-        # --- End Step 2 --- #
 
-        # --- Step 3: Calculate Cross-Metric Ratios --- #
-        # Use the overall aggregated metrics for org-wide ratios, or sum across entities if needed
-        overall_metrics = entity_aggregated_data.get("_org_wide_", {})
-        # If org-wide metrics weren't directly calculated, sum them from entities
-        if not overall_metrics:
-             for entity_id, metrics in entity_aggregated_data.items():
-                 if entity_id != "_org_wide_":
-                     for metric_name, value in metrics.items():
-                         if not metric_name.startswith("_"):
-                             overall_metrics[metric_name] = overall_metrics.get(metric_name, 0) + value
-
-        ratio_definitions = [
-            # (numerator_aliases, denominator_aliases, ratio_name)
-            (["Total Borrows", "Total Successful Borrows"], ["Total Users", "Active Patrons"], "Borrows per User"), # Placeholder, need user count
-            (["Total Borrows", "Total Successful Borrows"], ["Total Entries", "Total Visits"], "Borrows per Visit"), # Placeholder, need visit count
-            (["Total Successful Returns"], ["Total Borrows", "Total Successful Borrows"], "Return Rate"),
-            (["Total Renewals"], ["Total Borrows", "Total Successful Borrows"], "Renewal Rate"),
-            (["Total Logins"], ["Total Users", "Active Patrons"], "Logins per User") # Placeholder, need user count
-        ]
-
-        for num_aliases, denom_aliases, ratio_name in ratio_definitions:
-            num_val, num_key = None, None
-            denom_val, denom_key = None, None
-            
-            # Find first matching numerator metric in overall_metrics
-            for alias in num_aliases:
-                if alias in overall_metrics:
-                    num_val = overall_metrics[alias]
-                    num_key = alias
-                    break
-            
-            # Find first matching denominator metric in overall_metrics
-            for alias in denom_aliases:
-                if alias in overall_metrics:
-                    denom_val = overall_metrics[alias]
-                    denom_key = alias
-                    break
-            
-            # Calculate ratio if both found and denominator > 0
-            if num_val is not None and denom_val is not None and denom_val > 0:
-                ratio = num_val / denom_val
-                composite_metrics.cross_metric_ratios.append({
-                    "name": ratio_name,
-                    "numerator": f"{num_key} ({num_val})",
-                    "denominator": f"{denom_key} ({denom_val})",
-                    "ratio": round(ratio, 2)
-                })
-        # --- End Step 3 --- #
-
-        logger.info(f"{log_prefix}Composite metrics calculated. Found: {len(composite_metrics.success_rates)} success rates, "
-                  f"{len(composite_metrics.cross_metric_ratios)} cross-metric ratios")
-        
+        logger.info(f"{log_prefix}Composite metrics calculated. Found {len(composite_metrics.success_rates)} success rates.")
         return composite_metrics
     
     def _detect_trends(self, subquery_results: List[SubqueryResult]) -> InsightsResult:
         """
-        Automatically detect trends, anomalies, and patterns in the data.
-        This specialized function analyzes numerical data across subqueries to identify:
-        1. Trends over time
-        2. Outliers and anomalies
-        3. Correlations between different metrics
-        4. Performance relative to organizational baselines
+        Analyze subquery results to detect trends, anomalies, and comparisons.
+        Focuses on time series trends and deviations from averages.
+        Handles results where rows are lists of values.
         """
         log_prefix = f"[Org: {self.organization_id}] [SummaryTool] "
-        logger.info(f"{log_prefix}Analyzing trends across {len(subquery_results)} result sets")
-        
-        insights = InsightsResult(
-            trends=[],
-            anomalies=[],
-            organizational_comparisons=[]
-        )
-        
-        try:
-            # Extract numerical data series from all successful results
-            numerical_series = {}
-            time_series_data = {}
-            entity_performance = {}
-            org_averages = {}
+        insights = InsightsResult()
+        all_data_by_entity = {}
+
+        # First pass: Aggregate data by entity and identify time series
+        for result in subquery_results:
+            if not result.successful or "table" not in result.result:
+                continue
+                
+            table = result.result["table"]
+            columns = table.get("columns", [])
+            rows = table.get("rows", [])
             
-            # First pass: extract and organize data
-            for subquery_result in subquery_results:
-                if subquery_result.successful:
-                    table_data = subquery_result.result.get("table", {})
-                    if not isinstance(table_data, dict):
+            if not rows or not columns:
+                continue
+            
+            # Look for entity identifier column (preference order)
+            entity_col_index = -1
+            entity_col = None
+            for candidate in ["Location Name", "hierarchyId", "name"]:
+                if candidate in columns:
+                    entity_col_index = columns.index(candidate)
+                    entity_col = candidate
+                    break
+            
+            # Identify potential time/date column index
+            time_col_index = -1
+            time_col = None
+            time_col_keywords = {"date", "time", "day", "month", "year", "week"}
+            for idx, col_name in enumerate(columns):
+                if any(keyword in col_name.lower() for keyword in time_col_keywords):
+                    time_col_index = idx
+                    time_col = col_name
+                    break
+            
+            # Identify numeric columns and their indices (skip entity and time columns)
+            numeric_col_indices = {}
+            sample_row = rows[0] # Use first row to check types
+            for idx, col_name in enumerate(columns):
+                if idx != entity_col_index and idx != time_col_index and idx < len(sample_row):
+                    sample_val = sample_row[idx]
+                    if isinstance(sample_val, (int, float)):
+                        numeric_col_indices[col_name] = idx
+            
+            # Skip if no numeric columns to analyze
+            if not numeric_col_indices:
+                continue
+                
+            # Process rows using indices
+            for row in rows:
+                if len(row) < len(columns): continue # Skip malformed rows
+                
+                # Get entity ID/name using index
+                entity_id = str(row[entity_col_index]) if entity_col_index != -1 else "_org_wide_"
+                if entity_id not in all_data_by_entity:
+                    all_data_by_entity[entity_id] = {
+                        "metrics": {},
+                        "time_series": {} if time_col_index != -1 else None
+                    }
+                
+                # Store numeric metrics using indices
+                for metric_col_name, metric_col_idx in numeric_col_indices.items():
+                    if metric_col_idx < len(row):
+                        metric_val = row[metric_col_idx]
+                        if not isinstance(metric_val, (int, float)):
+                            continue
+                            
+                        # Add to aggregated metrics
+                        if metric_col_name not in all_data_by_entity[entity_id]["metrics"]:
+                            all_data_by_entity[entity_id]["metrics"][metric_col_name] = []
+                        all_data_by_entity[entity_id]["metrics"][metric_col_name].append(metric_val)
+                        
+                        # Add to time series if applicable using indices
+                        if time_col_index != -1 and all_data_by_entity[entity_id]["time_series" ] is not None:
+                            if time_col_index < len(row):
+                                time_val = row[time_col_index]
+                                if time_val:
+                                    if metric_col_name not in all_data_by_entity[entity_id]["time_series"]:
+                                        all_data_by_entity[entity_id]["time_series"][metric_col_name] = []
+                                    all_data_by_entity[entity_id]["time_series"][metric_col_name].append((time_val, metric_val))
+
+        # Calculate organization-wide averages for each metric
+        org_avg = {}
+        for metric in set().union(*(entity_data["metrics"].keys() for entity_data in all_data_by_entity.values())):
+            all_values = []
+            for entity_data in all_data_by_entity.values():
+                all_values.extend(entity_data["metrics"].get(metric, []))
+            
+            if all_values:
+                try:
+                    org_avg[metric] = sum(all_values) / len(all_values)
+                except (TypeError, ValueError):
+                    continue
+        
+        # Second pass: Analyze the aggregated data for insights
+        for entity, data in all_data_by_entity.items():
+            # Skip organization-wide data for comparison insights
+            if entity == "_org_wide_":
+                continue
+                
+            # Analyze metrics for anomalies relative to org averages
+            for metric, values in data["metrics"].items():
+                if not values or metric not in org_avg:
+                    continue
+                    
+                try:
+                    # Calculate statistics
+                    avg_val = sum(values) / len(values)
+                    entity_metric_avg = avg_val
+                    
+                    # Compare to organization average
+                    org_metric_avg = org_avg[metric]
+                    if abs(org_metric_avg) < 0.0001:  # Avoid division by zero
                         continue
                         
-                    columns = table_data.get("columns", [])
-                    rows = table_data.get("rows", [])
+                    percent_diff = ((entity_metric_avg - org_metric_avg) / org_metric_avg) * 100
                     
-                    if not columns or not rows:
+                    # Only report significant differences
+                    if abs(percent_diff) >= 20:  # 20% threshold
+                        performance = "above average" if percent_diff > 0 else "below average"
+                        
+                        # Format the entity name for display (strip org_wide marker)
+                        entity_display = entity if entity != "_org_wide_" else "Organization-wide"
+                        
+                        # Create proper OrganizationalComparison object directly
+                        insights.organizational_comparisons.append(OrganizationalComparison(
+                            entity=entity_display,
+                            metric=metric,
+                            percent_difference=round(percent_diff, 1),
+                            performance=performance,
+                            value=entity_metric_avg,
+                            org_average=org_metric_avg
+                        ))
+                except (TypeError, ValueError, ZeroDivisionError):
+                    continue
+            
+            # Analyze time series data for trends
+            if data["time_series"]:
+                for metric, time_points in data["time_series"].items():
+                    if len(time_points) < 3:  # Need at least 3 points for trend
                         continue
-                    
-                    # Look for time-related columns to identify time series
-                    time_cols = [i for i, col in enumerate(columns) if any(time_term in col.lower() 
-                                for time_term in ["date", "time", "day", "month", "year", "week"])]
-                    
-                    # Look for entity-related columns (locations, branches, etc.)
-                    entity_cols = [i for i, col in enumerate(columns) if any(entity_term in col.lower() 
-                                  for entity_term in ["name", "location", "branch", "department", "id"])]
-                    
-                    # Look for organizational average columns
-                    avg_cols = [i for i, col in enumerate(columns) if "average" in col.lower() or "avg" in col.lower()]
-                    
-                    # Extract numerical columns (excluding time and entity columns)
-                    num_cols = []
-                    for i, col in enumerate(columns):
-                        if i not in time_cols and i not in entity_cols:
-                            # Check if column contains numeric data
-                            has_numeric = False
-                            for row in rows[:min(5, len(rows))]:  # Check first few rows
-                                # Access row data using column NAME (key)
-                                if col in row and row[col] is not None: 
-                                    try:
-                                        float(row[col])
-                                        has_numeric = True
-                                        break
-                                    except (ValueError, TypeError):
-                                        pass
-                            if has_numeric:
-                                # Store column name instead of index
-                                num_cols.append(col) 
-                    
-                    # Process time series data if available
-                    if time_cols and num_cols:
-                        time_col_idx = time_cols[0]  # Use the first time column index
-                        time_col_name = columns[time_col_idx] # Get its name
-                        # Iterate through numeric column NAMES
-                        for num_col_name in num_cols: 
-                            series_name = f"{num_col_name}"
-                            time_series_data[series_name] = []
-                            
-                            for row in rows:
-                                # Access row data using column NAMES (keys)
-                                if time_col_name in row and num_col_name in row and row[time_col_name] and row[num_col_name] is not None: 
-                                    try:
-                                        time_val = row[time_col_name]
-                                        num_val = float(row[num_col_name])
-                                        time_series_data[series_name].append((time_val, num_val))
-                                    except (ValueError, TypeError):
-                                        pass
-                    
-                    # Process entity performance data
-                    if entity_cols and num_cols:
-                        entity_col_idx = entity_cols[0]  # Use the first entity column index
-                        entity_col_name = columns[entity_col_idx] # Get its name
-                        # Iterate through numeric column NAMES
-                        for metric_name in num_cols: 
-                            
-                            if metric_name not in entity_performance:
-                                entity_performance[metric_name] = {}
-                                
-                            for row in rows:
-                                # Access row data using column NAMES (keys)
-                                if entity_col_name in row and metric_name in row and row[entity_col_name] and row[metric_name] is not None: 
-                                    try:
-                                        entity_name = str(row[entity_col_name])
-                                        num_val = float(row[metric_name])
-                                        entity_performance[metric_name][entity_name] = num_val
-                                    except (ValueError, TypeError):
-                                        pass
-                    
-                    # Process organizational averages
-                    if avg_cols:
-                        for avg_col_idx in avg_cols:
-                            if avg_col_idx < len(columns):
-                                metric_name = columns[avg_col_idx] # Get column name
-                                for row in rows:
-                                    # Access row data using column NAME (key)
-                                    if metric_name in row and row[metric_name] is not None: 
-                                        try:
-                                            org_averages[metric_name] = float(row[metric_name])
-                                            break  # Just need one value for org average
-                                        except (ValueError, TypeError):
-                                            pass
-            
-            # Analyze time series for trends
-            for series_name, data_points in time_series_data.items():
-                if len(data_points) >= 3:  # Need at least 3 points to detect a trend
-                    # Sort by time
-                    data_points.sort(key=lambda x: x[0])
-                    
-                    # Extract just the values
-                    values = [point[1] for point in data_points]
-                    
-                    # Check for consistent increase/decrease
-                    is_increasing = all(values[i] <= values[i+1] for i in range(len(values)-1))
-                    is_decreasing = all(values[i] >= values[i+1] for i in range(len(values)-1))
-                    
-                    # Calculate percent change from first to last
-                    if values[0] != 0:
-                        percent_change = ((values[-1] - values[0]) / values[0]) * 100
-                    else:
-                        percent_change = 0
                         
-                    if is_increasing and abs(percent_change) > 10:
-                        insights.trends.append(TrendInfo(
-                            metric=series_name,
-                            direction="increasing",
-                            percent_change=round(percent_change, 1),
-                            confidence="high" if len(data_points) > 5 else "medium"
-                        ))
-                    elif is_decreasing and abs(percent_change) > 10:
-                        insights.trends.append(TrendInfo(
-                            metric=series_name,
-                            direction="decreasing",
-                            percent_change=round(abs(percent_change), 1),
-                            confidence="high" if len(data_points) > 5 else "medium"
-                        ))
-                    elif abs(percent_change) > 20:  # Significant change but not monotonic
-                        insights.trends.append(TrendInfo(
-                            metric=series_name,
-                            direction="increasing" if percent_change > 0 else "decreasing",
-                            percent_change=round(abs(percent_change), 1),
-                            confidence="medium"
-                        ))
-            
-            # Detect anomalies (outliers) in entity performance
-            for metric_name, entities in entity_performance.items():
-                if len(entities) >= 3:  # Need at least 3 entities to find outliers
-                    values = list(entities.values())
-                    
-                    if values:
-                        mean_val = statistics.mean(values)
-                        # Calculate median and standard deviation if possible
-                        try:
-                            median_val = statistics.median(values)
-                            stdev_val = statistics.stdev(values) if len(values) > 1 else 0
-                            
-                            # Find outliers (more than 2 stdevs from mean)
-                            if stdev_val > 0:
-                                for entity_name, value in entities.items():
-                                    z_score = (value - mean_val) / stdev_val
-                                    if abs(z_score) > 2:
-                                        insights.anomalies.append(AnomalyInfo(
-                                            entity=entity_name,
-                                            metric=metric_name,
-                                            difference_from_avg=f"{round(((value - mean_val) / mean_val) * 100, 1)}% {'above' if value > mean_val else 'below'} the average for this metric across all entities", 
-                                            severity="high" if abs(z_score) > 3 else "medium"
-                                        ))
-                        except statistics.StatisticsError:
-                            pass
-                
-            # Compare entity performance to organizational averages
-            for metric_name, entities in entity_performance.items():
-                org_avg_key = next((key for key in org_averages.keys() if metric_name in key), None)
-                
-                if org_avg_key and org_averages[org_avg_key] > 0:
-                    org_avg = org_averages[org_avg_key]
-                    
-                    for entity_name, value in entities.items():
-                        percent_diff = ((value - org_avg) / org_avg) * 100
+                    try:
+                        # Sort by time value
+                        sorted_points = sorted(time_points, key=lambda x: x[0])
+                        values = [point[1] for point in sorted_points]
                         
-                        if abs(percent_diff) > 25:  # Significant difference from org average
-                            insights.organizational_comparisons.append(OrganizationalComparison(
-                                entity=entity_name,
-                                metric=metric_name,
-                                percent_difference=round(percent_diff, 1),
-                                performance="above average" if value > org_avg else "below average",
-                                value=value,
-                                org_average=org_avg
+                        # Simple trend detection - compare first and last values
+                        first_val = values[0]
+                        last_val = values[-1]
+                        
+                        if abs(first_val) < 0.0001:  # Avoid division by zero
+                            continue
+                            
+                        change_pct = ((last_val - first_val) / first_val) * 100
+                        
+                        # Only report significant trends
+                        if abs(change_pct) >= 10:  # 10% threshold
+                            direction = "increased" if change_pct > 0 else "decreased"
+                            
+                            # Format the entity name for display
+                            entity_display = entity if entity != "_org_wide_" else "Organization-wide"
+                            
+                            trend = f"{entity_display} {metric} has {direction} by {abs(change_pct):.1f}% over the period"
+                            insights.trends.append(TrendInfo(
+                                metric=f"{metric} for {entity_display}",
+                                direction=direction,
+                                percent_change=round(abs(change_pct), 1),
+                                confidence="high" if len(sorted_points) >= 5 else "medium"
                             ))
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        continue
             
-            logger.info(f"{log_prefix}Trend analysis complete. Found: {len(insights.trends)} trends, "
-                      f"{len(insights.anomalies)} anomalies, {len(insights.organizational_comparisons)} org comparisons")
-            
-            return insights
-            
-        except Exception as e:
-            logger.error(f"{log_prefix}Error during trend detection: {e}", exc_info=True)
-            return insights  # Return empty structure on error
+            # Analyze for anomalies/outliers among peer entities
+            for metric, values in data["metrics"].items():
+                if len(values) <= 1:
+                    continue
+                    
+                try:
+                    # Calculate entity's average for this metric
+                    entity_avg = sum(values) / len(values)
+                    
+                    # Need to gather peer values for this metric
+                    peer_metrics = []
+                    for peer_entity, peer_data in all_data_by_entity.items():
+                        if peer_entity != entity and peer_entity != "_org_wide_":
+                            if metric in peer_data["metrics"] and peer_data["metrics"][metric]:
+                                peer_avg = sum(peer_data["metrics"][metric]) / len(peer_data["metrics"][metric])
+                                peer_metrics.append(peer_avg)
+                    
+                    # Only detect anomalies if we have enough peer entities
+                    if len(peer_metrics) >= 2:
+                        peer_avg = sum(peer_metrics) / len(peer_metrics)
+                        
+                        # Calculate standard deviation
+                        stdev_val = statistics.stdev(peer_metrics)
+                        
+                        if stdev_val > 0:
+                            # Calculate z-score
+                            z_score = (entity_avg - peer_avg) / stdev_val
+                            
+                            # Anomaly if z-score is significant
+                            if abs(z_score) >= 2.0:
+                                # Format the entity name for display
+                                entity_display = entity if entity != "_org_wide_" else "Organization-wide"
+                                
+                                diff_percent = round(((entity_avg - peer_avg) / peer_avg) * 100 if peer_avg != 0 else 0, 1)
+                                diff_description = f"{diff_percent}% {'above' if entity_avg > peer_avg else 'below'} peer average"
+                                
+                                anomaly = f"{entity_display} {metric} is unusually {'high' if z_score > 0 else 'low'} compared to peers (z-score: {abs(z_score):.1f})"
+                                insights.anomalies.append(AnomalyInfo(
+                                    entity=entity_display,
+                                    metric=metric,
+                                    difference_from_avg=diff_description,
+                                    severity="high" if abs(z_score) > 3 else "medium"
+                                ))
+                except statistics.StatisticsError:
+                    continue
+                except (TypeError, ValueError, ZeroDivisionError):
+                    continue
+        
+        # Convert organizational comparisons to proper objects
+        for i, comparison in enumerate(insights.organizational_comparisons):
+            if not isinstance(comparison, OrganizationalComparison):
+                parts = comparison.split(" is ")
+                if len(parts) < 2:
+                    continue
+                    
+                entity_metric = parts[0].split(" ", 1)
+                if len(entity_metric) < 2:
+                    continue
+                    
+                entity_display = entity_metric[0]
+                metric = entity_metric[1]
+                
+                # Extract percentage
+                pct_match = re.search(r"(\d+\.\d+)%", comparison)
+                pct_diff = float(pct_match.group(1)) if pct_match else 0
+                
+                # Determine performance
+                performance = "above average" if "above average" in comparison else "below average"
+                
+                # Extract values
+                val_match = re.search(r"\((\d+\.\d+) vs. org avg (\d+\.\d+)\)", comparison)
+                if val_match:
+                    value = float(val_match.group(1))
+                    org_avg_val = float(val_match.group(2))
+                else:
+                    value = 0
+                    org_avg_val = 0
+                
+                insights.organizational_comparisons[i] = OrganizationalComparison(
+                    entity=entity_display,
+                    metric=metric,
+                    percent_difference=pct_diff,
+                    performance=performance,
+                    value=value,
+                    org_average=org_avg_val
+                )
+                
+        logger.info(f"{log_prefix}Analysis complete. Found: {len(insights.trends)} trends, "
+                   f"{len(insights.anomalies)} anomalies, {len(insights.organizational_comparisons)} org comparisons")
+        return insights
     
     def _synthesize_results(self, query: str, subquery_results: List[SubqueryResult]) -> str:
         """Synthesize subquery results into a coherent summary with automated insights."""
@@ -1311,183 +1164,79 @@ class SummarySynthesizerTool(BaseTool):
             all_failed = all(not result.successful for result in subquery_results)
                     
             if all_failed:
-                error_messages = []
-                for subquery_result in subquery_results:
-                    if subquery_result.error:
-                        error_messages.append(subquery_result.error)
+                return self._handle_all_subqueries_failed(subquery_results)
                 
-                unique_errors = set(error_messages)
-                
-                # Check for specific schema mismatch errors
-                table_not_found_errors = []
-                for err in unique_errors:
-                    if isinstance(err, str) and "Table '" in err and "does not exist in the database" in err:
-                        match = re.search(r"Table '([^']+)'", err)
-                        if match:
-                            table_not_found_errors.append(match.group(1))
-                
-                if table_not_found_errors:
-                    tables_str = ", ".join(f"'{t}'" for t in table_not_found_errors)
-                    return (f"I couldn't retrieve the requested data because of a schema mismatch issue. "
-                           f"The following tables couldn't be found in the database: {tables_str}. "
-                           "This suggests there's a discrepancy between the expected schema and the actual database structure.")
-                
-                if any("relation" in str(err) and "does not exist" in str(err) for err in unique_errors):
-                    return ("I couldn't retrieve the requested library data because some required database tables appear to be missing. "
-                           "This could be due to a system configuration issue. Please contact your system administrator.")
-                
-                if any("column" in str(err) and "does not exist" in str(err) for err in unique_errors):
-                    return ("I couldn't retrieve the requested library data because some database columns appear to be missing or incorrectly referenced. "
-                           "This could be due to a schema mismatch issue. Please contact your system administrator.")
-                
-                # Check for location/hierarchy ID resolution errors
-                if any("resolve" in str(err).lower() and "location" in str(err).lower() for err in unique_errors):
-                    location_errors = [err for err in unique_errors if "resolve" in str(err).lower() and "location" in str(err).lower()]
-                    if location_errors:
-                        return (f"I couldn't complete the analysis because I couldn't find the location you mentioned. "
-                               f"Details: {location_errors[0]}")
-
-                if any("uuid" in str(err).lower() for err in unique_errors):
-                    return ("I encountered an issue with the location identifiers in the database. "
-                           "This is likely a technical problem with how locations are being referenced. "
-                           "Please contact your system administrator.")
-                
-                if len(unique_errors) == 1:
-                    return f"I wasn't able to analyze the requested data due to a technical issue: {next(iter(unique_errors))}"
-                else:
-                    return ("I couldn't retrieve the data needed for analysis. "
-                           "There appears to be a technical issue with accessing the database.")
-            
-            # Extract location names from successful results for better context
-            mentioned_locations = set()
-            for result in subquery_results:
-                if result.successful and "table" in result.result:
-                    columns = result.result["table"].get("columns", [])
-                    rows = result.result["table"].get("rows", [])
-                    
-                    # Check if we have location name column
-                    if "Location Name" in columns and rows:
-                        location_idx = columns.index("Location Name")
-                        for row in rows:
-                            if "Location Name" in row and row["Location Name"]:
-                                mentioned_locations.add(row["Location Name"])
-            
-            # First detect trends and patterns automatically
+            # Calculate metrics and detect trends/insights
+            composite_metrics = self._calculate_composite_metrics(subquery_results)
             insights = self._detect_trends(subquery_results)
             
-            # Check for anomalies in time series data
-            try:
-                for result in subquery_results:
-                    if result.successful and "table" in result.result:
-                        table_data = result.result["table"]
-                        columns = table_data.get("columns", [])
-                        rows = table_data.get("rows", [])
-                        
-                        # Look for time-related columns
-                        time_cols = [col for col in columns if any(time_term in col.lower() 
-                                    for time_term in ["date", "time", "day", "month", "year", "week"])]
-                        
-                        # Look for numeric columns
-                        numeric_cols = []
-                        if rows and time_cols:
-                            for col in columns:
-                                if col not in time_cols:
-                                    # Check first row to see if column contains numeric data
-                                    if rows[0].get(col) is not None:
-                                        try:
-                                            float(rows[0].get(col))
-                                            numeric_cols.append(col)
-                                        except (ValueError, TypeError):
-                                            pass
-                        
-                        # If we have time and numeric data, check for anomalies
-                        if time_cols and numeric_cols and len(rows) >= 5:  # Need at least 5 points
-                            time_col = time_cols[0]
-                            for num_col in numeric_cols:
-                                # Extract values and calculate statistics
-                                values = []
-                                for row in rows:
-                                    if row.get(num_col) is not None:
-                                        try:
-                                            values.append(float(row.get(num_col)))
-                                        except (ValueError, TypeError):
-                                            pass
-                                
-                                if len(values) >= 5:
-                                    # Calculate mean and standard deviation
-                                    try:
-                                        mean_val = statistics.mean(values)
-                                        stdev_val = statistics.stdev(values)
-                                        
-                                        # Check for outliers (more than 2.5 standard deviations from mean)
-                                        for i, val in enumerate(values):
-                                            if abs(val - mean_val) > 2.5 * stdev_val:
-                                                # Found an anomaly
-                                                entity = rows[i].get("Location Name", "Unknown location")
-                                                time_point = rows[i].get(time_col, "Unknown time")
-                                                
-                                                logger.info(f"{log_prefix}Detected anomaly in {num_col} at {time_point} "
-                                                           f"for {entity}: value {val} deviates significantly from mean {mean_val}")
-                                                
-                                                # Add to insights
-                                                insights.anomalies.append(AnomalyInfo(
-                                                    entity=f"{entity} at {time_point}",
-                                                    metric=num_col,
-                                                    difference_from_avg=f"{round(((val - mean_val) / mean_val) * 100, 1)}% {'above' if val > mean_val else 'below'} the average",
-                                                    severity="high" if abs(val - mean_val) > 3 * stdev_val else "medium"
-                                                ))
-                                    except statistics.StatisticsError as e:
-                                        # Not enough data for standard deviation or other statistics error
-                                        logger.debug(f"{log_prefix}Statistics error during anomaly detection: {str(e)}")
-                                    except Exception as e:
-                                        # Handle any other unexpected errors during calculation
-                                        logger.debug(f"{log_prefix}Error during anomaly calculations: {str(e)}")
-                                        # Continue processing other metrics
-            except Exception as e:
-                logger.warning(f"{log_prefix}Error during anomaly detection: {str(e)}")
-                # Continue with synthesis even if anomaly detection fails
+            # Prepare the synthesizer input
+            context_str = f"Organization ID: {self.organization_id}\nQuery: {query}\n"
             
-            # Then calculate composite metrics from the data
-            composite_metrics = self._calculate_composite_metrics(subquery_results)
-            
+            # Setup LLM for synthesis
             llm = AzureChatOpenAI(
                 openai_api_key=settings.AZURE_OPENAI_API_KEY,
                 azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
                 openai_api_version=settings.AZURE_OPENAI_API_VERSION,
                 deployment_name=settings.AZURE_OPENAI_DEPLOYMENT_NAME,
                 model_name=settings.LLM_MODEL_NAME,
-                temperature=0.3,
+                temperature=0.2,
                 max_retries=settings.LLM_MAX_RETRIES,
             )
             
-            results_str = ""
-            successful_data = {} # Store successful data for potential calculations
-            error_count = 0
+            # Prepare the prompt template
+            template = """
+            You are an expert data analyst for a library system. Your job is to synthesize query results into a clear, concise summary.
+            
+            USER QUERY:
+            {query}
+            
+            CONTEXT:
+            {context}
+            
+            QUERY RESULTS:
+            {results}
+            
+            AUTOMATED INSIGHTS:
+            {insights}
+            
+            Your task is to create a helpful, informative summary that addresses the user's original query and highlights key findings.
+            
+            Guidelines:
+            - Be concise but thorough
+            - Highlight notable patterns or anomalies
+            - Include statistical context where relevant (e.g., changes over time, comparisons to averages)
+            - Use precise numbers rather than vague terms
+            - Structure your response for readability
+            - Do not invent data not present in the results
+            - Maintain a professional, objective tone
+            
+            SUMMARY:
+            """
+            
+            # Track success/error counts
+            success_count = sum(1 for r in subquery_results if r.successful)
+            error_count = len(subquery_results) - success_count
+            
+            # Prepare results string for the prompt
+            results_str = f"Success Rate: {success_count}/{len(subquery_results)} subqueries successful\n\n"
             
             for subquery_result in subquery_results:
                 results_str += f"Subquery: {subquery_result.query}\n"
                 if subquery_result.error:
                      results_str += f"Result: Error - {subquery_result.error}\n\n"
-                     error_count += 1
                      continue 
                 table_data = subquery_result.result.get("table", {})
                 if not isinstance(table_data, dict):
                      results_str += f"Result: Invalid table data format received.\n\n"
-                     error_count += 1
                      continue
-                # Store successful data keyed by subquery for potential calculations
-                successful_data[subquery_result.query] = table_data 
+                
                 limited_rows = table_data.get("rows", [])[:5]
                 columns = table_data.get("columns", [])
                 results_str += f"Results (showing up to 5 rows): {json.dumps({"columns": columns, "rows": limited_rows}, indent=2)}\n"
                 results_str += f"Total rows in original result: {len(table_data.get('rows', []))}\n\n"
             
-            # Log the success/failure rate - FIXED count that properly matches the actual state
-            total_subqueries = len(subquery_results)
-            success_count = total_subqueries - error_count
-            logger.info(f"{log_prefix}Synthesis stats: {success_count}/{total_subqueries} subqueries successful")
-            
-            # If all subqueries had some error but we're continuing, add a note about partial data
+            # Add warning if partial data
             warning_prefix = ""
             if error_count > 0 and success_count > 0:
                 warning_prefix = "**Note: Some data could not be retrieved due to database issues. This analysis is based on partial data.**\n\n"
@@ -1495,78 +1244,34 @@ class SummarySynthesizerTool(BaseTool):
             # Add automated insights section to the synthesizer input
             insights_str = "Automated Insights Detected:\n"
             
+            # Add trends if any were detected
             if insights.trends:
                 insights_str += "Trends:\n"
                 for trend in insights.trends:
-                    insights_str += f"- {trend.metric}: {trend.direction} by {trend.percent_change}% (Confidence: {trend.confidence})\n"
-            else:
-                insights_str += "Trends: None detected\n"
-                
+                    insights_str += f"- {trend}\n"
+            
+            # Add anomalies if any were detected
             if insights.anomalies:
-                insights_str += "\nAnomalies/Outliers:\n"
+                insights_str += "Anomalies:\n"
                 for anomaly in insights.anomalies:
-                    insights_str += f"- {anomaly.entity}: {anomaly.metric} is {anomaly.difference_from_avg} (Severity: {anomaly.severity})\n"
-            else:
-                insights_str += "\nAnomalies/Outliers: None detected\n"
-                
+                    insights_str += f"- {anomaly}\n"
+            
+            # Add organizational comparisons if any
             if insights.organizational_comparisons:
-                insights_str += "\nOrganizational Comparisons:\n"
-                for comp in insights.organizational_comparisons:
-                    insights_str += f"- {comp.entity}: {comp.metric} is {comp.percent_difference}% {comp.performance} ({comp.value} vs. org avg {comp.org_average})\n"
-            else:
-                insights_str += "\nOrganizational Comparisons: None detected\n"
+                insights_str += "Comparisons to Organizational Averages:\n"
+                for comparison in insights.organizational_comparisons:
+                    insights_str += f"- {comparison}\n"
             
-            # Add composite metrics section
-            if composite_metrics.success_rates or composite_metrics.cross_metric_ratios:
-                insights_str += "\nAutomatically Calculated Composite Metrics:\n"
-                
-                if composite_metrics.success_rates:
-                    insights_str += "Success Rates:\n"
-                    for rate in composite_metrics.success_rates:
-                        entity_str = f" for {rate['entity']}" if rate['entity'] else ""
-                        insights_str += f"- {rate['metric']}{entity_str}: {rate['success_rate']}% ({rate['success_count']} successes, {rate['failure_count']} failures)\n"
-                
-                if composite_metrics.cross_metric_ratios:
-                    insights_str += "\nRelationship Metrics:\n"
-                    for ratio in composite_metrics.cross_metric_ratios:
-                        insights_str += f"- {ratio['name']}: {ratio['ratio']} ({ratio['numerator']} / {ratio['denominator']})\n"
+            # Add success/failure rate metrics
+            if composite_metrics.success_rates:
+                insights_str += "Success Rate Metrics:\n"
+                for metric in composite_metrics.success_rates:
+                    insights_str += f"- {metric['metric']}: {metric['success_rate']}%\n"
             
-            # Add information about locations covered in the analysis
-            context_str = ""
-            if mentioned_locations:
-                context_str = f"\nLocations covered in this analysis: {', '.join(sorted(mentioned_locations))}\n"
-            
-            template = """
-            You are a data analyst for a library system. Given the original user query, results from potentially multiple subqueries, and automated insights,
-            synthesize a coherent, insightful summary that addresses the original question.
-            The subquery results may contain data tables or error messages.
-
-            Original Query: {query}
-
-            {context}
-
-            Subquery Results:
-            {results}
-            
-            {insights}
-
-            Provide a comprehensive summary that:
-            1. Directly answers the original query, integrating information from all **successful** subqueries.
-            2. Incorporates the automated insights and composite metrics. 
-                - **Crucially**: When reporting trends, state only the `direction` and overall `percent_change` provided in the `TrendInfo` insight. Do not invent specific month-to-month changes or percentages not explicitly provided.
-                - Report anomalies using the full description provided.
-            3. If subquery results include a "Location Name" column, **use the Location Name instead of the hierarchyId** when referring to specific locations.
-            4. If any subqueries resulted in errors, acknowledge this limitation.
-            5. Highlights key insights and patterns apparent from the combined successful results.
-            6. Mentions any notable outliers or anomalies within the successful results, using the clear descriptions provided in the insights.
-            7. Uses specific numbers *sparingly* in the text for key totals or findings. **DO NOT include markdown tables, raw data lists, or extensive numerical lists in this text summary.** Refer to the underlying data conceptually (e.g., "Monthly data shows fluctuations...", "Borrow success rate was high..."). The detailed data should be presented via separate tables or visualizations if requested.
-            8. Discusses implications of the calculated metrics (success rates, efficiency metrics, etc.) when available.
-            9. **Formatting:** Structure your summary clearly, potentially using bullet points for key findings. Use markdown bolding (`**text**`) for emphasis on insights or overall conclusions.
-            10. Is written in a professional, concise style (aim for a few key sentences summarizing the findings).
-            11. If the majority of subqueries failed, acknowledge the limitations but try to provide value from any successful data.
-
-            Your summary:
-            """
+            # If no insights were detected, note that
+            if (not insights.trends and not insights.anomalies and 
+                not insights.organizational_comparisons and not composite_metrics.success_rates):
+                insights_str += "No specific trends, anomalies, or comparisons were automatically detected in the data.\n"
             
             prompt = PromptTemplate(input_variables=["query", "context", "results", "insights"], template=template)
             synthesis_chain = prompt | llm | StrOutputParser()
@@ -1592,6 +1297,53 @@ class SummarySynthesizerTool(BaseTool):
         except Exception as e:
             logger.error(f"{log_prefix}Error in _synthesize_results: {str(e)}", exc_info=True)
             return "I encountered an unexpected error while processing your request. Please try again or contact support if the issue persists."
+            
+    def _handle_all_subqueries_failed(self, subquery_results: List[SubqueryResult]) -> str:
+        """Extract patterns from error messages when all subqueries fail and provide a meaningful response."""
+        # Extract and analyze error messages
+        error_messages = [result.error for result in subquery_results if result.error]
+        unique_errors = set(error_messages)
+        
+        # Check for specific error patterns
+        table_not_found_errors = []
+        for err in unique_errors:
+            if not isinstance(err, str):
+                continue
+                
+            # Pattern matching for table not found errors
+            if "Table '" in err and "does not exist in the database" in err:
+                match = re.search(r"Table '([^']+)'", err)
+                if match:
+                    table_not_found_errors.append(match.group(1))
+        
+        # Generate appropriate error message based on patterns
+        if table_not_found_errors:
+            tables_str = ", ".join(f"'{t}'" for t in table_not_found_errors)
+            return (f"I couldn't retrieve the requested data because of a schema mismatch issue. "
+                   f"The following tables couldn't be found in the database: {tables_str}. "
+                   "This suggests there's a discrepancy between the expected schema and the actual database structure.")
+        
+        # Look for permission/security errors
+        if any("permission denied" in str(err).lower() or "access denied" in str(err).lower() for err in unique_errors):
+            return "I couldn't access the requested data due to database permission restrictions. Please verify your access rights or contact your administrator."
+        
+        # Look for timeouts
+        if any("timeout" in str(err).lower() or "timed out" in str(err).lower() for err in unique_errors):
+            return "The database queries timed out while retrieving your data. This might indicate the query was too complex or the database is under heavy load. Try simplifying your request or try again later."
+        
+        # Handle syntax errors
+        if any("syntax error" in str(err).lower() for err in unique_errors):
+            return "There was a problem with the database query syntax. This is likely an internal issue with how I'm translating your request. Please try rephrasing your question or contact support."
+        
+        # Generic fallback for other errors
+        if unique_errors:
+            # Provide a user-friendly version of the first error
+            sample_error = next(iter(unique_errors))
+            sanitized_error = str(sample_error).replace(self.organization_id, "[ORGANIZATION_ID]")
+            return f"I encountered a database error while trying to retrieve your data: {sanitized_error}. Please try again or contact support."
+        
+        # Ultra fallback
+        return "I couldn't retrieve the requested data due to database errors. Please try again or contact support if the problem persists."
     
     async def ainvoke(self, input_data: Dict[str, Any], **kwargs: Any) -> Any:
         """Invoke the tool with the given input data."""
@@ -1607,107 +1359,56 @@ class SummarySynthesizerTool(BaseTool):
             }
         
         try:
+            # Get schema information for SQL generation
+            schema_info = self._get_schema_info()
+            
             # Decompose the query into subqueries
             subqueries = self._decompose_query(query)
             logger.info(f"{log_prefix}Query decomposed into {len(subqueries)} subqueries")
             
             # Check if any subquery contains potential hierarchy ID placeholders
             contains_hierarchy_references = any(
-                "hierarchy" in sq.lower() or "branch" in sq.lower() or "location" in sq.lower()
+                "hierarchy" in sq["description"].lower() or 
+                "branch" in sq["description"].lower() or 
+                "location" in sq["description"].lower() or
+                sq.get("location_names", [])
                 for sq in subqueries
             )
             
+            # If location references exist, resolve them first
+            resolved_location_map = {}
             if contains_hierarchy_references:
-                logger.info(f"{log_prefix}Detected potential hierarchy/location references in subqueries")
-            
-            # Check if any subquery contains direct hierarchy ID references that might be problematic
-            direct_id_pattern = r"(?:hierarchy|branch).+?(?:'|\")([a-fA-F0-9-]+)(?:'|\")"
-            direct_id_matches = [re.search(direct_id_pattern, sq) for sq in subqueries]
-            direct_id_matches = [m for m in direct_id_matches if m is not None]
-            
-            if direct_id_matches:
-                direct_ids = [m.group(1) for m in direct_id_matches]
-                logger.warning(
-                    f"{log_prefix}Detected {len(direct_ids)} direct UUID-like references in subqueries: "
-                    f"{direct_ids[:3]}{'...' if len(direct_ids) > 3 else ''}"
-                )
-                logger.info(f"{log_prefix}Parameter binding system will attempt to handle these IDs properly")
+                logger.info(f"{log_prefix}Detected potential location references, resolving IDs")
+                try:
+                    resolved_location_map = await self._resolve_locations(subqueries)
+                except ValueError as e:
+                    # If location resolution fails, we consider this a critical error and stop
+                    logger.error(f"{log_prefix}Location resolution failed: {e}")
+                    return {"message": str(e)}
             
             # Execute all subqueries concurrently
-            results = await self._execute_subqueries_concurrently(subqueries)
+            results = await self._execute_subqueries_concurrently(subqueries, resolved_location_map, schema_info)
             
             # Log execution results summary
-            successful_count = sum(1 for r in results if r.successful)
-            error_count = len(results) - successful_count
+            successful_queries = sum(1 for r in results if r.successful)
+            logger.info(f"{log_prefix}Subquery execution complete. {successful_queries}/{len(results)} successful.")
             
-            success_info = {
-                "total_subqueries": len(results),
-                "successful_subqueries": successful_count,
-                "failed_subqueries": error_count,
-                "success_rate": f"{successful_count/len(results)*100:.1f}%" if results else "N/A"
-            }
-            
-            logger.info(f"{log_prefix}Subquery execution results: "
-                       f"{successful_count}/{len(results)} successful, "
-                       f"{error_count}/{len(results)} failed")
-            
-            if error_count > 0:
-                # Log first few errors for debugging
-                for i, result in enumerate(results):
-                    if not result.successful and i < 3:  # Limit to first 3 errors
-                        logger.warning(f"{log_prefix}Subquery error [{i+1}]: {result.error}")
-                        
-                # Check if errors are related to hierarchy ID resolution
-                hierarchy_id_errors = [
-                    i for i, r in enumerate(results) 
-                    if not r.successful and r.error and (
-                        "hierarchy" in r.error.lower() or 
-                        "location" in r.error.lower() or
-                        "uuid" in r.error.lower() or
-                        "id" in r.error.lower()
-                    )
-                ]
-                
-                if hierarchy_id_errors:
-                    logger.warning(
-                        f"{log_prefix}{len(hierarchy_id_errors)} errors appear to be related to "
-                        f"hierarchy ID resolution or parameter binding"
-                    )
+            # If all subqueries failed, return early with the error message
+            if all(not result.successful for result in results):
+                first_error = next((result.error for result in results if result.error), "Unknown error")
+                return {"message": f"All subqueries failed. Error: {first_error}"}
             
             # Resolve hierarchy IDs to names
             results_with_names = await self._resolve_and_inject_names(results)
             
-            # Calculate composite metrics
-            metrics = self._calculate_composite_metrics(results_with_names)
-            
-            # Analyze trends and anomalies
-            insights = self._detect_trends(results_with_names)
-            
-            # Synthesize a natural language summary 
+            # Generate a coherent summary
             summary = self._synthesize_results(query, results_with_names)
             
-            logger.info(f"{log_prefix}Synthesis stats: {successful_count}/{len(results)} subqueries successful")
+            return {"message": summary}
             
-            return {
-                "summary": summary,
-                "query": query,
-                "subquery_count": len(results),
-                "execution_info": success_info
-            }
-        except (APIConnectionError, APITimeoutError, RateLimitError) as e:
-            logger.error(f"{log_prefix}OpenAI API error: {e}", exc_info=False)
-            return {
-                "summary": f"I encountered an issue connecting to the analysis service. Please try again in a moment.",
-                "error": str(e),
-                "query": query
-            }
         except Exception as e:
-            logger.error(f"{log_prefix}Unexpected error processing summary: {e}", exc_info=True)
-            return {
-                "summary": f"I encountered an unexpected error while processing your request: {str(e)}",
-                "error": str(e),
-                "query": query
-            }
+            logger.error(f"{log_prefix}Unexpected error processing query: {e}", exc_info=True)
+            return {"message": f"An unexpected error occurred: {str(e)}"}
 
     def _run(self, query: str) -> Dict[str, str]:
         """
