@@ -6,6 +6,7 @@ import datetime
 import asyncio
 import functools
 import decimal
+import re
 
 from langchain.tools import BaseTool
 from sqlalchemy import text
@@ -58,63 +59,146 @@ class SQLExecutionTool(BaseTool):
         MAX_ROWS = 50
         original_sql = sql
         
-        # --- SQL Syntax Validation using sqlparse ---
+        # --- SQL Syntax Validation and Organization Check ---
         try:
-            import sqlparse
-            parsed_statements = sqlparse.parse(sql)
-            if not parsed_statements:
-                raise ValueError("Provided SQL is empty or could not be parsed.")
+            # First try to validate using sqlparse if available
+            sqlparse_available = False
+            try:
+                import sqlparse
+                sqlparse_available = True
+            except ImportError:
+                logger.warning(f"{log_prefix}sqlparse library not installed. Using regex-based validation as fallback.")
             
-            first_statement_type = parsed_statements[0].get_type()
-            if first_statement_type not in ('SELECT', 'UNKNOWN'):
-                 if first_statement_type != 'UNKNOWN':
-                     logger.warning(f"{log_prefix}Provided SQL might not be a SELECT statement (Type: {first_statement_type}). Proceeding cautiously.")
+            # Store SQL elements for security verification
+            cte_blocks = []
+            subqueries = []
+            main_query = sql
             
-            logger.debug(f"{log_prefix}SQL syntax parsed successfully.")
+            if sqlparse_available:
+                # Parse with sqlparse for syntax validation
+                parsed_statements = sqlparse.parse(sql)
+                if not parsed_statements:
+                    raise ValueError("Provided SQL is empty or could not be parsed.")
+                
+                first_statement_type = parsed_statements[0].get_type()
+                if first_statement_type not in ('SELECT', 'UNKNOWN'):
+                    if first_statement_type != 'UNKNOWN':
+                        logger.warning(f"{log_prefix}Provided SQL might not be a SELECT statement (Type: {first_statement_type}). Proceeding cautiously.")
+                
+                # Extract CTEs using sqlparse
+                for stmt in parsed_statements:
+                    # Look for WITH keyword to identify CTEs
+                    for token in stmt.tokens:
+                        if hasattr(token, 'ttype') and token.ttype is sqlparse.tokens.Keyword and token.value.upper() == 'WITH':
+                            # Find the CTE block (from WITH to the main SELECT)
+                            cte_start = sql.upper().find('WITH')
+                            if cte_start >= 0:
+                                # Find the main SELECT after the CTE
+                                select_pos = sql.upper().find('SELECT', cte_start + 4)
+                                if select_pos > 0:
+                                    # Extract the CTE part
+                                    cte_part = sql[cte_start:select_pos].strip()
+                                    cte_blocks.append(cte_part)
+                                    # Main query starts at SELECT
+                                    main_query = sql[select_pos:]
+                            break
+                    
+                    # Extract subqueries using sqlparse
+                    for token in stmt.flatten():
+                        if isinstance(token, sqlparse.sql.Parenthesis):
+                            subquery_text = str(token).strip()
+                            if 'SELECT' in subquery_text.upper():
+                                subqueries.append(subquery_text)
+            else:
+                # Fallback to regex-based SQL parsing
+                # Extract CTE blocks
+                cte_match = re.search(r'WITH\s+(.+?)(?=SELECT)', sql, re.IGNORECASE | re.DOTALL)
+                if cte_match:
+                    cte_blocks.append(f"WITH {cte_match.group(1)}")
+                    # Main query starts at SELECT
+                    select_pos = sql.upper().find('SELECT', cte_match.end())
+                    if select_pos > 0:
+                        main_query = sql[select_pos:]
+                
+                # Extract subqueries using regex
+                # This is a simplified approach - won't catch all cases
+                subquery_matches = re.finditer(r'\(\s*SELECT.*?\)', sql, re.IGNORECASE | re.DOTALL)
+                for match in subquery_matches:
+                    subqueries.append(match.group(0))
+                
+            logger.debug(f"{log_prefix}SQL parsing complete. Found {len(cte_blocks)} CTE blocks, {len(subqueries)} subqueries.")
             
-        except ImportError:
-            logger.warning(f"{log_prefix}sqlparse library not installed. Skipping SQL syntax validation.")
         except ValueError as ve:
-             logger.error(f"{log_prefix}SQL validation failed: {ve}. SQL: {sql[:200]}...", exc_info=False)
-             raise
+            logger.error(f"{log_prefix}SQL validation failed: {ve}. SQL: {sql[:200]}...", exc_info=False)
+            raise
         except Exception as validation_err:
             logger.error(f"{log_prefix}Unexpected error during SQL validation: {validation_err}. SQL: {sql}", exc_info=True)
             raise ValueError(f"Provided SQL failed validation: {validation_err}")
         
-        # --- Security Check: Verify :organization_id parameter usage in WHERE clause --- #
+        # --- Security Check: Verify organization_id parameter usage in all SQL components ---
         try:
-            # Use the parsed statements from the syntax validation above
-            org_filter_found = False
-            for stmt in parsed_statements:
-                where_clause = None
-                # Find the WHERE clause in the statement
-                for token in stmt.tokens:
-                    if isinstance(token, sqlparse.sql.Where):
-                        where_clause = token
-                        break
-                
-                if where_clause:
-                    # Check if the WHERE clause contains the required parameter :organization_id
-                    # And references an appropriate column ("organizationId", "parentId", "id")
-                    where_content = str(where_clause).upper() # Check content case-insensitively
-                    param_present = ":ORGANIZATION_ID" in where_content
-                    column_present = any(col in where_content for col in ['"ORGANIZATIONID" = ', '"PARENTID" = ', '"ID" = '])
-                    
-                    if param_present and column_present:
-                        org_filter_found = True
-                        logger.debug(f"{log_prefix}Security check passed: :organization_id parameter found in WHERE clause.")
-                        break # Found in this statement, no need to check others
+            # Check main query for organization_id filter
+            main_query_has_filter = (
+                # Look for parameter in main query
+                ":organization_id" in main_query.lower() and 
+                # Look for appropriate column in main query
+                any(
+                    f'"{col}"' in main_query.lower() or f'"{col}" ' in main_query.lower() 
+                    for col in ["organizationid", "parentid", "id"]
+                )
+            )
             
-            if not org_filter_found:
-                error_msg = "SECURITY CHECK FAILED: SQL query MUST contain a WHERE clause filtering by :organization_id on 'organizationId', 'parentId', or 'id'."
-                logger.error(f"{log_prefix}{error_msg} SQL: {sql[:200]}...")
+            if not main_query_has_filter:
+                error_msg = "SECURITY CHECK FAILED: Main SQL query MUST contain a WHERE clause filtering by :organization_id on 'organizationId', 'parentId', or 'id'."
+                logger.error(f"{log_prefix}{error_msg} SQL: {main_query[:200]}...")
                 raise ValueError(error_msg)
+            
+            # Check CTE blocks for organization_id filter
+            for i, cte_block in enumerate(cte_blocks):
+                cte_has_filter = (
+                    # Look for parameter in CTE
+                    ":organization_id" in cte_block.lower() and 
+                    # Look for appropriate column in CTE
+                    any(
+                        f'"{col}"' in cte_block.lower() or f'"{col}" ' in cte_block.lower() 
+                        for col in ["organizationid", "parentid", "id"]
+                    )
+                )
                 
-        except Exception as filter_check_err: # Catch potential errors during this specific check
+                if not cte_has_filter:
+                    error_msg = f"SECURITY CHECK FAILED: CTE block #{i+1} is missing required organization_id filter. Every CTE must include ':organization_id' parameter with 'organizationId', 'parentId', or 'id' column."
+                    logger.error(f"{log_prefix}{error_msg} CTE Block: {cte_block[:200]}...")
+                    raise ValueError(error_msg)
+            
+            # Check subqueries for organization_id filter (more complex ones)
+            for i, subquery in enumerate(subqueries):
+                # Only check substantive subqueries (larger than a simple lookup)
+                if len(subquery) > 100:  # Arbitrary threshold to avoid checking simple subqueries
+                    subquery_has_filter = (
+                        # Look for parameter in subquery
+                        ":organization_id" in subquery.lower() and 
+                        # Look for appropriate column in subquery
+                        any(
+                            f'"{col}"' in subquery.lower() or f'"{col}" ' in subquery.lower() 
+                            for col in ["organizationid", "parentid", "id"]
+                        )
+                    )
+                    
+                    if not subquery_has_filter:
+                        error_msg = f"SECURITY CHECK FAILED: Complex subquery #{i+1} is missing required organization_id filter. Each substantive subquery must include ':organization_id' parameter with 'organizationId', 'parentId', or 'id' column."
+                        logger.error(f"{log_prefix}{error_msg} Subquery: {subquery[:200]}...")
+                        raise ValueError(error_msg)
+            
+            logger.debug(f"{log_prefix}Security check passed: organization_id parameter found in all required SQL components.")
+                
+        except ValueError as filter_check_err:
+            # Re-raise any ValueError from the check
+            raise
+        except Exception as filter_check_err:
             logger.error(f"{log_prefix}Error during SQL organization filter check: {filter_check_err}", exc_info=True)
             # Re-raise as a ValueError to be handled like other validation errors
             raise ValueError(f"Error validating SQL organization filter: {filter_check_err}")
-        # --- End Security Check for :organization_id usage --- #
+        # --- End Security Check for organization_id usage ---
 
         # --- Security Check: organization_id in parameters dictionary --- 
         if 'organization_id' not in parameters:

@@ -19,6 +19,7 @@ from langchain_openai import AzureChatOpenAI
 from langchain_core.output_parsers.openai_tools import PydanticToolsParser, JsonOutputToolsParser
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, END
+from langgraph.errors import GraphRecursionError
 from langchain.tools import BaseTool
 
 # Local Imports
@@ -29,13 +30,13 @@ from app.langchain.tools.hierarchy_resolver_tool import HierarchyNameResolverToo
 from app.schemas.chat import ChatData, ApiChartSpecification, TableData
 
 logger = logging.getLogger(__name__)
-usage_logger = logging.getLogger("usage") # Dedicated logger for usage stats
+usage_logger = logging.getLogger("usage") 
 
 
 # --- Helper Function to Get Schema String --- #
 def _get_schema_string(db_name: str = "report_management") -> str:
     """Gets schema information from predefined schema definitions as a formatted string."""
-    from app.db.schema_definitions import SCHEMA_DEFINITIONS # Keep import local
+    from app.db.schema_definitions import SCHEMA_DEFINITIONS 
     logger.debug(f"[_get_schema_string] Fetching schema for database: {db_name}")
     
     if db_name not in SCHEMA_DEFINITIONS:
@@ -115,6 +116,10 @@ class AgentState(TypedDict):
     request_id: Optional[str] = None
     prompt_tokens: Annotated[int, operator.add]
     completion_tokens: Annotated[int, operator.add]
+    # Add field to track tool failures for intelligent adaptation
+    failure_patterns: Dict[str, List[Dict[str, Any]]] = Field(default_factory=dict)
+    # Add field for recovery instructions when needed
+    recovery_guidance: Optional[str] = None
 
 
 # --- System Prompt ---
@@ -302,7 +307,18 @@ Available Tools:
    - **Use `summary_synthesizer` ONLY FOR:** More **open-ended, qualitative summary requests** (e.g., "summarize activity," "tell me about the branches") where specific metrics are not the primary focus, or when the exact metrics are unclear. Call it directly after name resolution (if applicable), providing context in the `query` argument. Its output will be purely text. **Do not include chart specifications when `summary_synthesizer` is used.**
 
 9. **Final Response Formation:**
-   - **TRIGGER:** You must reach this step and call `FinalApiResponseStructure` as your final action. This is mandatory **immediately after** receiving the necessary data from `execute_sql` (per Guideline #5) or `summary_synthesizer`.
+   - **TRIGGER:** You must reach this step and call `FinalApiResponseStructure` as your final action.
+   - **Workflow Logic:**
+       *   If the previous step was `summary_synthesizer`: Proceed directly to calling `FinalApiResponseStructure` using the text summary provided by the tool.
+       *   If the previous step successfully returned data via one or more `ToolMessage`(s) from `execute_sql`:
+           *   **Evaluate Sufficiency:** First, assess if the data now available in `state['tables']` is sufficient to fully address the original user query.
+           *   **Preferred Path (Sufficient Data):** If the data IS sufficient, your **strongly preferred next step** is to call `FinalApiResponseStructure`. Summarize the findings based *only* on the retrieved `execute_sql` data.
+           *   **Exception Path (Insufficient Data):** Only if the `execute_sql` data is **clearly insufficient** for the original request (e.g., reveals a misunderstanding, lacks necessary context that another tool could provide), should you consider: 
+               a) Asking the user for clarification (Guideline #3).
+               b) Calling `summary_synthesizer` IF the original request was better suited for it and the SQL path was clearly wrong (do NOT call it just to re-process the SQL data).
+               c) Calling another operational tool if absolutely necessary.
+           *   **Avoid Redundancy:** Critically, **DO NOT** call `summary_synthesizer` simply to re-analyze or re-format data already successfully retrieved by `execute_sql`.
+       *   If the previous step was `hierarchy_name_resolver`: Proceed with the next logical step based on the user query (likely `execute_sql` or `summary_synthesizer`).
    - Examine the gathered data (`tables` in state).
    - **Decide which tables to include using the `include_tables` flag in `FinalApiResponseStructure`. Apply the following criteria:**
        *   **Prefer `False` for Redundancy:** If the essential information from a table is fully represented in a chart (listed in `chart_specs`) AND adequately summarized in the `text`, set the corresponding `include_tables` flag to `False` to avoid unnecessary duplication.
@@ -310,7 +326,8 @@ Available Tools:
        *   **Prefer `True` for Detail/Explicit Request:** Include a table (set flag to `True`) primarily when it provides detailed data points that are not easily captured in the text or a chart, or if the user explicitly asked for the table or raw data.
        *   Default to `False` unless the user explicitly asks for it, or the table adds some actual and extra value over the text + chart (if there is one) combo.
    - Decide which chart specifications to generate and include directly in the `chart_specs` list within `FinalApiResponseStructure` (follow Guideline #6).
-   - **CRITICAL `text` field Formatting:** Ensure the `text` field is **CONCISE** (1-3 sentences), focuses on insights/anomalies, and **REFERENCES** any included table(s) or chart spec(s). **DO NOT** repeat detailed data. **NEVER include markdown tables or extensive data lists in the `text` field;** use the `include_tables` and `chart_specs` fields for detailed data presentation. 
+   - **CRITICAL `text` field Formatting:** Ensure the `text` field is **CONCISE** (1-5 sentences typically), focuses on insights/anomalies, and **REFERENCES** any included table(s) or chart spec(s). **DO NOT repeat detailed data.** 
+     **ABSOLUTELY NEVER include markdown tables or extensive data lists (e.g., multiple bullet points listing numbers/dates) in the `text` field.** Use the dedicated `include_tables` and `chart_specs` fields for presenting detailed data. Summarize findings conceptually in the text.
      *   **Mention Default Timeframes:** If the underlying data query used the **default timeframe** (e.g., 'last 30 days') because the user didn't specify one (as per SQL Guideline #11), **you MUST explicitly mention this timeframe** in your `text` response. Example: "*Over the last 30 days,* the total borrows were X..." or "The table below shows data *for the past 30 days*."
      *   **Mention Resolved Names:** If the request involved resolving a hierarchy name (using `hierarchy_name_resolver`) and the resolved name is distinct or adds clarity (e.g., includes a code like '(MN)' or differs significantly from the user's input), **mention the resolved name** in your `text` response when referring to that entity. Example: "For *Main Library (MN)*, the total entries were Y..."
      *   Example referencing items: "The table below shows X, and the bar chart illustrates the trend for Y."
@@ -318,9 +335,12 @@ Available Tools:
    - **Accuracy:** Ensure the final text accurately reflects and references any included items, timeframes, and resolved entities.
 
 10. **Strict Out-of-Scope Handling:**
-    - If a request is unrelated to library data or operations (e.g., weather, general knowledge, historical facts outside the library context, calculations, copyrighted material like specific song lyrics), you MUST refuse it directly.
-    - **CRITICAL:** Your refusal message MUST be polite and direct. **DO NOT** engage with the substance of the out-of-scope request (e.g., don't correct factual errors in the request). **MOST IMPORTANTLY: DO NOT offer alternative assistance related to the out-of-scope topic** (e.g., do not offer to summarize a song if you refuse to give lyrics; do not offer to find related books if asked about recipes). Simply state that the request is outside your capabilities and stop.
-    - Use `FinalApiResponseStructure` (with empty `chart_specs` and `include_tables`) to deliver a brief refusal message (e.g., "I cannot answer questions about topics outside of library data and operations." or "I cannot provide copyrighted material like song lyrics. My capabilities are focused on library data."). Ensure it's formatted correctly as a tool call (See example in 'CRITICAL FINAL STEP' section).
+    - If a request is unrelated to library data or operations (e.g., weather, general knowledge, historical facts outside the library context, calculations, personal advice, health information, emotional support, copyrighted material like specific song lyrics, ETC.), you MUST refuse it directly.
+    - **CRITICAL:** Your refusal message MUST be polite but firm, consistent, and completely neutral regardless of the content. Use EXACTLY this format: "I cannot answer questions about [topic]. My capabilities are focused strictly on library data and operations."
+    - **MOST IMPORTANTLY: DO NOT offer alternative assistance related to the out-of-scope topic** (e.g., do not offer to summarize a song if you refuse to give lyrics; do not offer to find related books if asked about recipes; do not provide personal advice or emotional support of any kind).
+    - **NEVER** engage with the substance of out-of-scope requests, even for sensitive or concerning topics. Your role is strictly limited to library data analysis.
+    - Use `FinalApiResponseStructure` (with empty `chart_specs` and `include_tables`) to deliver your refusal message. Ensure it's formatted correctly as a tool call (See example in 'CRITICAL FINAL STEP' section).
+    - **CRITICAL ADDITIONAL INSTRUCTION:** For ANY messages that seem to request personal advice, emotional support, health information, or express concerning content, respond ONLY with: "I cannot provide assistance with this topic. My capabilities are focused strictly on library data and operations."
 
 # --- Workflow Summary --- #
 1. Analyze Request & History.
@@ -383,7 +403,10 @@ When generating SQL queries for the `execute_sql` tool, adhere strictly to these
     GROUP BY hc."name";
     ```
 11. **Time Filtering:** Generate SQL date/time conditions DIRECTLY using `NOW()`, `CURRENT_DATE`, `INTERVAL`, `DATE_TRUNC`, `EXTRACT`, `MAKE_DATE`, etc., based on the Current Time Context provided above and user query terms. **DO NOT** pass dates/times as parameters.
-    *   **Default Timeframe (MANDATORY):** If the user asks for an aggregate calculation (SUM, COUNT, AVG) but **does not specify a time period**, you **MUST** default to using a recent period, specifically **`"eventTimestamp" >= NOW() - INTERVAL '30 days'`**. Include this default filter in the `WHERE` clause. This is mandatory unless the user explicitly specifies a different timeframe.
+    *   **Adhere Strictly to User Request:** Generate time filters *only* for the specific date(s) or period(s) **explicitly mentioned** in the user's query. 
+    *   **DO NOT Assume Comparisons:** If the user asks for a specific period (e.g., "January 2025", "last week"), **DO NOT** automatically generate additional queries or filters for other comparison periods (like "last 30 days" or "previous month") unless the user *explicitly asks* for such a comparison (e.g., "compare Jan to Dec", "how does last week compare to the week before?").
+    *   **Ask if Unsure:** If a comparison seems potentially useful but wasn't requested for a specific timeframe query, consider asking the user for clarification first (using Guideline #3) instead of generating unrequested queries.
+    *   **Default Timeframe (MANDATORY for Aggregates without User Timeframe):** If the user asks for an aggregate calculation (SUM, COUNT, AVG) but **does not specify ANY time period at all**, you **MUST** default to using a recent period, specifically **`"eventTimestamp" >= NOW() - INTERVAL '30 days'`**. Include this default filter in the `WHERE` clause. This is mandatory only when the user provides *no* timeframe guidance.
     *   Resolve relative terms: "last week" -> `"eventTimestamp" >= NOW() - INTERVAL '7 days'`, "yesterday" -> `DATE_TRUNC('day', "eventTimestamp") = CURRENT_DATE - INTERVAL '1 day'`.
     *   Use `{current_year}` for month/day without year: "March" -> `EXTRACT(MONTH FROM "eventTimestamp") = 3 AND EXTRACT(YEAR FROM "eventTimestamp") = {current_year}`, "April 1st" -> `DATE_TRUNC('day', "eventTimestamp") = MAKE_DATE({current_year}, 4, 1)`.
     *   Handle specific ranges: "Q1 2023" -> `"eventTimestamp" >= MAKE_DATE(2023, 1, 1) AND "eventTimestamp" < MAKE_DATE(2023, 4, 1)`.
@@ -391,7 +414,34 @@ When generating SQL queries for the `execute_sql` tool, adhere strictly to these
 12. **Date Aggregation:** For "daily" or "by date" metrics, include `DATE("eventTimestamp") AS "Date"` in SELECT and GROUP BY.
 13. **Footfall Queries (Table '8'):** For general footfall/visitor queries, calculate `SUM("39") AS "Total Entries"` AND `SUM("40") AS "Total Exits"`. If only entries or exits are asked for, sum only the specific column.
 14. **Combine Metrics:** **CRITICAL:** Generate a SINGLE `execute_sql` call if multiple related metrics (e.g., borrows & returns) from the same table/period are requested. **DO NOT** make separate calls for each metric. Also, do not make separate calls if queries differ only by presentation (e.g., `ORDER BY`).
-15. **Final Check:** Before finalizing the tool call, mentally re-verify all points above, **especially applying the mandatory default timeframe (#11 if applicable)** and using resolved IDs (#2): physical names ('5', '8'), quoting, parameters, org filter, aliases, joins, aggregates, LIMIT, time logic, metric combination.
+15. **CTE Security Requirements:** **CRITICAL:** When using Common Table Expressions (CTEs) or subqueries, EACH component MUST include its own independent organization_id filter. The security system checks each SQL component separately, and failing to include the proper filter in any component will cause the entire query to be rejected.
+    * Main query: `WHERE "tablename"."organizationId" = :organization_id`
+    * Each CTE: `WHERE "tablename"."organizationId" = :organization_id`
+    * Each subquery: `WHERE "tablename"."organizationId" = :organization_id`
+    
+    Example of properly secured CTE query:
+    ```sql
+    WITH location_sums AS (
+        SELECT "hierarchyId", SUM("1") AS "total_borrows"
+        FROM "5"
+        WHERE "organizationId" = :organization_id  -- REQUIRED here
+          AND "eventTimestamp" >= NOW() - INTERVAL '30 days'
+        GROUP BY "hierarchyId"
+    ),
+    org_avg AS (
+        SELECT AVG("total_borrows") AS "avg_borrows"
+        FROM location_sums  -- No need for org filter, it's already filtered in location_sums
+    )
+    SELECT hc."name" AS "Location Name", 
+           ls."total_borrows" AS "Total Borrows", 
+           (SELECT "avg_borrows" FROM org_avg) AS "Org Average"
+    FROM location_sums ls
+    JOIN "hierarchyCaches" hc ON ls."hierarchyId" = hc."id"
+    WHERE hc."parentId" = :organization_id  -- REQUIRED here too
+    ORDER BY "Total Borrows" DESC
+    LIMIT 10;
+    ```
+16. **Final Check:** Before finalizing the tool call, mentally re-verify all points above, **especially applying the mandatory default timeframe (#11 if applicable)** and using resolved IDs (#2): physical names ('5', '8'), quoting, parameters, org filter, aliases, joins, aggregates, LIMIT, time logic, metric combination, and CTE security (#15).
 
 # --- END SQL GENERATION GUIDELINES --- #
 
@@ -525,7 +575,113 @@ def agent_node(state: AgentState, llm_with_structured_output):
     # Parser for the final response structure
     final_response_parser = PydanticToolsParser(tools=[FinalApiResponseStructure])
 
+    # --- Adaptive Error Analysis: Check for recurring failure patterns ---
+    failure_patterns = state.get("failure_patterns", {})
+    recovery_guidance = None
+    
+    # Create a copy for preprocessing to avoid modifying the original state
     preprocessed_state = _preprocess_state_for_llm(state)
+    
+    # Check if we have recurring patterns of the same failure
+    if failure_patterns:
+        for tool_name, failures in failure_patterns.items():
+            # Require at least 2 failures to trigger adaptation
+            if len(failures) >= 2:
+                # Extract error messages to detect patterns
+                error_messages = [f.get("error_message", "") for f in failures[-2:]]
+                
+                # Check for SQL organization_id security filter failures
+                if tool_name == "execute_sql" and any("SECURITY CHECK FAILED" in msg and "organization_id" in msg for msg in error_messages):
+                    recovery_guidance = """
+                    CRITICAL SQL CORRECTION INSTRUCTION:
+                    
+                    Your previous SQL queries have failed the security check because they're missing required organization_id filtering.
+                    
+                    The security system checks EACH SQL component SEPARATELY:
+                    1. Every CTE (WITH clause) must include: WHERE "organizationId" = :organization_id
+                    2. Every subquery must include: WHERE "organizationId" = :organization_id 
+                    3. The main query must include: WHERE "organizationId" = :organization_id
+                    
+                    Example of CORRECT organization_id filtering in a complex query:
+                    ```sql
+                    WITH branch_stats AS (
+                        SELECT "hierarchyId", SUM("1") AS total_borrows
+                        FROM "5"
+                        WHERE "organizationId" = :organization_id  -- REQUIRED HERE
+                          AND "eventTimestamp" >= NOW() - INTERVAL '30 days'
+                        GROUP BY "hierarchyId"
+                    )
+                    SELECT hc."name" AS "Branch Name", bs.total_borrows AS "Total Borrows"
+                    FROM branch_stats bs
+                    JOIN "hierarchyCaches" hc ON bs."hierarchyId" = hc."id"
+                    WHERE hc."parentId" = :organization_id  -- REQUIRED HERE TOO
+                    LIMIT 10;
+                    ```
+                    
+                    If a complex query structure continues to fail:
+                    1. Try a simpler query without CTEs
+                    2. Break it into multiple separate queries
+                    3. Ensure EVERY table reference has organization_id filtering
+                    """
+                    logger.info(f"[AgentNode] Adding SQL security recovery guidance after {len(failures)} consecutive failures")
+                    break
+                
+                # Check for SQL syntax failures
+                elif tool_name == "execute_sql" and any("syntax" in msg.lower() for msg in error_messages):
+                    recovery_guidance = """
+                    CRITICAL SQL SYNTAX CORRECTION NEEDED:
+                    
+                    Your previous SQL queries have syntax errors. Please:
+                    1. Verify all table and column names are properly double-quoted
+                    2. Ensure all CTEs are properly terminated
+                    3. Check that all parentheses are balanced
+                    4. Simplify the query structure if needed
+                    
+                    If syntax issues persist, try a completely different query approach.
+                    """
+                    logger.info(f"[AgentNode] Adding SQL syntax recovery guidance after {len(failures)} syntax failures")
+                    break
+                
+                # Generic recovery for 3+ failures of any type
+                elif len(failures) >= 3:
+                    recovery_guidance = """
+                    CRITICAL STRATEGY CHANGE REQUIRED:
+                    
+                    Multiple tool calls have failed consecutively. Change your approach:
+                    
+                    1. Use a significantly different strategy than previous attempts
+                    2. Simplify your approach - focus on the most essential part of the request
+                    3. If a complex query is failing, try multiple simpler queries instead
+                    
+                    If this attempt also fails, return a helpful error message explaining the limitations.
+                    """
+                    logger.info(f"[AgentNode] Adding generic recovery guidance after {len(failures)} consecutive failures")
+                    break
+    
+    # If we've identified recovery guidance, insert it into the system message
+    if recovery_guidance:
+        messages = preprocessed_state.get("messages", [])
+        system_message_found = False
+        
+        # Find and update system message if it exists
+        for i, msg in enumerate(messages):
+            if isinstance(msg, SystemMessage):
+                # Append recovery guidance to the existing system message
+                new_content = f"{msg.content}\n\n{recovery_guidance}"
+                messages[i] = SystemMessage(content=new_content)
+                system_message_found = True
+                break
+        
+        # If no system message was found, add one at the beginning
+        if not system_message_found and messages:
+            messages.insert(0, SystemMessage(content=recovery_guidance))
+        
+        # Update the preprocessed state
+        preprocessed_state["messages"] = messages
+        
+        # Preserve recovery guidance for state tracking
+        return_dict["recovery_guidance"] = recovery_guidance
+    # --- End Adaptive Error Analysis ---
 
     try:
         llm_response = llm_with_structured_output.invoke(preprocessed_state)
@@ -815,6 +971,10 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
     new_tables = [] # Only tables are extracted here now
     successful_calls = 0
     operational_tool_calls = []
+    
+    # Initialize update dictionary and failure tracking
+    update_dict = {}
+    failure_patterns = state.get("failure_patterns", {}).copy()  # Create a copy to avoid modifying the original
 
     # Filter out non-operational "tool calls" (Final API Structure)
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
@@ -832,12 +992,23 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
     for tool_call in operational_tool_calls:
         tool_name = tool_call.get("name")
         tool_id = tool_call.get("id", "")
+        tool_args = tool_call.get("args", {})
         if tool_name in tool_map:
             # Use config setting for retries
-            tool_executions.append({"tool": tool_map[tool_name], "args": tool_call.get("args", {}), "id": tool_id, "name": tool_name, "retries_left": settings.TOOL_EXECUTION_RETRIES})
+            tool_executions.append({
+                "tool": tool_map[tool_name], 
+                "args": tool_args, 
+                "id": tool_id, 
+                "name": tool_name, 
+                "retries_left": settings.TOOL_EXECUTION_RETRIES
+            })
         else:
              logger.error(f"[ToolsNode] Operational tool '{tool_name}' requested but not found.")
-             new_messages.append(ToolMessage(content=f"Error: Tool '{tool_name}' not found.", tool_call_id=tool_id, name=tool_name))
+             new_messages.append(ToolMessage(
+                content=f"Error: Tool '{tool_name}' not found.", 
+                tool_call_id=tool_id, 
+                name=tool_name
+             ))
 
     if not tool_executions:
         logger.warning(f"[ToolsNode] No operational tools could be prepared for execution.")
@@ -846,7 +1017,11 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
     sem = asyncio.Semaphore(settings.MAX_CONCURRENT_TOOLS)
     # Define async execution function with retry logic
     async def execute_with_retry(execution_details):
-        tool = execution_details["tool"]; args = execution_details["args"]; tool_id = execution_details["id"]; tool_name = execution_details["name"]; retries = execution_details["retries_left"]
+        tool = execution_details["tool"]
+        args = execution_details["args"]
+        tool_id = execution_details["id"]
+        tool_name = execution_details["name"]
+        retries = execution_details["retries_left"]
         try:
             async with sem:
                  logger.debug(f"[ToolsNode] Executing tool '{tool_name}' (ID: {tool_id}) with args: {args}")
@@ -854,18 +1029,34 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
                  if asyncio.iscoroutine(content): content = await content
                  content_str = json.dumps(content, default=str) if isinstance(content, (dict, list)) else str(content)
                  logger.debug(f"[ToolsNode] Tool '{tool_name}' (ID: {tool_id}) completed.")
-                 return {"success": True, "message": ToolMessage(content=content_str, tool_call_id=tool_id, name=tool_name), "raw_content": content, "tool_name": tool_name, "tool_id": tool_id}
+                 return {
+                     "success": True, 
+                     "message": ToolMessage(content=content_str, tool_call_id=tool_id, name=tool_name), 
+                     "raw_content": content, 
+                     "tool_name": tool_name, 
+                     "tool_id": tool_id,
+                     "args": args  # Include args in successful result
+                 }
         except Exception as e:
-            error_msg_for_log = f"Error executing tool '{tool_name}' (ID: {tool_id}): {str(e)}"
+            error_msg = str(e)
+            error_msg_for_log = f"Error executing tool '{tool_name}' (ID: {tool_id}): {error_msg}"
             if retries > 0 and _is_retryable_error(e):
                 retry_num = settings.TOOL_EXECUTION_RETRIES - retries + 1
                 delay = settings.TOOL_RETRY_DELAY * retry_num
                 logger.warning(f"[ToolsNode] {error_msg_for_log} - Retrying ({retries} left, delay {delay}s).", exc_info=False)
-                await asyncio.sleep(delay); execution_details["retries_left"] = retries - 1
+                await asyncio.sleep(delay)
+                execution_details["retries_left"] = retries - 1
                 return await execute_with_retry(execution_details)
             else:
                 logger.error(f"[ToolsNode] {error_msg_for_log}", exc_info=True)
-                return {"success": False, "error": f"{error_msg_for_log}", "tool_name": tool_name, "tool_id": tool_id}
+                return {
+                    "success": False, 
+                    "error": f"{error_msg_for_log}", 
+                    "error_message": error_msg,  # Store original error message separately
+                    "tool_name": tool_name, 
+                    "tool_id": tool_id,
+                    "args": args  # Include args in failed result too
+                }
 
     results = await asyncio.gather(*[execute_with_retry(exec_data) for exec_data in tool_executions])
 
@@ -873,6 +1064,8 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
     for result in results:
         tool_name = result.get("tool_name", "unknown")
         tool_id = result.get("tool_id", "")
+        tool_args = result.get("args", {})
+        
         if result["success"]:
             successful_calls += 1
             new_messages.append(result["message"])
@@ -897,16 +1090,52 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
                          logger.info(f"[ToolsNode] Extracted table from '{tool_name}' with {len(table_data.get('rows', []))} rows")
                      elif table_data: logger.warning(f"[ToolsNode] '{tool_name}' invalid table structure. Keys: {list(table_data.keys())}")
         else:
-            # Error handling 
-            logger.warning(f"[ToolsNode] Tool call '{tool_name}' (ID: {tool_id}) failed. Error appended.")
+            # Handle tool execution failures and track patterns
+            error_message = result.get("error_message", "Unknown error")
+            logger.warning(f"[ToolsNode] Tool call '{tool_name}' (ID: {tool_id}) failed: {error_message}")
+            
+            # Append to messages if not already present
             if not any(getattr(m, 'tool_call_id', None) == tool_id for m in new_messages if isinstance(m, ToolMessage)):
-                 error_content = f"Tool execution failed: {result.get('error', 'Unknown error')}"
-                 new_messages.append(ToolMessage(content=error_content, tool_call_id=tool_id, name=tool_name))
+                error_content = f"Tool execution failed: {error_message}"
+                new_messages.append(ToolMessage(content=error_content, tool_call_id=tool_id, name=tool_name))
+            
+            # Track failure patterns for later analysis
+            if tool_name not in failure_patterns:
+                failure_patterns[tool_name] = []
+            
+            # Create a unique signature for this failure
+            # Include more detailed information to help identify patterns
+            args_hash = None
+            try:
+                # Create a deterministic hash of the arguments
+                args_str = json.dumps(tool_args, sort_keys=True, default=str) if tool_args else ""
+                args_hash = hash(args_str)  # Simple hash for similarity detection
+            except Exception as hash_err:
+                logger.warning(f"[ToolsNode] Could not hash args for {tool_name}: {hash_err}")
+                args_hash = hash(str(tool_args)) if tool_args else None
+            
+            failure_signature = {
+                "tool_id": tool_id,
+                "error_message": error_message,
+                "timestamp": datetime.datetime.now().isoformat(),
+                "args_hash": args_hash,
+                # Store a simplified version of the arguments for analysis
+                "args_summary": str(tool_args)[:100] if tool_args else None
+            }
+            
+            # Add to failure patterns
+            failure_patterns[tool_name].append(failure_signature)
+            
+            # Keep only last 5 failures per tool to prevent state bloat
+            if len(failure_patterns[tool_name]) > 5:
+                failure_patterns[tool_name] = failure_patterns[tool_name][-5:]
 
     # Update state: Only add messages and new tables
-    logger.info(f"[ToolsNode] Updating state with {len(new_messages)} messages, {len(new_tables)} tables.")
+    logger.info(f"[ToolsNode] Updating state with {len(new_messages)} messages, {len(new_tables)} tables, {len(failure_patterns)} failure patterns.")
     
-    update_dict: Dict[str, Any] = {"messages": new_messages}
+    if new_messages:
+        update_dict["messages"] = new_messages
+    
     if new_tables:
         # Combine with existing tables from state correctly
         existing_tables = state.get('tables', [])
@@ -914,6 +1143,13 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
         logger.info(f"[ToolsNode] Found {len(new_tables)} new table(s). State will have {len(combined_tables)} total tables.")
         update_dict["tables"] = combined_tables
     
+    # Add updated failure patterns to state
+    update_dict["failure_patterns"] = failure_patterns
+    
+    # Preserve recovery guidance if present
+    if "recovery_guidance" in state:
+        update_dict["recovery_guidance"] = state["recovery_guidance"]
+        
     logger.info(f"[ToolsNode] Final update_dict keys before return: {list(update_dict.keys())}")
     return update_dict
 
@@ -941,11 +1177,75 @@ def should_continue(state: AgentState) -> str:
     messages = state.get("messages", [])
     last_message = messages[-1] if messages else None
     final_structure_in_state = state.get("final_response_structure")
+    failure_patterns = state.get("failure_patterns", {})
 
     # If the final structure is already set (by agent node), we end.
     if final_structure_in_state:
         logger.debug("[ShouldContinue] Final response structure found in state. Routing to END.")
         return END
+
+    # --- Check for recursive failure patterns ---
+    max_identical_failures = 4  # Break after 4 identical failures
+    for tool_name, failures in failure_patterns.items():
+        if len(failures) >= max_identical_failures:
+            # Check for similar error patterns in the last N failures
+            recent_failures = failures[-max_identical_failures:]
+            
+            # Extract error messages for analysis
+            error_messages = [failure.get("error_message", "") for failure in recent_failures]
+            
+            # Count occurrences of each error type
+            error_types = {}
+            for error_msg in error_messages:
+                # Extract error type (first part before colon or first 40 chars)
+                if ":" in error_msg:
+                    error_type = error_msg.split(":", 1)[0].strip()
+                else:
+                    error_type = error_msg[:40] if error_msg else "unknown"
+                
+                error_types[error_type] = error_types.get(error_type, 0) + 1
+            
+            # If we have a dominant error type (occurs in at least 3 of last 4 failures)
+            # or if we have at most 2 different error types total, we're in a recursion pattern
+            has_dominant_error = any(count >= 3 for count in error_types.values())
+            few_error_types = len(error_types) <= 2
+            
+            if has_dominant_error or few_error_types:
+                logger.warning(f"[ShouldContinue] Detected recursion with {len(failures)} failures for {tool_name}. Error types: {error_types}")
+                
+                # Determine the most common error type for a tailored message
+                common_error_type = max(error_types.items(), key=lambda x: x[1])[0] if error_types else "unknown"
+                response_text = "I encountered technical limitations processing this complex request."
+                
+                # Customize message based on error pattern
+                if "security check" in common_error_type.lower():
+                    response_text = (
+                        "I'm unable to complete this request due to security constraints in how database queries are structured. "
+                        "Please try simplifying your request or breaking it into separate questions about specific metrics or locations."
+                    )
+                elif "syntax" in common_error_type.lower():
+                    response_text = (
+                        "I'm having difficulty formulating a valid query for this complex request. "
+                        "Please try asking about fewer metrics at once or focus on one specific aspect of your question."
+                    )
+                else:
+                    response_text = (
+                        "I've reached a technical limitation while processing this complex request. "
+                        "Please try simplifying your question or breaking it into separate parts."
+                    )
+                
+                # Create a final response to break the recursion
+                final_structure = FinalApiResponseStructure(
+                    text=response_text,
+                    include_tables=[],
+                    chart_specs=[]
+                )
+                
+                # Update state directly
+                state["final_response_structure"] = final_structure
+                logger.info(f"[ShouldContinue] Breaking recursion with message: {response_text[:100]}...")
+                return END
+    # --- End recursion check ---
 
     # --- ADDED: Check for Tool Execution Errors --- #
     if isinstance(last_message, ToolMessage):
@@ -1056,11 +1356,35 @@ async def process_chat_message(
     logger.info(f"--- Starting request processing ---")
     logger.info(f"Org: {organization_id}, Session: {session_id}, History: {len(chat_history) if chat_history else 0}, User Message: '{message}'") 
 
+    # Standard response templates
+    error_response = {
+        "status": "error",
+        "error": {
+            "code": "UNKNOWN_ERROR",
+            "message": "An unexpected error occurred",
+            "details": None
+        },
+        "data": None,
+        "timestamp": datetime.datetime.now().isoformat()
+    }
+    
+    success_response = {
+        "status": "success",
+        "data": {
+            "text": "",
+            "tables": [],
+            "visualizations": []
+        },
+        "error": None,
+        "timestamp": datetime.datetime.now().isoformat()
+    }
+
     # Org ID validation
     try: uuid.UUID(organization_id)
     except ValueError: 
         logger.error(f"Invalid organization_id format: {organization_id}")
-        return {"status": "error", "error": {"code": "INVALID_INPUT", "message": "Invalid organization identifier.", "details": None}, "data": None}
+        error_response["error"] = {"code": "INVALID_INPUT", "message": "Invalid organization identifier.", "details": None}
+        return error_response
 
     # History validation & Initial State construction
     initial_messages: List[BaseMessage] = []
@@ -1075,14 +1399,20 @@ async def process_chat_message(
         logger.warning(f"Initial message count ({len(initial_messages)}) exceeds limit ({settings.MAX_STATE_MESSAGES}). Pruning...")
         initial_messages = initial_messages[-settings.MAX_STATE_MESSAGES:]
 
-    # AgentState includes token counts again
+    # Initialize token tracking
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+
+    # Initialize agent state with failure pattern tracking
     initial_state = AgentState(
         messages=initial_messages,
         tables=[],
         final_response_structure=None,
         request_id=req_id,
-        prompt_tokens=0, # Initialize prompt tokens
-        completion_tokens=0 # Initialize completion tokens
+        prompt_tokens=0,
+        completion_tokens=0,
+        failure_patterns={},
+        recovery_guidance=None
     )
 
     try:
@@ -1096,244 +1426,235 @@ async def process_chat_message(
         )
         logger.info(f"LangGraph workflow invocation complete.")
 
-        # Extract final response structure (contains text, include_tables, chart_specs)
+        # Track token usage
+        total_prompt_tokens = final_state.get("prompt_tokens", 0)
+        total_completion_tokens = final_state.get("completion_tokens", 0)
+
+        # Extract final response structure
         structured_response = final_state.get("final_response_structure")
-
-        if structured_response:
-            logger.info(f"Successfully obtained FinalApiResponseStructure.")
-            
-            # --- Prepare final API data ---
-            final_text = structured_response.text
-            final_tables_for_api: List[TableData] = []
-            final_visualizations_for_api: List[ApiChartSpecification] = [] # Still called visualizations in API
-
-            # Get all tables accumulated in the state
-            all_tables_from_state = final_state.get('tables', [])
-            
-            # Filter tables based on include flags
-            include_tables_flags = structured_response.include_tables
-            logger.debug(f"Processing {len(all_tables_from_state)} tables with flags: {include_tables_flags}")
-            for i, table_dict in enumerate(all_tables_from_state):
-                 if isinstance(table_dict, dict) and isinstance(table_dict.get('columns'), list) and isinstance(table_dict.get('rows'), list):
-                     if i < len(include_tables_flags) and include_tables_flags[i]:
-                         try:
-                             final_tables_for_api.append(TableData(**table_dict)) 
-                             logger.debug(f"Including table index {i} in final API response.")
-                         except Exception as table_parse_err:
-                             logger.warning(f"Skipping table index {i} due to parsing error: {table_parse_err}. Data: {str(table_dict)[:200]}...")
-                     # else: logger.debug(f"Excluding table index {i} based on include flag.") # Reduced verbosity
-                 else:
-                      logger.warning(f"Skipping invalid table structure at index {i} in final state.")
-
-            # Construct visualizations (ApiChartSpecification) from chart_specs in the final response structure
-            chart_specs_from_llm = structured_response.chart_specs # This is List[ChartSpecFinalInstruction]
-            logger.debug(f"Processing {len(chart_specs_from_llm)} chart specifications from FinalApiResponseStructure.")
-            
-            for i, instruction in enumerate(chart_specs_from_llm):
-                 logger.debug(f"Constructing API visualization spec for: {instruction.title}")
-                 source_index = instruction.source_table_index
-                 
-                 # --- Start Stricter Validation --- #
-                 # 1. Validate source index range
-                 if not (0 <= source_index < len(all_tables_from_state)):
-                     logger.warning(f"Discarding chart spec '{instruction.title}' due to invalid source_table_index: {source_index} (Num tables: {len(all_tables_from_state)}). LLM Spec: {instruction}")
-                     continue # Skip to the next instruction
-
-                 source_table_dict = all_tables_from_state[source_index]
-
-                 validation_passed = True
-                 error_reason = ""
-                 source_columns = []
-                 
-                 # 2. Validate source table structure itself
-                 if not (isinstance(source_table_dict, dict) and isinstance(source_table_dict.get('columns'), list) and isinstance(source_table_dict.get('rows'), list)):
-                     validation_passed = False
-                     error_reason = f"Source table at index {source_index} has invalid structure (not dict with list columns/rows)."
-                 else:
-                     source_columns = source_table_dict['columns']
-                     # 3. Validate X column exists
-                     if instruction.x_column not in source_columns:
-                         validation_passed = False
-                         error_reason = f"Specified x_column '{instruction.x_column}' not found in source table columns: {source_columns}."
-                     # 4. Validate Y column exists (check original LLM value, with exception for multi-metric bar)
-                     elif instruction.y_column not in source_columns:
-                         is_multi_metric_bar = False
-                         if instruction.type_hint == "bar":
-                             metric_cols = [col for col in source_columns if col != instruction.x_column]
-                             if len(metric_cols) >= 2: is_multi_metric_bar = True
-                         
-                         if not (is_multi_metric_bar and instruction.y_column == "Value"): # Allow Value only if multi-metric bar
-                             validation_passed = False
-                             error_reason = f"Specified y_column '{instruction.y_column}' not found in source table columns: {source_columns}."
-                     # 5. Validate Color column exists (if specified, with exception for multi-metric bar)
-                     elif instruction.color_column is not None and instruction.color_column not in source_columns:
-                         is_multi_metric_bar = False # Recheck here for clarity
-                         if instruction.type_hint == "bar":
-                             metric_cols = [col for col in source_columns if col != instruction.x_column]
-                             if len(metric_cols) >= 2: is_multi_metric_bar = True
-                         
-                         if not (is_multi_metric_bar and instruction.color_column == "Metric"): # Allow Metric only if multi-metric bar
-                             validation_passed = False
-                             error_reason = f"Specified color_column '{instruction.color_column}' not found in source table columns: {source_columns}."
-
-                 if not validation_passed:
-                     logger.warning(f"Discarding chart spec '{instruction.title}' due to validation error: {error_reason} LLM Spec: {instruction}")
-                     continue # Skip to the next instruction
-                 # --- End Stricter Validation --- #
-
-                 # If validation passed, proceed with parsing and potential corrections
-                 try:
-                     source_table_data = TableData(**source_table_dict)
-                     
-                     # --- Special Handling for Single-Row Pie Charts (Columns as Categories) --- #
-                     is_pie_transformed = False
-                     if instruction.type_hint == 'pie' and len(source_table_data.rows) == 1 and len(source_table_data.columns) > 1:
-                         logger.info(f"Applying specific transformation for single-row pie chart: '{instruction.title}'")
-                         original_columns = source_table_data.columns
-                         original_row = source_table_data.rows[0]
-                         
-                         # Define new structure
-                         category_col_name = "Metric" # Or derive from x_column if needed? Let's stick to convention.
-                         value_col_name = "Count"   # Or derive from y_column?
-                         transformed_columns = [category_col_name, value_col_name]
-                         transformed_rows = []
-                         
-                         # Create new rows from original columns/values
-                         for col_index, col_name in enumerate(original_columns):
-                             try:
-                                 # Attempt to convert value, skip if not possible for a pie chart
-                                 value = float(original_row[col_index]) if original_row[col_index] is not None else 0.0
-                                 transformed_rows.append([col_name, value])
-                             except (ValueError, TypeError):
-                                 logger.warning(f"Could not convert value '{original_row[col_index]}' for column '{col_name}' to float for pie chart. Skipping this category.")
-                         
-                         if not transformed_rows:
-                             logger.warning(f"Pie chart '{instruction.title}' transformation resulted in no valid data rows. Skipping chart.")
-                             continue # Skip this chart spec
-                             
-                         # Create the transformed data object
-                         api_data_for_chart = TableData(columns=transformed_columns, rows=transformed_rows)
-                         
-                         # Create and append the corrected ApiChartSpecification directly
-                         api_spec = ApiChartSpecification(
-                             type_hint="pie",
-                             title=instruction.title,
-                             x_column=category_col_name, # Use transformed column name
-                             y_column=value_col_name,   # Use transformed column name
-                             color_column=None,         # Pie charts don't use color_column here
-                             x_label=instruction.x_label or category_col_name, # Use LLM label or default
-                             y_label=instruction.y_label or value_col_name,   # Use LLM label or default
-                             data=api_data_for_chart
-                         )
-                         final_visualizations_for_api.append(api_spec)
-                         logger.debug(f"Successfully added transformed pie chart spec: {api_spec.title}")
-                         is_pie_transformed = True
-                         continue # Go to next instruction, pie chart handled
-                     # --- End Special Handling for Single-Row Pie Charts --- #
-
-                     # --- Standard Processing & Correction Logic (Skip if pie was transformed) --- #
-                     if not is_pie_transformed:
-                         # --- Correction Logic for Multi-Metric Bar Charts --- #
-                         corrected_y_column = instruction.y_column
-                         corrected_color_column = instruction.color_column
-                         corrected_y_label = instruction.y_label or instruction.y_column
-                         apply_wide_to_long = False # Flag to ensure transformation runs
-                         
-                         if instruction.type_hint == "bar":
-                             # Check source_columns (derived during validation) instead of source_table_data.columns
-                             metric_columns = [col for col in source_columns if col != instruction.x_column]
-                             if len(metric_columns) >= 2:
-                                 logger.debug(f"Applying correction for multi-metric bar chart '{instruction.title}'. Forcing y_column='Value', color_column='Metric'. Original LLM spec: y='{instruction.y_column}', color='{instruction.color_column}'")
-                                 corrected_y_column = "Value"       # Override
-                                 corrected_color_column = "Metric"   # Override
-                                 corrected_y_label = "Value"        # Override
-                                 apply_wide_to_long = True          # Mark for transformation
-                         # --- End Correction Logic --- #
- 
-                         # --- Apply Wide-to-Long Transformation if needed --- #
-                         api_data_for_chart = source_table_data # Start with original
-                         # Condition: Apply if flagged by correction logic OR (original LLM spec had color_column for bar chart)
-                         if apply_wide_to_long or (instruction.type_hint == "bar" and instruction.color_column is not None and not apply_wide_to_long):
-                             logger.info(f"Applying wide-to-long transformation for chart spec: {instruction.title}")
-                             # Pass the original x_column name to identify the ID column
-                             api_data_for_chart = _transform_wide_to_long(source_table_data, instruction.x_column)
- 
-                         # Construct the ApiChartSpecification (for API response)
-                         api_spec = ApiChartSpecification(
-                             type_hint=instruction.type_hint,
-                             title=instruction.title,
-                             x_column=instruction.x_column,       # Use original from LLM
-                             y_column=corrected_y_column,         # Use corrected value
-                             color_column=corrected_color_column, # Use corrected value
-                             x_label=instruction.x_label or instruction.x_column, # Use original from LLM
-                             y_label=corrected_y_label,           # Use corrected value
-                             data=api_data_for_chart # Use the potentially transformed TableData here
-                         )
-                         final_visualizations_for_api.append(api_spec)
-                         logger.debug(f"Successfully added API visualization spec: {api_spec.title}")
-                 except Exception as spec_build_err:
-                     logger.error(f"Error building ApiChartSpecification for instruction index {i} after validation: {spec_build_err}", exc_info=True)
-
-            # Log final counts for verification
-            logger.info(f"Final Response - Text: {len(final_text)} chars, Tables: {len(final_tables_for_api)}, Visualizations (Specs): {len(final_visualizations_for_api)}")
-            
-            # --- Add token usage log to main application logs ---
-            total_prompt_tokens = final_state.get('prompt_tokens', 0)
-            total_completion_tokens = final_state.get('completion_tokens', 0)
-            logger.info(f"Token Usage - Prompt: {total_prompt_tokens}, Completion: {total_completion_tokens}, Total: {total_prompt_tokens + total_completion_tokens}")
-            
-            # --- Log Usage Data --- #
-            escaped_query = json.dumps(message)
-            escaped_response = json.dumps(final_text)
-            usage_logger.info(
-                f"REQUEST_ID={req_id} "
-                f"PROMPT_TOKENS={total_prompt_tokens} "
-                f"COMPLETION_TOKENS={total_completion_tokens} "
-                f"QUERY={escaped_query} " 
-                f"RESPONSE={escaped_response}" 
+        if not structured_response:
+            logger.warning(f"No final_response_structure found in final state. Generating fallback.")
+            structured_response = FinalApiResponseStructure(
+                text="I wasn't able to properly complete this request. Please try again with a more specific question.",
+                include_tables=[],
+                chart_specs=[]
             )
-            # --- End Log Usage Data --- #
-
-            # Construct final ChatData for the API response
-            response_data = ChatData(
-                text=final_text, 
-                tables=final_tables_for_api or None, 
-                visualizations=final_visualizations_for_api or None # Assign to the 'visualizations' key
-            )
+        
+        # Process tables
+        tables_from_state = final_state.get("tables", [])
+        tables_to_include = []
+        
+        # Handle include_tables flags
+        include_tables_flags = structured_response.include_tables
+        if include_tables_flags and len(tables_from_state) > 0:
+            # Ensure include_tables exists and has the right length
+            if not include_tables_flags:
+                # Generate default include_tables (all False)
+                logger.debug(f"No include_tables specified, defaulting all {len(tables_from_state)} tables to False")
+                include_tables_flags = [False] * len(tables_from_state)
+            elif len(include_tables_flags) < len(tables_from_state):
+                # Pad with False if too short
+                missing_count = len(tables_from_state) - len(include_tables_flags)
+                logger.debug(f"Padding include_tables with {missing_count} False values to match table count ({len(tables_from_state)})")
+                include_tables_flags.extend([False] * missing_count)
+            elif len(include_tables_flags) > len(tables_from_state):
+                # Truncate if too long
+                logger.debug(f"Truncating include_tables from {len(include_tables_flags)} to match table count ({len(tables_from_state)})")
+                include_tables_flags = include_tables_flags[:len(tables_from_state)]
             
-            logger.info(f"Success. Returning response.")
-            logger.info(f"--- Finished request processing ---")
-            return {"status": "success", "data": response_data.model_dump(exclude_none=True), "error": None}
+            # Apply flags to filter tables
+            tables_to_include = [
+                table for idx, table in enumerate(tables_from_state)
+                if idx < len(include_tables_flags) and include_tables_flags[idx]
+            ]
+        
+        # Process charts
+        visualizations = []
+        chart_specs = getattr(structured_response, "chart_specs", [])
+        if chart_specs:
+            # Transform chart specs to API format
+            for chart_spec in chart_specs:
+                source_table_idx = getattr(chart_spec, "source_table_index", None)
+                if source_table_idx is not None and 0 <= source_table_idx < len(tables_from_state):
+                    # Create API visualization spec
+                    api_chart = ApiChartSpecification(
+                        type_hint=getattr(chart_spec, "type_hint", "bar"),
+                        title=getattr(chart_spec, "title", "Chart"),
+                        x_column=getattr(chart_spec, "x_column", ""),
+                        y_column=getattr(chart_spec, "y_column", ""),
+                        color_column=getattr(chart_spec, "color_column", None),
+                        x_label=getattr(chart_spec, "x_label", None),
+                        y_label=getattr(chart_spec, "y_label", None),
+                        data=tables_from_state[source_table_idx]
+                    )
+                    
+                    # Validate column references
+                    source_table = tables_from_state[source_table_idx]
+                    columns = source_table.get("columns", [])
+                    
+                    # Ensure column references are valid
+                    if api_chart.x_column not in columns and columns:
+                        logger.warning(f"x_column '{api_chart.x_column}' not found in source table. Using first column.")
+                        api_chart.x_column = columns[0]
+                    
+                    if api_chart.y_column not in columns and len(columns) > 1:
+                        logger.warning(f"y_column '{api_chart.y_column}' not found in source table. Using second column.")
+                        api_chart.y_column = columns[1]
+                    
+                    if api_chart.color_column and api_chart.color_column not in columns:
+                        logger.warning(f"color_column '{api_chart.color_column}' not found in source table. Setting to None.")
+                        api_chart.color_column = None
+                    
+                    visualizations.append(api_chart)
+        
+        # Build successful response
+        success_response["data"] = {
+            "text": structured_response.text,
+            "tables": tables_to_include,
+            "visualizations": visualizations
+        }
+        
+        # Log token usage
+        logger.info(f"Token Usage - Prompt: {total_prompt_tokens}, Completion: {total_completion_tokens}, Total: {total_prompt_tokens + total_completion_tokens}")
+        
+        # Log detailed usage info
+        usage_logger.info(json.dumps({
+            "request_id": req_id,
+            "organization_id": organization_id,
+            "session_id": session_id,
+            "prompt_tokens": total_prompt_tokens,
+            "completion_tokens": total_completion_tokens,
+            "total_tokens": total_prompt_tokens + total_completion_tokens,
+            "query": message,
+            "response_length": len(structured_response.text),
+            "table_count": len(tables_to_include),
+            "visualization_count": len(visualizations)
+        }))
+        
+        logger.info("Successfully completed chat request")
+        return success_response
+        
+    except GraphRecursionError as e:
+        logger.error(f"Recursion limit exceeded: {e}")
+        
+        # Try to extract partial results from the state
+        partial_tables = []
+        failure_info = {}
+        error_type = "unknown"
+        
+        # Access partial state if available
+        if hasattr(e, "partial_state"):
+            partial_state = e.partial_state
+            if partial_state:
+                # Extract tables for partial results
+                partial_tables = partial_state.get("tables", [])
+                
+                # Extract failure patterns to determine error type
+                failure_patterns = partial_state.get("failure_patterns", {})
+                if failure_patterns:
+                    # Analyze the most common failures
+                    for tool_name, failures in failure_patterns.items():
+                        if len(failures) >= 2:
+                            error_msgs = [f.get("error_message", "") for f in failures]
+                            
+                            # Check for common error types
+                            if any("SECURITY CHECK FAILED" in msg for msg in error_msgs):
+                                error_type = "security_filter"
+                            elif any("syntax" in msg.lower() for msg in error_msgs):
+                                error_type = "sql_syntax"
+                            
+                            failure_info[tool_name] = {
+                                "count": len(failures),
+                                "last_error": failures[-1].get("error_message", "") if failures else ""
+                            }
+        
+        # Generate appropriate user message based on error type
+        user_message = "I wasn't able to complete this complex request due to system limitations."
+        
+        if error_type == "security_filter":
+            user_message = "I couldn't process this complex query due to security requirements. Please try breaking your request into simpler parts, focusing on one aspect at a time."
+        elif error_type == "sql_syntax":
+            user_message = "I had difficulty generating a valid query for this complex request. Try asking about one metric or location at a time."
+        
+        # Return partial results if available
+        if partial_tables:
+            # Return the first available table with a partial success status
+            error_response["status"] = "partial_success"
+            error_response["error"] = {
+                "code": "RECURSION_LIMIT_EXCEEDED",
+                "message": "Request partially completed before complexity limit was reached.",
+                "details": {"exception": str(e), "failure_info": failure_info}
+            }
+            error_response["data"] = {
+                "text": f"{user_message} Here are the partial results I was able to retrieve:",
+                "tables": [partial_tables[0]],  # First table only
+                "visualizations": []
+            }
         else:
-            # Handle case where graph finished but final structure is missing
-            logger.error(f"Graph finished, but FinalApiResponseStructure missing. State keys: {list(final_state.keys())}")
-            last_msg_content = str(final_state['messages'][-1].content) if final_state.get('messages') else "No messages."
-            error_details = {"last_message_preview": last_msg_content[:100], "cause": "Final structure missing from state"}
+            # No partial results
+            error_response["error"] = {
+                "code": "RECURSION_LIMIT_EXCEEDED",
+                "message": "Request complexity limit exceeded.",
+                "details": {"exception": str(e), "failure_info": failure_info}
+            }
+            error_response["data"] = {
+                "text": user_message,
+                "tables": [],
+                "visualizations": []
+            }
+        
+        logger.info("--- Finished request processing with exception ---")
+        return error_response
+        
+    except openai.APIError as e:
+        # Handle OpenAI API errors
+        error_code = "LLM_SERVICE_ERROR"
+        error_message = "Language model service error"
+        
+        if isinstance(e, openai.APIConnectionError):
+            error_code = "LLM_CONNECTION_ERROR" 
+            error_message = "Could not connect to the language model service."
+        elif isinstance(e, openai.APITimeoutError):
+            error_code = "LLM_TIMEOUT_ERROR"
+            error_message = "The language model service timed out."
+        elif isinstance(e, openai.RateLimitError):
+            error_code = "LLM_RATE_LIMIT_ERROR"
+            error_message = "The language model service rate limit was exceeded."
             
-            # --- Log Usage Data (Error Case) --- #
-            total_prompt_tokens = final_state.get('prompt_tokens', 0)
-            total_completion_tokens = final_state.get('completion_tokens', 0)
-            error_message = f"Error: Final structure missing. Last message: {last_msg_content[:100]}..."
-            escaped_query = json.dumps(message)
-            escaped_response = json.dumps(error_message)
-            usage_logger.info(
-                f"REQUEST_ID={req_id} "
-                f"PROMPT_TOKENS={total_prompt_tokens} "
-                f"COMPLETION_TOKENS={total_completion_tokens} "
-                f"QUERY={escaped_query} "
-                f"RESPONSE={escaped_response}" # Log error indicator
-            )
-            # --- End Log Usage Data (Error Case) --- #
-            
-            logger.info(f"--- Finished request processing with error ---")
-            return {"status": "error", "data": None, "error": {"code": "FINAL_STRUCTURE_MISSING", "message": "Unable to generate final response", "details": error_details}}
-
+        logger.error(f"OpenAI API Error: {error_code} - {e}", exc_info=True)
+        error_response["error"] = {"code": error_code, "message": error_message, "details": {"exception": str(e)}}
+        logger.info("--- Finished request processing with exception ---")
+        return error_response
+    
+    except ValueError as e:
+        # Handle value errors with special case for content policy violations
+        if "content management policy violation" in str(e).lower():
+            logger.warning(f"Content policy violation: {e}")
+            error_response["error"] = {
+                "code": "CONTENT_POLICY_VIOLATION",
+                "message": "I cannot process this request due to content policies.",
+                "details": {"exception": str(e)}
+            }
+        else:
+            logger.error(f"ValueError during processing: {e}", exc_info=True)
+            error_response["error"] = {
+                "code": "INVALID_INPUT",
+                "message": "The request contained invalid input or parameters.",
+                "details": {"exception": str(e)}
+            }
+        logger.info("--- Finished request processing with exception ---")
+        return error_response
+        
     except Exception as e:
-        logger.error(f"Unhandled exception during processing: {str(e)}", exc_info=True)
-        error_code = "INTERNAL_ERROR"; error_message = "Internal error."; error_details = {"exception": str(e)}
-        if "recursion limit" in str(e).lower(): error_code = "RECURSION_LIMIT_EXCEEDED"; error_message = "Request complexity limit exceeded."
-        logger.info(f"--- Finished request processing with exception ---")
-        return {"status": "error", "data": None, "error": {"code": error_code, "message": error_message, "details": error_details}}
+        # Handle all other exceptions
+        logger.error(f"Unhandled exception during processing: {e}", exc_info=True)
+        error_response["error"] = {
+            "code": "UNKNOWN_ERROR", 
+            "message": "An unexpected error occurred while processing your request.",
+            "details": {"exception": str(e)}
+        }
+        logger.info("--- Finished request processing with exception ---")
+        return error_response
 
 
 # --- Helper function for Data Transformation --- #
@@ -1367,7 +1688,6 @@ def _transform_wide_to_long(wide_table: TableData, id_column_name: str) -> Table
         for index, metric_name in value_column_indices.items():
             value = wide_row[index]
             try:
-                # Convert numeric types, pass others as is? Or enforce numeric?
                 # Let's try converting to float, falling back to None if not possible
                 numeric_value = float(value) if value is not None else None
                 long_rows.append([id_value, metric_name, numeric_value])
