@@ -9,10 +9,9 @@ import decimal
 import re
 
 from langchain.tools import BaseTool
-from langchain_core.runnables import RunnableConfig 
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 
 from app.core.config import settings
 from app.db.schema_definitions import SCHEMA_DEFINITIONS
@@ -138,27 +137,36 @@ class SQLExecutionTool(BaseTool):
         
         # --- Security Check: Verify organization_id parameter usage in all SQL components ---
         try:
-            # Function to check for organization_id filter using regex
-            def check_filter(sql_segment: str) -> bool:
-                # SIMPLIFIED REGEX: Checks if :organization_id is used in a comparison
-                # with organizationId, parentId, or id (case-insensitive, allows quotes).
-                # Looks for: "column_name" [operator] :organization_id
-                # Does NOT strictly validate the operator list anymore, focuses on linkage.
-                pattern = r'["\']?(?:organizationid|parentid|id)["\']?\s*(?:[=<>]|!=|\bIN\b)\s*:organization_id\b'
-                # Alternative more robust pattern if needed:
-                # pattern = r'(?i)["\']?(?:organizationid|parentId|id)["\']?\s*(?:=|>=|<=|<>|!=|\bIN\b)\s*:\s*organization_id\b'
-                return bool(re.search(pattern, sql_segment, re.IGNORECASE))
-
             # Check main query for organization_id filter
-            if not check_filter(main_query):
+            main_query_has_filter = (
+                # Look for parameter in main query
+                ":organization_id" in main_query.lower() and 
+                # Look for appropriate column in main query
+                any(
+                    f'"{col}"' in main_query.lower() or f'"{col}" ' in main_query.lower() 
+                    for col in ["organizationid", "parentid", "id"]
+                )
+            )
+            
+            if not main_query_has_filter:
                 error_msg = "SECURITY CHECK FAILED: Main SQL query MUST contain a WHERE clause filtering by :organization_id on 'organizationId', 'parentId', or 'id'."
                 logger.error(f"{log_prefix}{error_msg} SQL: {main_query[:200]}...")
                 raise ValueError(error_msg)
             
             # Check CTE blocks for organization_id filter
             for i, cte_block in enumerate(cte_blocks):
-                if not check_filter(cte_block):
-                    error_msg = f"SECURITY CHECK FAILED: CTE block #{i+1} is missing required organization_id filter. Every CTE must include a filter on 'organizationId', 'parentId', or 'id' using the :organization_id parameter."
+                cte_has_filter = (
+                    # Look for parameter in CTE
+                    ":organization_id" in cte_block.lower() and 
+                    # Look for appropriate column in CTE
+                    any(
+                        f'"{col}"' in cte_block.lower() or f'"{col}" ' in cte_block.lower() 
+                        for col in ["organizationid", "parentid", "id"]
+                    )
+                )
+                
+                if not cte_has_filter:
+                    error_msg = f"SECURITY CHECK FAILED: CTE block #{i+1} is missing required organization_id filter. Every CTE must include ':organization_id' parameter with 'organizationId', 'parentId', or 'id' column."
                     logger.error(f"{log_prefix}{error_msg} CTE Block: {cte_block[:200]}...")
                     raise ValueError(error_msg)
             
@@ -166,8 +174,18 @@ class SQLExecutionTool(BaseTool):
             for i, subquery in enumerate(subqueries):
                 # Only check substantive subqueries (larger than a simple lookup)
                 if len(subquery) > 100:  # Arbitrary threshold to avoid checking simple subqueries
-                     if not check_filter(subquery):
-                        error_msg = f"SECURITY CHECK FAILED: Complex subquery #{i+1} is missing required organization_id filter. Each substantive subquery must include a filter on 'organizationId', 'parentId', or 'id' using the :organization_id parameter."
+                    subquery_has_filter = (
+                        # Look for parameter in subquery
+                        ":organization_id" in subquery.lower() and 
+                        # Look for appropriate column in subquery
+                        any(
+                            f'"{col}"' in subquery.lower() or f'"{col}" ' in subquery.lower() 
+                            for col in ["organizationid", "parentid", "id"]
+                        )
+                    )
+                    
+                    if not subquery_has_filter:
+                        error_msg = f"SECURITY CHECK FAILED: Complex subquery #{i+1} is missing required organization_id filter. Each substantive subquery must include ':organization_id' parameter with 'organizationId', 'parentId', or 'id' column."
                         logger.error(f"{log_prefix}{error_msg} Subquery: {subquery[:200]}...")
                         raise ValueError(error_msg)
             
@@ -266,37 +284,4 @@ class SQLExecutionTool(BaseTool):
              }
             return json.dumps(fallback_output, default=json_default)
 
-    # Explicitly define ainvoke for clarity and consistency
-    async def ainvoke(self, tool_input: Union[str, Dict], config: Optional[RunnableConfig] = None, **kwargs: Any) -> str:
-        """Execute the SQL query asynchronously."""
-        # Validate and parse the input using the tool's args_schema
-        try:
-            # Ensure input is a dictionary before passing to schema
-            if isinstance(tool_input, str):
-                # Attempt to parse if it's a JSON string, otherwise raise error
-                try:
-                    input_dict = json.loads(tool_input)
-                except json.JSONDecodeError:
-                    raise ValueError(f"Tool input must be a valid JSON string or a dictionary, received string: {tool_input[:100]}...")
-            elif isinstance(tool_input, dict):
-                input_dict = tool_input
-            else:
-                raise ValueError(f"Tool input must be a dictionary or JSON string, received {type(tool_input)}")
-                
-            # Use the args_schema for validation
-            validated_args = self.args_schema(**input_dict)
-            
-            # Extract arguments for _run from the validated model
-            sql = validated_args.sql
-            params = validated_args.params
-            db_name = validated_args.db_name # Takes default if not provided
-                
-        except ValidationError as e:
-            raise ValueError(f"Input validation failed for {self.name}: {e}") from e
-        except Exception as e:
-             # Catch other potential errors during parsing/validation
-            raise ValueError(f"Error processing input for {self.name}: {e}") from e
-        
-        # Directly await the _run method with validated arguments
-        # No need to pass run_manager explicitly, BaseTool handles callbacks via config
-        return await self._run(sql=sql, params=params, db_name=db_name)
+    # BaseTool handles ainvoke implementation for us when _run is async
