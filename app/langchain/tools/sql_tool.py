@@ -43,7 +43,8 @@ class SQLExecutionTool(BaseTool):
         """Execute SQL with parameters and return results (asynchronous version)."""
         log_prefix = f"[SQLExecutionTool] "
         logger.debug(f"{log_prefix}Executing SQL on DB '{db_name}'...")
-        MAX_ROWS = 50
+        # Use configurable MAX_ROWS from settings
+        MAX_ROWS = settings.MAX_SQL_RESULT_ROWS
         original_sql = sql
         
         # --- SQL Syntax Validation and Organization Check ---
@@ -130,8 +131,45 @@ class SQLExecutionTool(BaseTool):
         try:
             # Define valid org identifier column names from schema conventions
             # (We check if the :organization_id param is used with ANY of these quoted cols)
-            valid_org_id_cols = {"organizationId", "parentId", "id"} # Based on SCHEMA_DEFINITIONS structure
-            log_prefix = f"[SQLExecutionTool]"
+            # --- DYNAMICALLY DERIVE ORG ID COLS --- 
+            valid_org_id_cols = set()
+            if db_name in SCHEMA_DEFINITIONS:
+                # Access the 'tables' dictionary within the db definition
+                tables_dict = SCHEMA_DEFINITIONS[db_name].get("tables", {})
+                for table_name, table_def in tables_dict.items():
+                    # table_def is the dictionary for a single table
+                    # table_def['columns'] should be a LIST of column dictionaries
+                    column_list = table_def.get("columns", [])
+                    if not isinstance(column_list, list):
+                        logger.warning(f"{log_prefix}Unexpected structure for columns in table '{table_name}'. Expected list, got {type(column_list)}. Skipping table.")
+                        continue
+
+                    # Iterate through the list of column dictionaries
+                    for col_def in column_list:
+                        if not isinstance(col_def, dict) or "name" not in col_def:
+                            # Log unexpected column definition format
+                            logger.warning(f"{log_prefix}Unexpected column definition format found in table '{table_name}': {col_def}. Skipping column.")
+                            continue 
+                        
+                        col_name = col_def["name"]
+                        # Heuristic: Add columns commonly used for organization linkage
+                        if col_name == "organizationId":
+                            valid_org_id_cols.add("organizationId")
+                        elif col_name == "parentId":
+                            valid_org_id_cols.add("parentId")
+                        # Add 'id' only if the table is hierarchyCaches (specific known case)
+                        elif col_name == "id" and table_name == "hierarchyCaches":
+                            valid_org_id_cols.add("id")
+            else:
+                logger.warning(f"{log_prefix}Schema definition for db '{db_name}' not found. Falling back to default org ID columns.")
+            
+            if not valid_org_id_cols:
+                 logger.error(f"{log_prefix}Could not determine any valid organization ID columns for schema '{db_name}'. Using defaults.")
+                 valid_org_id_cols = {"organizationId", "parentId", "id"}
+            logger.debug(f"{log_prefix}Dynamically determined valid org ID columns for '{db_name}': {valid_org_id_cols}")
+            # --- END DYNAMIC DERIVATION ---
+            # Removed old hardcoded set: valid_org_id_cols = {"organizationId", "parentId", "id"} 
+            # <<< log_prefix redefinition removed >>>
 
             # Function to check if a SQL block has the required filter pattern
             def check_block_for_org_filter(sql_block: str, block_type: str) -> bool:
@@ -200,19 +238,63 @@ class SQLExecutionTool(BaseTool):
         # --- End Security Check for organization_id usage ---
 
         # --- Security Check: organization_id in parameters dictionary --- 
-        if 'organization_id' not in parameters:
+        org_id_param = parameters.get('organization_id')
+        if not org_id_param:
              error_msg = f"SECURITY CHECK FAILED: organization_id missing from parameters. Aborting."
              logger.error(f"{log_prefix}{error_msg}")
              raise ValueError(error_msg)
-        if parameters['organization_id'] != self.organization_id:
-            error_msg = f"SECURITY CHECK FAILED: organization_id mismatch in parameters. Expected {self.organization_id}, got {parameters.get('organization_id')}. Aborting."
-            logger.error(f"[SQLExecutionTool] {error_msg}")
+        
+        # <<< START UUID FORMAT VALIDATION >>>
+        try:
+            # Attempt to parse the provided org_id as a UUID
+            uuid.UUID(str(org_id_param))
+        except ValueError:
+             # Log the specific invalid ID found
+            logger.error(f"{log_prefix}SECURITY CHECK FAILED: Provided organization_id parameter '{org_id_param}' is not a valid UUID format. Aborting.")
+            raise ValueError("Invalid organization_id format provided in parameters.")
+        # <<< END UUID FORMAT VALIDATION >>>
+            
+        if str(org_id_param) != self.organization_id:
+            error_msg = f"SECURITY CHECK FAILED: organization_id mismatch in parameters. Expected {self.organization_id}, got {org_id_param}. Aborting."
+            logger.error(f"{log_prefix}{error_msg}")
             raise ValueError(error_msg)
         
-        # Log execution details
-        logger.debug(f"{log_prefix}Executing SQL: {sql[:500]}...")
-        logger.debug(f"{log_prefix}With Parameters: {parameters}")
+        # --- START Query Fingerprint Logging ---
+        try:
+            # Normalize query: lowercase, replace literals, remove comments
+            normalized_sql = sqlparse.format(original_sql, strip_comments=True, reindent=False, keyword_case='lower', identifier_case='lower', use_space_around_operators=False)
+            # Replace common literal types for better fingerprinting
+            normalized_sql = re.sub(r'\'.*?\'', '?', normalized_sql) # Replace string literals
+            normalized_sql = re.sub(r'\b\d+\.?\d*\b', '?', normalized_sql) # Replace numeric literals
+            # Generate a simple hash (fingerprint)
+            fingerprint = hex(hash(normalized_sql) & 0xffffffffffffffff) # Use 64-bit hash hex
+            logger.info(f"{log_prefix}Executing SQL (Fingerprint: {fingerprint}) on DB '{db_name}'.")
+        except Exception as fp_err:
+            logger.warning(f"{log_prefix}Failed to generate SQL fingerprint: {fp_err}. Proceeding without fingerprint.")
+            logger.info(f"{log_prefix}Executing SQL on DB '{db_name}'.") # Log without fingerprint on error
+        # --- END Query Fingerprint Logging ---
         
+        # <<< START Audit Logging >>>
+        try:
+             # Use default=str for non-serializable params like UUIDs
+            params_str = json.dumps(parameters, default=str)
+        except TypeError:
+             params_str = "Error serializing parameters"
+        logger.info(
+            f"SQL_SECURITY_AUDIT|org:{self.organization_id}|"
+            f"db:{db_name}|fingerprint:{fingerprint if 'fingerprint' in locals() else 'N/A'}|"
+            f"params:{params_str}"
+        )
+        # <<< END Audit Logging >>>
+
+        # Log parameters *after* fingerprinting/main exec log, before the actual execution block
+        logger.debug(f"{log_prefix}With Parameters: {parameters}")
+
+        # <<< START SQL Comment Injection >>>
+        # Prepend comment for tracing/auditing in DB logs
+        sql_with_comment = f"/* org_id={self.organization_id} tool={self.name} */\n{sql}"
+        # <<< END SQL Comment Injection >>>
+
         try:
             from app.db.connection import get_async_db_connection
             
@@ -221,9 +303,9 @@ class SQLExecutionTool(BaseTool):
                 timeout_seconds = settings.SQL_EXECUTION_TIMEOUT_SECONDS
                 logger.debug(f"{log_prefix}Applying asyncio timeout: {timeout_seconds} seconds.")
 
-                # Execute within the timeout window
+                # Execute within the timeout window (use sql_with_comment)
                 result = await asyncio.wait_for(
-                    conn.execute(text(sql), parameters),
+                    conn.execute(text(sql_with_comment), parameters),
                     timeout=timeout_seconds
                 )
 
@@ -282,17 +364,36 @@ class SQLExecutionTool(BaseTool):
             return json.dumps(results, default=json_default)
             
         except ValueError as ve:
-             logger.error(f"{log_prefix}Failed execution: {ve}", exc_info=False)
-             fallback_output = {
-                 "table": {"columns": ["Error"], "rows": [[f"Failed to execute query: {ve}"]]},
-                 "text": f"Error executing provided SQL: {ve}"
-             }
-             return json.dumps(fallback_output, default=json_default)
-        except Exception as e:
-            logger.exception(f"[SQLExecutionTool] Unexpected critical error during SQL execution for org {self.organization_id}, SQL: '{sql[:100]}...': {e}", exc_info=True)
+            logger.error(f"{log_prefix}Failed execution: {ve}", exc_info=False)
+            # Determine error type based on message content (simple heuristic)
+            error_type = "VALIDATION_ERROR"
+            if "took too long" in str(ve) or "timeout limit" in str(ve):
+                error_type = "TIMEOUT_ERROR"
+            elif "Invalid organization_id" in str(ve) or "SECURITY CHECK FAILED" in str(ve):
+                 error_type = "SECURITY_ERROR"
+            elif "failed validation" in str(ve) or "syntax error" in str(ve).lower(): # Check lower case for syntax
+                error_type = "SYNTAX_ERROR"
+            elif "executing the database query" in str(ve): # From SQLAlchemyError catch in _execute_sql
+                error_type = "EXECUTION_ERROR" 
+
             fallback_output = {
-                 "table": {"columns": ["Error"], "rows": [["An unexpected critical error occurred during execution."]]},
-                 "text": f"An unexpected critical error occurred while executing the query."
+                "error": {
+                    "type": error_type,
+                    "message": f"Failed to execute query: {ve}"
+                },
+                "table": None, # Indicate no table data on error
+                "text": f"Error executing provided SQL: {ve}" # Keep user-facing text simple
+            }
+            return json.dumps(fallback_output, default=json_default)
+        except Exception as e:
+            logger.exception(f"{log_prefix}Unexpected critical error during SQL execution for org {self.organization_id}, SQL: '{sql[:100]}...': {e}", exc_info=True)
+            fallback_output = {
+                 "error": {
+                     "type": "UNEXPECTED_ERROR",
+                     "message": "An unexpected critical error occurred during execution."
+                 },
+                 "table": None,
+                 "text": f"An unexpected critical error occurred while executing the query." # Keep user-facing text simple
              }
             return json.dumps(fallback_output, default=json_default)
 

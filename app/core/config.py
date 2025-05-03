@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     LLM_SUMMARY_TIME_PERIOD: int = Field(default=60, description="Time period in seconds for the summary tool's rate limiter.")
     SUBQUERY_TIMEOUT_SECONDS: int = Field(default=15, description="Timeout in seconds for individual subqueries in the summary tool.")
     SQL_EXECUTION_TIMEOUT_SECONDS: int = Field(default=30, description="Timeout in seconds for database query execution in SQLExecutionTool.")
+    MAX_SQL_RESULT_ROWS: int = 50 # Max rows to return from SQL query tool
     
     # Security
     SECRET_KEY: str = ""
