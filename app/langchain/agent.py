@@ -11,6 +11,7 @@ import datetime
 import re 
 import openai
 from openai import APIConnectionError, APITimeoutError, RateLimitError 
+import copy # Import copy for deep copying tables
 
 # LangChain & LangGraph Imports
 from langchain_core.messages import BaseMessage, FunctionMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
@@ -107,6 +108,8 @@ class AgentState(TypedDict):
     failure_patterns: Dict[str, List[Dict[str, Any]]] = Field(default_factory=dict)
     # Add field for recovery instructions when needed
     recovery_guidance: Optional[str] = None
+    # Add field to store the latest successful name resolution results
+    resolved_location_map: Optional[Dict[str, str]] = None
 
 
 # --- LLM and Tools Initialization ---
@@ -240,7 +243,8 @@ def agent_node(state: AgentState, llm_with_structured_output):
         "messages": [],
         "final_response_structure": None,
         "prompt_tokens": 0, # Initialize, will be updated if call succeeds
-        "completion_tokens": 0
+        "completion_tokens": 0,
+        "resolved_location_map": state.get("resolved_location_map") # Carry over map if exists
     }
 
     # Parser for the final response structure
@@ -355,6 +359,7 @@ def agent_node(state: AgentState, llm_with_structured_output):
     # --- End Adaptive Error Analysis ---
 
     try:
+        logger.debug(f"[AgentNode] Invoking LLM with state: {preprocessed_state}") # ADDED LOG
         llm_response = llm_with_structured_output.invoke(preprocessed_state)
         # --- ADDED: Debugging logs for raw LLM output --- #
         logger.debug(f"[AgentNode] Raw LLM response object type: {type(llm_response)}")
@@ -561,7 +566,11 @@ def agent_node(state: AgentState, llm_with_structured_output):
              # Clear tool calls from message history IF a final structure was set here
              return_dict["messages"] = [AIMessage(content=original_message.content, id=original_message.id, usage_metadata=original_message.usage_metadata)]
              # Ensure operational_calls list is empty if final structure is set
-             operational_calls = [] 
+             operational_calls = []
+        # Clear the resolved map when leaving agent node if final structure is set
+        # This prevents potentially stale maps being used later if the agent loops without resolving again
+        if "resolved_location_map" in return_dict:
+             return_dict["resolved_location_map"] = None
 
     # If operational calls were identified and a final_structure was NOT set, they remain in return_dict["messages"][0].tool_calls
     logger.debug(f"[AgentNode] Exiting agent node. Final Structure Set: {final_structure is not None}. Proceeding Tool Calls in Message History: {len(return_dict['messages'][0].tool_calls) if return_dict['messages'] and isinstance(return_dict['messages'][0], AIMessage) else 0}")
@@ -625,73 +634,191 @@ def _preprocess_state_for_llm(state: AgentState) -> AgentState:
 
     return processed_state
 
+# --- Helper Function to Apply Resolved IDs ---
+def _apply_resolved_ids_to_sql_args(sql: str, params: Dict[str, Any], resolved_map: Dict[str, str]) -> Tuple[str, Dict[str, Any]]:
+    """
+    Replaces name-based filters in SQL with ID-based filters using a resolved map.
+
+    Args:
+        sql: The original SQL query string.
+        params: The original parameters dictionary.
+        resolved_map: A dictionary mapping lowercase location names to resolved UUIDs.
+
+    Returns:
+        A tuple containing the modified SQL string and the updated parameters dictionary.
+    """
+    if not resolved_map:
+        return sql, params # No map, nothing to do
+
+    logger.debug(f"[SQL Correction] Applying resolved IDs. Map: {resolved_map}")
+    modified_sql = sql
+    updated_params = params.copy()
+    new_params_added = {}
+    param_counter = 0
+
+    # Define patterns for "hc."name" = 'Some Name'" and "hc."name" IN ('Name1', 'Name2')"
+    # Uses non-capturing groups (?:...) and case-insensitivity
+    # Looks for common hierarchy cache aliases like hc, h1, h2, etc. or the full table name
+    name_filter_pattern = re.compile(
+        r"""
+        (\b(?:hc|h\d*|hierarchyCaches)\."name"\s*) # Capture table alias and .name
+        (=|IN)\s*                                  # Capture operator (= or IN)
+        (\(?'[^)]+\)?')                             # Capture value(s) ('Name' or ('N1', 'N2'))
+        """,
+        re.IGNORECASE | re.VERBOSE
+    )
+
+    def replacer(match):
+        nonlocal param_counter
+        alias_dot_name, operator, values_str = match.groups()
+        alias = alias_dot_name.split('.')[0] # Extract alias like hc
+        names_to_resolve = []
+        new_param_dict = {}
+
+        if operator.upper() == 'IN':
+            # Extract names from ('Name1', 'Name2', ...)
+            names_to_resolve = [name.strip().strip("'\"") for name in values_str.strip("()").split(',')]
+        elif operator == '=':
+            # Extract single name from 'Name'
+            names_to_resolve = [values_str.strip().strip("'\"")]
+
+        resolved_ids = []
+        param_names_for_sql = []
+        for name in names_to_resolve:
+            lower_name = name.lower()
+            if lower_name in resolved_map:
+                resolved_id = resolved_map[lower_name]
+                resolved_ids.append(resolved_id)
+                # Generate unique param name for this ID
+                param_name = f"res_id_{param_counter}"
+                param_names_for_sql.append(f":{param_name}")
+                new_param_dict[param_name] = resolved_id
+                param_counter += 1
+            else:
+                logger.warning(f"[SQL Correction] Name '{name}' found in SQL filter but not in resolved map. Skipping.")
+
+        if not resolved_ids:
+            # If no names could be resolved, return original match to avoid breaking SQL
+            logger.warning(f"[SQL Correction] Could not resolve any names in filter: {match.group(0)}. Keeping original.")
+            return match.group(0)
+
+        # Update the main parameter dictionary
+        new_params_added.update(new_param_dict)
+
+        # Construct replacement SQL segment
+        id_column = f'{alias}."id"' # Use the alias captured
+        if len(resolved_ids) == 1:
+            return f'{id_column} = {param_names_for_sql[0]}'
+        else:
+            return f'{id_column} IN ({", ".join(param_names_for_sql)})'
+
+    modified_sql = name_filter_pattern.sub(replacer, modified_sql)
+
+    # Update the main params dictionary only if changes were made
+    if new_params_added:
+        updated_params.update(new_params_added)
+        # Remove original name parameters if they existed (less likely but possible)
+        # This part is complex as LLM might use :branch_name instead of literal strings
+        # For now, we focus on literal strings which was the observed failure mode
+        logger.info(f"[SQL Correction] Applied ID filters. Modified SQL: ...{modified_sql[-200:]}. Added params: {new_params_added}")
+    else:
+         logger.debug(f"[SQL Correction] No name filters found matching resolved map keys.")
+
+
+    return modified_sql, updated_params
+
 # --- Tool Node Handler ---
 async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[str, Any]:
     """
     Enhanced asynchronous tools node handler. Executes OPERATIONAL tools only.
-    Ignores FinalApiResponseStructure 'tool calls'.
-    Adds resulting tables to the state.
+    Corrects execute_sql calls using resolved IDs if available in state.
+    Adds resulting tables to the state and stores resolved ID map.
     """
     request_id = state.get("request_id")
     logger.debug(f"[ToolsNode] Entering tool handler.")
-    # Get last message, could be AIMessage with tool calls or others
     last_message = state["messages"][-1] if state["messages"] else None
     tool_map = {tool.name: tool for tool in tools}
     tool_executions = []
     new_messages = []
-    new_tables = [] # Only tables are extracted here now
+    new_tables = []
     successful_calls = 0
     operational_tool_calls = []
-    
+    latest_resolved_map = None # Track map resolved in this turn
+
     # Initialize update dictionary and failure tracking
-    update_dict = {}
-    failure_patterns = state.get("failure_patterns", {}).copy()  # Create a copy to avoid modifying the original
+    update_dict = {"resolved_location_map": None} # Default to clearing map
+    failure_patterns = state.get("failure_patterns", {}).copy()
 
     # Filter out non-operational "tool calls" (Final API Structure)
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
         operational_tool_calls = [
-            tc for tc in last_message.tool_calls 
-            if tc.get("name") != FinalApiResponseStructure.__name__ # Only filter out FinalApiResponseStructure
+            tc for tc in last_message.tool_calls
+            if tc.get("name") != FinalApiResponseStructure.__name__
         ]
 
     if not operational_tool_calls:
         logger.debug(f"[ToolsNode] No operational tool calls found in last message.")
-        return {} 
+        return update_dict # Return dict with map cleared
 
     logger.debug(f"[ToolsNode] Dispatching {len(operational_tool_calls)} operational tool calls: {[tc.get('name') for tc in operational_tool_calls]}")
+
     # Prepare tool execution details
     for tool_call in operational_tool_calls:
         tool_name = tool_call.get("name")
         tool_id = tool_call.get("id", "")
         tool_args = tool_call.get("args", {})
         if tool_name in tool_map:
-            # Use config setting for retries
             tool_executions.append({
-                "tool": tool_map[tool_name], 
-                "args": tool_args, 
-                "id": tool_id, 
-                "name": tool_name, 
+                "tool": tool_map[tool_name],
+                "args": tool_args,
+                "id": tool_id,
+                "name": tool_name,
                 "retries_left": settings.TOOL_EXECUTION_RETRIES
             })
         else:
              logger.error(f"[ToolsNode] Operational tool '{tool_name}' requested but not found.")
              new_messages.append(ToolMessage(
-                content=f"Error: Tool '{tool_name}' not found.", 
-                tool_call_id=tool_id, 
+                content=f"Error: Tool '{tool_name}' not found.",
+                tool_call_id=tool_id,
                 name=tool_name
              ))
 
     if not tool_executions:
         logger.warning(f"[ToolsNode] No operational tools could be prepared for execution.")
-        return {"messages": new_messages} if new_messages else {}
+        update_dict["messages"] = new_messages # Add error messages if any
+        return update_dict # Return dict with map cleared
 
     sem = asyncio.Semaphore(settings.MAX_CONCURRENT_TOOLS)
     # Define async execution function with retry logic
     async def execute_with_retry(execution_details):
-        tool = execution_details["tool"]
-        args = execution_details["args"]
-        tool_id = execution_details["id"]
+        # --- Apply SQL Correction BEFORE executing execute_sql ---
         tool_name = execution_details["name"]
+        args = execution_details["args"]
+        current_resolved_map = state.get("resolved_location_map") # Get map from CURRENT state
+
+        if tool_name == "execute_sql" and current_resolved_map:
+            logger.debug(f"[ToolsNode] Checking SQL args for potential ID correction using map: {current_resolved_map}")
+            original_sql = args.get("sql")
+            original_params = args.get("params")
+            if original_sql and original_params:
+                try:
+                    corrected_sql, corrected_params = _apply_resolved_ids_to_sql_args(
+                        original_sql, original_params, current_resolved_map
+                    )
+                    # Update args ONLY if changes were made
+                    if corrected_sql != original_sql or corrected_params != original_params:
+                        execution_details["args"] = {"sql": corrected_sql, "params": corrected_params}
+                        logger.info(f"[ToolsNode] Corrected SQL arguments for tool ID {execution_details['id']}")
+                        args = execution_details["args"] # Use corrected args for logging below
+                except Exception as correction_err:
+                     logger.error(f"[ToolsNode] Error applying SQL correction for tool {tool_name}: {correction_err}", exc_info=True)
+                     # Proceed with original args on correction error
+        # --- End SQL Correction ---
+
+        tool = execution_details["tool"]
+        # args = execution_details["args"] # Already defined above
+        tool_id = execution_details["id"]
+        # tool_name = execution_details["name"] # Already defined above
         retries = execution_details["retries_left"]
         try:
             async with sem:
@@ -701,12 +828,12 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
                  content_str = json.dumps(content, default=str) if isinstance(content, (dict, list)) else str(content)
                  logger.debug(f"[ToolsNode] Tool '{tool_name}' (ID: {tool_id}) completed.")
                  return {
-                     "success": True, 
-                     "message": ToolMessage(content=content_str, tool_call_id=tool_id, name=tool_name), 
-                     "raw_content": content, 
-                     "tool_name": tool_name, 
+                     "success": True,
+                     "message": ToolMessage(content=content_str, tool_call_id=tool_id, name=tool_name),
+                     "raw_content": content,
+                     "tool_name": tool_name,
                      "tool_id": tool_id,
-                     "args": args  # Include args in successful result
+                     "args": args
                  }
         except Exception as e:
             error_msg = str(e)
@@ -721,22 +848,22 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
             else:
                 logger.error(f"[ToolsNode] {error_msg_for_log}", exc_info=True)
                 return {
-                    "success": False, 
-                    "error": f"{error_msg_for_log}", 
-                    "error_message": error_msg,  # Store original error message separately
-                    "tool_name": tool_name, 
+                    "success": False,
+                    "error": f"{error_msg_for_log}",
+                    "error_message": error_msg,
+                    "tool_name": tool_name,
                     "tool_id": tool_id,
-                    "args": args  # Include args in failed result too
+                    "args": args
                 }
 
     results = await asyncio.gather(*[execute_with_retry(exec_data) for exec_data in tool_executions])
 
-    # Result processing: Extract only tables
+    # Result processing: Extract tables and potential new resolved map
     for result in results:
         tool_name = result.get("tool_name", "unknown")
         tool_id = result.get("tool_id", "")
         tool_args = result.get("args", {})
-        
+
         if result["success"]:
             successful_calls += 1
             new_messages.append(result["message"])
@@ -750,78 +877,93 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
                 except json.JSONDecodeError: parsed_content = raw_content
             else: parsed_content = raw_content
 
-            # Table extraction logic
+            # Table extraction logic for SQL tool
             if isinstance(parsed_content, dict):
                  if tool_name in ["sql_query", "execute_sql"]:
                      if isinstance(parsed_content.get("table"), dict): table_data = parsed_content["table"]
                      elif isinstance(parsed_content.get('columns'), list) and isinstance(parsed_content.get('rows'), list): table_data = parsed_content
-                     
+
                      if table_data and isinstance(table_data.get('columns'), list) and isinstance(table_data.get('rows'), list):
                          new_tables.append(table_data)
                          logger.info(f"[ToolsNode] Extracted table from '{tool_name}' with {len(table_data.get('rows', []))} rows")
                      elif table_data: logger.warning(f"[ToolsNode] '{tool_name}' invalid table structure. Keys: {list(table_data.keys())}")
+
+                 # Hierarchy Resolver: Extract the map to store in state
+                 elif tool_name == "hierarchy_name_resolver":
+                     resolution_results = parsed_content.get("resolution_results", {})
+                     if resolution_results:
+                         temp_map = {}
+                         for name, res_info in resolution_results.items():
+                             if res_info.get("status") == "found" and res_info.get("id"):
+                                 # Store lowercase name -> ID
+                                 temp_map[name.lower()] = str(res_info["id"])
+                         if temp_map:
+                             # --- MERGE results instead of overwriting ---
+                             if latest_resolved_map is None:
+                                 latest_resolved_map = {}
+                             latest_resolved_map.update(temp_map)
+                             # --- End Merge ---
+                             logger.info(f"[ToolsNode] Updated resolved location map with {len(temp_map)} entries. Current map: {latest_resolved_map}")
         else:
             # Handle tool execution failures and track patterns
             error_message = result.get("error_message", "Unknown error")
             logger.warning(f"[ToolsNode] Tool call '{tool_name}' (ID: {tool_id}) failed: {error_message}")
-            
+
             # Append to messages if not already present
             if not any(getattr(m, 'tool_call_id', None) == tool_id for m in new_messages if isinstance(m, ToolMessage)):
                 error_content = f"Tool execution failed: {error_message}"
                 new_messages.append(ToolMessage(content=error_content, tool_call_id=tool_id, name=tool_name))
-            
-            # Track failure patterns for later analysis
+
+            # Track failure patterns
             if tool_name not in failure_patterns:
                 failure_patterns[tool_name] = []
-            
-            # Create a unique signature for this failure
-            # Include more detailed information to help identify patterns
+
             args_hash = None
             try:
-                # Create a deterministic hash of the arguments
                 args_str = json.dumps(tool_args, sort_keys=True, default=str) if tool_args else ""
-                args_hash = hash(args_str)  # Simple hash for similarity detection
+                args_hash = hash(args_str)
             except Exception as hash_err:
                 logger.warning(f"[ToolsNode] Could not hash args for {tool_name}: {hash_err}")
                 args_hash = hash(str(tool_args)) if tool_args else None
-            
+
             failure_signature = {
                 "tool_id": tool_id,
                 "error_message": error_message,
                 "timestamp": datetime.datetime.now().isoformat(),
                 "args_hash": args_hash,
-                # Store a simplified version of the arguments for analysis
                 "args_summary": str(tool_args)[:100] if tool_args else None
             }
-            
-            # Add to failure patterns
+
             failure_patterns[tool_name].append(failure_signature)
-            
-            # Keep only last 5 failures per tool to prevent state bloat
             if len(failure_patterns[tool_name]) > 5:
                 failure_patterns[tool_name] = failure_patterns[tool_name][-5:]
 
-    # Update state: Only add messages and new tables
-    logger.info(f"[ToolsNode] Updating state with {len(new_messages)} messages, {len(new_tables)} tables, {len(failure_patterns)} failure patterns.")
-    
+    # Update state
+    logger.info(f"[ToolsNode] Updating state with {len(new_messages)} messages, {len(new_tables)} tables.")
+
     if new_messages:
         update_dict["messages"] = new_messages
-    
+
     if new_tables:
-        # Combine with existing tables from state correctly
         existing_tables = state.get('tables', [])
         combined_tables = existing_tables + new_tables
         logger.info(f"[ToolsNode] Found {len(new_tables)} new table(s). State will have {len(combined_tables)} total tables.")
         update_dict["tables"] = combined_tables
-    
-    # Add updated failure patterns to state
+
+    # Update failure patterns
     update_dict["failure_patterns"] = failure_patterns
-    
+
+    # Store the NEW resolved map if one was found this turn
+    if latest_resolved_map is not None:
+        update_dict["resolved_location_map"] = latest_resolved_map
+    # Otherwise, the default of None (clearing) remains
+
     # Preserve recovery guidance if present
     if "recovery_guidance" in state:
         update_dict["recovery_guidance"] = state["recovery_guidance"]
-        
+
     logger.info(f"[ToolsNode] Final update_dict keys before return: {list(update_dict.keys())}")
+    logger.debug(f"[ToolsNode] Returning update_dict: {update_dict}") # ADDED LOG
     return update_dict
 
 def _is_retryable_error(error: Exception) -> bool:
@@ -1074,7 +1216,7 @@ async def process_chat_message(
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
-    # Initialize agent state with failure pattern tracking
+    # Initialize agent state with failure pattern tracking AND resolved_location_map
     initial_state = AgentState(
         messages=initial_messages,
         tables=[],
@@ -1083,8 +1225,10 @@ async def process_chat_message(
         prompt_tokens=0,
         completion_tokens=0,
         failure_patterns={},
-        recovery_guidance=None
+        recovery_guidance=None,
+        resolved_location_map=None # Initialize as None
     )
+    logger.debug(f"[ProcessChatMessage] Initial state prepared: {initial_state}") 
 
     try:
         graph_app = create_graph_app(organization_id)
@@ -1096,6 +1240,7 @@ async def process_chat_message(
             config=RunnableConfig(recursion_limit=settings.MAX_GRAPH_ITERATIONS, configurable={})
         )
         logger.info(f"LangGraph workflow invocation complete.")
+        logger.debug(f"[ProcessChatMessage] Final state received from graph: {final_state}") # ADDED LOG
 
         # Track token usage
         total_prompt_tokens = final_state.get("prompt_tokens", 0)
@@ -1111,41 +1256,59 @@ async def process_chat_message(
                 chart_specs=[]
             )
         
-        # Process tables
+        # Process tables - Step 1: Determine which tables to include based on LLM flags
         tables_from_state = final_state.get("tables", [])
-        tables_to_include = []
-        
-        # Handle include_tables flags
+        tables_to_include_unformatted = []
         include_tables_flags = structured_response.include_tables
-        if include_tables_flags and len(tables_from_state) > 0:
-            # Ensure include_tables exists and has the right length
-            if not include_tables_flags:
-                # Generate default include_tables (all False)
-                logger.debug(f"No include_tables specified, defaulting all {len(tables_from_state)} tables to False")
-                include_tables_flags = [False] * len(tables_from_state)
-            elif len(include_tables_flags) < len(tables_from_state):
-                # Pad with False if too short
-                missing_count = len(tables_from_state) - len(include_tables_flags)
-                logger.debug(f"Padding include_tables with {missing_count} False values to match table count ({len(tables_from_state)})" )
-                include_tables_flags.extend([False] * missing_count)
-            elif len(include_tables_flags) > len(tables_from_state):
-                # Truncate if too long
-                logger.debug(f"Truncating include_tables from {len(include_tables_flags)} to match table count ({len(tables_from_state)})" )
-                include_tables_flags = include_tables_flags[:len(tables_from_state)]
-            
-            # Apply flags to filter tables
-            tables_to_include = [
-                table for idx, table in enumerate(tables_from_state)
-                if idx < len(include_tables_flags) and include_tables_flags[idx]
-            ]
         
+        if tables_from_state: # Only process flags if there are tables
+            # Ensure include_tables_flags has the right length (default to False)
+            if not include_tables_flags: 
+                include_tables_flags = [False] * len(tables_from_state)
+            elif len(include_tables_flags) != len(tables_from_state):
+                logger.warning(f"include_tables flag length mismatch ({len(include_tables_flags)}) vs table count ({len(tables_from_state)}). Adjusting flags.")
+                # Adjust length - pad with False or truncate
+                adjusted_flags = [False] * len(tables_from_state)
+                for i in range(min(len(include_tables_flags), len(tables_from_state))):
+                    adjusted_flags[i] = include_tables_flags[i]
+                include_tables_flags = adjusted_flags
+
+            # Apply flags to filter tables
+            tables_to_include_unformatted = [
+                table for idx, table in enumerate(tables_from_state)
+                if include_tables_flags[idx]
+            ]
+            
+        # Process tables - Step 2: Format numbers in selected tables
+        formatted_tables_to_include = []
+        if tables_to_include_unformatted:
+            logger.debug(f"Formatting float numbers for {len(tables_to_include_unformatted)} table(s) included in response.")
+            for table in tables_to_include_unformatted:
+                # Deep copy to avoid modifying potentially cached state data elsewhere
+                formatted_table = copy.deepcopy(table)
+                if 'rows' in formatted_table and isinstance(formatted_table['rows'], list):
+                    new_rows = []
+                    for row in formatted_table['rows']:
+                        if isinstance(row, list):
+                            new_row = []
+                            for cell in row:
+                                # Check if cell is a STANDARD FLOAT and represents a whole number
+                                if isinstance(cell, float) and not isinstance(cell, int) and cell.is_integer():
+                                    new_row.append(int(cell)) # Convert float 234.0 -> int 234
+                                else:
+                                    new_row.append(cell) # Keep other types (int, str, bool, Decimal handled by json_default)
+                            new_rows.append(new_row)
+                        else:
+                             new_rows.append(row) # Keep non-list rows as is
+                    formatted_table['rows'] = new_rows
+                formatted_tables_to_include.append(formatted_table)
+        # --- End Number Formatting --- 
+
         # Process charts using the dedicated function from charting.py
         visualizations = []
-        filtered_charts_info = [] # Initialize list for filtered info
+        filtered_charts_info = [] 
         chart_specs_from_llm = getattr(structured_response, "chart_specs", [])
         if chart_specs_from_llm:
-            logger.debug(f"Processing {len(chart_specs_from_llm)} chart specs from LLM...")
-            # Capture both return values from the updated function
             visualizations, filtered_charts_info = process_and_validate_chart_specs(chart_specs_from_llm, tables_from_state)
             logger.debug(f"Validated {len(visualizations)} chart specs for API response. Filtered out {len(filtered_charts_info)} specs.")
         else:
@@ -1166,11 +1329,11 @@ async def process_chat_message(
             final_text += warning_suffix
         # --- End text modification ---
         
-        # Build successful response
+        # Build successful response using formatted tables
         success_response["data"] = {
-            "text": final_text, # Use the potentially modified text
-            "tables": tables_to_include,
-            "visualizations": visualizations # Use the validated list
+            "text": final_text, 
+            "tables": formatted_tables_to_include, # Use the formatted tables
+            "visualizations": visualizations
         }
         
         # Log token usage
@@ -1186,7 +1349,7 @@ async def process_chat_message(
             "total_tokens": total_prompt_tokens + total_completion_tokens,
             "query": message,
             "response_length": len(structured_response.text),
-            "table_count": len(tables_to_include),
+            "table_count": len(formatted_tables_to_include),
             "visualization_count": len(visualizations)
         }))
         
