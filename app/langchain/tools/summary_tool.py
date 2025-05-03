@@ -3,10 +3,12 @@ import re
 import logging
 import asyncio
 import statistics
+import datetime
 from typing import Dict, List, Any, Optional, Tuple
 import inspect
+from functools import lru_cache
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 from langchain.tools import BaseTool
 from langchain.prompts import PromptTemplate
@@ -15,12 +17,15 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import SystemMessage, HumanMessage
 from openai import APIConnectionError, APITimeoutError, RateLimitError
 from sqlalchemy import text
+from aiolimiter import AsyncLimiter
 
 from app.core.config import settings
 from app.db.connection import get_async_db_connection
 from app.db.schema_definitions import SCHEMA_DEFINITIONS
 from app.langchain.tools.sql_tool import SQLExecutionTool
 from app.langchain.tools.hierarchy_resolver_tool import HierarchyNameResolverTool
+from app.utils import clean_json_response, json_default
+from app.prompts import SUMMARY_SQL_GENERATION_PROMPT, SUMMARY_SYNTHESIS_TEMPLATE, SUMMARY_DECOMPOSITION_TEMPLATE
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +124,22 @@ class SummarySynthesizerTool(BaseTool):
     """
     
     organization_id: str
+    # Declare injected tools as private attributes
+    _sql_tool: SQLExecutionTool = PrivateAttr()
+    _hierarchy_resolver: HierarchyNameResolverTool = PrivateAttr()
+    # Declare limiter as a private attribute for internal state
+    _limiter: AsyncLimiter = PrivateAttr()
     
+    def __init__(self, *, sql_tool: SQLExecutionTool, hierarchy_resolver: HierarchyNameResolverTool, **data):
+        """Initialize the tool, injecting dependencies."""
+        super().__init__(**data)
+        # Store injected tools
+        self._sql_tool = sql_tool
+        self._hierarchy_resolver = hierarchy_resolver
+        # Initialize rate limiter based on settings, using the private attribute name
+        self._limiter = AsyncLimiter(settings.LLM_SUMMARY_MAX_RATE, settings.LLM_SUMMARY_TIME_PERIOD)
+
+    @lru_cache(maxsize=1)
     def _get_schema_info(self) -> str:
         """Get database schema information for SQL generation."""
         logger.debug(f"[Org: {self.organization_id}] [SummaryTool] Fetching schema information")
@@ -176,61 +196,12 @@ class SummarySynthesizerTool(BaseTool):
                 max_retries=settings.LLM_MAX_RETRIES,
             )
             
-            # Updated template to extract descriptions and location names
-            template = """
-            You are a data analyst. Given the high-level query below, break it down into atomic subqueries.
-            Identify any specific location names (like "Main Library", "Argyle Branch") mentioned in relation to the data needed for each subquery.
-            **Aim for an efficient plan** respecting concurrency limits (max {max_concurrent_tools} subqueries).
-
-            HIGH-LEVEL QUERY:
-            {query}
-
-            DATABASE SCHEMA INFORMATION:
-            {schema_info}
-
-            CRITICAL REQUIREMENTS:
-            - For each subquery needed, provide a clear natural language description.
-            - For each subquery description, also list any specific location names (e.g., "Main Library", "Downtown Branch (DTB)") that the subquery relates to. Use the exact names as mentioned in the original query.
-            - If a subquery is organizational-wide or doesn't refer to a specific location, provide an empty list for location_names.
-            - Focus on the core data needed. Comparisons or complex calculations will be handled later.
-            - **Do NOT include UUIDs or parameter placeholders** in the descriptions or location names.
-            - Handle time-based queries appropriately by mentioning grouping periods (e.g., "monthly", "daily") in the description if trends are requested.
-
-            OUTPUT FORMAT:
-            Return ONLY a valid JSON array of objects. Each object must have two keys:
-            1. "description": A string containing the natural language description of the subquery.
-            2. "location_names": An array of strings, containing the exact location names relevant to this subquery (or an empty array [] if none).
-
-            EXAMPLE OUTPUT for query "Compare borrows for Main Library and Downtown Branch (DTB) last month":
-            ```json
-            [
-              {{
-                "description": "Retrieve total successful borrows (column \\"1\\" in events table \\"5\\") for Main Library last month",
-                "location_names": ["Main Library"]
-              }},
-              {{
-                "description": "Retrieve total successful borrows (column \\"1\\" in events table \\"5\\") for Downtown Branch (DTB) last month",
-                "location_names": ["Downtown Branch (DTB)"]
-              }}
-            ]
-            ```
-            
-            EXAMPLE OUTPUT for query "Summarize total renewals across the organization last week":
-            ```json
-            [
-              {{
-                "description": "Calculate the total number of renewals across the entire organization last week",
-                "location_names": []
-              }}
-            ]
-            ```
-            
-            Ensure the output is ONLY the JSON array, without any preamble or explanation.
-            """
+            # Updated template to extract descriptions and location names (Use imported template)
+            # template = """...""" # Removed original inline definition
             
             prompt = PromptTemplate(
                 input_variables=["query", "schema_info", "max_concurrent_tools"],
-                template=template
+                template=SUMMARY_DECOMPOSITION_TEMPLATE # Use imported constant
             )
             
             logger.debug(f"{log_prefix}Decomposing query with schema information...")
@@ -333,9 +304,10 @@ class SummarySynthesizerTool(BaseTool):
         failed_to_resolve = []
         
         try:
-            resolver = HierarchyNameResolverTool(organization_id=self.organization_id)
+            # Use the injected hierarchy resolver instance
+            # resolver = HierarchyNameResolverTool(organization_id=self.organization_id) # REMOVED
             # Resolve all unique names found
-            resolution_result = await resolver.ainvoke({"name_candidates": list(all_location_names)})
+            resolution_result = await self._hierarchy_resolver.ainvoke({"name_candidates": list(all_location_names)})
             resolution_data = resolution_result.get("resolution_results", {})
 
             successfully_resolved_count = 0
@@ -399,45 +371,13 @@ class SummarySynthesizerTool(BaseTool):
         location_context_str = "\n".join(location_param_context) if location_param_context else "No specific locations identified for this query."
         # --- End Preprocessing ---
         
-        # --- System Message Updated ---
-        system_message = f"""
-        You are an expert SQL query generation assistant. Convert the natural language query description into a PostgreSQL compatible SQL query.
-
-        **CRITICAL Instructions:**
-        1.  **Use ONLY the provided schema.** Do not assume tables/columns exist.
-        2.  **Table Specificity:** 
-            - Footfall data (columns \"39\", \"40\") is ONLY in table \"8\".
-            - Event metrics (borrows, returns, logins, etc.) are ONLY in table \"5\".
-            - DO NOT mix columns between these tables.
-        3.  **Quoting:** Double-quote ALL table and column names (e.g., \"5\", \"organizationId\").
-        4.  **Mandatory Filtering:** 
-            - Your query MUST ALWAYS filter by organization ID using `:organization_id`.
-            - Add `WHERE \"tableName\".\"organizationId\" = :organization_id`.
-            - If using CTEs or subqueries, EACH component MUST include its own independent `:organization_id` filter.
-        5.  **Location Filtering (Use Provided Parameter Names):**
-            {location_context_str}
-            - Ensure you use these exact parameter names (e.g., `:{param_name_for_llm}`) in your SQL `WHERE` clauses when filtering by location.
-        6.  **Parameters:** Use parameter placeholders (e.g., `:parameter_name`) for all dynamic values EXCEPT date/time functions.
-        7.  **SELECT Clause:** Select specific columns with descriptive aliases (e.g., `SUM(\"1\") AS \"Total Borrows\"`). Avoid `SELECT *`.
-        8.  **Performance:** Use appropriate JOINs, aggregations, and date functions. Add `LIMIT 50` to queries expected to return multiple rows.
-
-        **Database Schema:**
-        {schema_info}
-
-        **Output Format (JSON):**
-        Return ONLY a valid JSON object with 'sql' and 'params' keys.
-        ```json
-        {{
-          "sql": "Your SQL query using the specified parameter names (e.g., :organization_id, :{param_name_for_llm})",
-          "params": {{
-            "organization_id": "SECURITY_PARAM_ORG_ID",
-            "{param_name_for_llm}": "placeholder"  // The exact value here doesn't matter, it will be replaced
-            // Include other necessary parameter keys with placeholder values if needed
-          }}
-        }}
-        ```
-        **IMPORTANT:** In the `params` dictionary you return, include keys for `organization_id` and *all* the required location parameter names (e.g., `{param_name_for_llm}`). The *values* for these keys in your returned JSON can be simple placeholders like \"placeholder\" or \"value\"; they will be replaced correctly later.
-        """
+        # --- System Message (Uses Imported Prompt) ---
+        # Use imported prompt constant, formatted with dynamic info
+        system_message = SUMMARY_SQL_GENERATION_PROMPT.format(
+            location_context_str=location_context_str,
+            param_name_for_llm="{param_name_for_llm}", # Keep placeholder for LLM guidance
+            schema_info=schema_info
+        )
         # --- End System Message Update ---
         
         logger.debug(f"{log_prefix}LLM System Message for SQL Generation:\n{system_message}") # Log updated message
@@ -464,7 +404,7 @@ class SummarySynthesizerTool(BaseTool):
             
             logger.debug(f"{log_prefix}Raw LLM Output (SQL Generation):\n{sql_text}")
             
-            sql_text = self._clean_json_response(sql_text)
+            sql_text = clean_json_response(sql_text)
             
             try:
                 result_json = json.loads(sql_text)
@@ -522,88 +462,91 @@ class SummarySynthesizerTool(BaseTool):
         resolved_location_map: Dict[str, str],
         schema_info: str
     ) -> List[SubqueryResult]:
-        """Execute multiple subqueries concurrently and return their results."""
+        """Execute multiple subqueries concurrently and return their results, with timeouts."""
         log_prefix = f"[Org: {self.organization_id}] [SummaryTool] "
-        logger.info(f"{log_prefix}Executing {len(subquery_data)} subqueries concurrently")
+        logger.info(f"{log_prefix}Executing {len(subquery_data)} subqueries concurrently with timeout {settings.SUBQUERY_TIMEOUT_SECONDS}s")
         
         if not subquery_data:
             return []
             
-        sql_tool = SQLExecutionTool(organization_id=self.organization_id)
+        # Use the injected sql_tool instance
+        # sql_tool = SQLExecutionTool(organization_id=self.organization_id) # REMOVED
         
         tasks = []
         for i, subquery in enumerate(subquery_data):
             description = subquery.get("description", f"Subquery {i+1}")
+            # Create task with timeout
             task = asyncio.create_task(
-                self._generate_and_execute_single(
-                    sql_tool, 
-                    description, 
-                    resolved_location_map,
-                    schema_info
+                asyncio.wait_for(
+                    self._generate_and_execute_single(
+                        description, 
+                        resolved_location_map,
+                        schema_info
+                    ),
+                    timeout=settings.SUBQUERY_TIMEOUT_SECONDS # Apply timeout
                 )
             )
             tasks.append((description, task))
         
-        # Gather results as they complete
+        # Gather results as they complete, handling timeouts
         results = []
         for description, task in tasks:
             try:
-                result = await task
+                # Await the task (which includes the wait_for)
+                result_dict = await task 
                 
                 # --- Check if the result dictionary indicates an error from SQLExecutionTool --- 
                 is_error_structure = (
-                    isinstance(result, dict) and 
-                    isinstance(result.get("table"), dict) and
-                    result["table"].get("columns") == ["Error"]
+                    isinstance(result_dict, dict) and 
+                    isinstance(result_dict.get("table"), dict) and
+                    result_dict["table"].get("columns") == ["Error"]
                 )
                 
                 if is_error_structure:
-                    # This indicates _execute_sql caught an error (like security check or DB error)
-                    error_message = result.get("text", "Unknown error from SQL execution")
-                    logger.warning(f"{log_prefix}Subquery '{description}' failed during execution: {error_message}")
+                    # This indicates _execute_sql caught an error
+                    error_message = result_dict.get("text", "Unknown error from SQL execution")
+                    logger.warning(f"{log_prefix}Subquery '{description}' failed internally: {error_message}")
                     results.append(SubqueryResult(query=description, result={}, error=error_message))
-                elif isinstance(result, dict):
-                    # If await task SUCCEEDS (returns a valid data dict), append a successful result
-                    results.append(SubqueryResult(query=description, result=result, error=None))
+                elif isinstance(result_dict, dict):
+                    # Assume successful execution, result is the table data
+                    logger.debug(f"{log_prefix}Subquery '{description}' completed successfully.")
+                    # Store the full result which includes the table dict {'table': {'columns': ..., 'rows': ...}}
+                    results.append(SubqueryResult(query=description, result=result_dict, error=None))
                 else:
-                    # Handle unexpected return types from _generate_and_execute_single
-                    logger.error(f"{log_prefix}Subquery '{description}' returned unexpected type: {type(result)}")
-                    results.append(SubqueryResult(query=description, result={}, error=f"Unexpected result type: {type(result)}"))
+                    # Unexpected result type
+                    error_message = f"Unexpected result type from subquery execution: {type(result_dict)}"
+                    logger.error(f"{log_prefix}Subquery '{description}': {error_message}")
+                    results.append(SubqueryResult(query=description, result={}, error=error_message))
 
-            except ValueError as ve:
-                # Handle SQL generation/validation errors (expected errors from _generate_and_execute_single)
-                logger.warning(f"{log_prefix}Subquery '{description}' failed: {ve}")
-                results.append(SubqueryResult(query=description, result={}, error=str(ve)))
             except asyncio.TimeoutError:
-                logger.error(f"{log_prefix}Subquery '{description}' timed out.")
-                results.append(SubqueryResult(query=description, result={}, error="Query execution timed out"))
+                # Handle timeout specifically
+                error_message = f"Subquery timed out after {settings.SUBQUERY_TIMEOUT_SECONDS} seconds."
+                logger.warning(f"{log_prefix}Subquery '{description}': {error_message}")
+                results.append(SubqueryResult(query=description, result={}, error=error_message))
             except Exception as e:
-                # Catch any other unexpected errors during the await task or processing
-                logger.error(f"{log_prefix}Unexpected error processing subquery '{description}': {e}", exc_info=True)
-                results.append(SubqueryResult(query=description, result={}, error=f"Unexpected error: {str(e)}"))
-
-        # Log a summary of results
-        successful_queries = sum(1 for r in results if r.successful)
-        logger.info(f"{log_prefix}Completed {len(results)} subqueries. Success rate: {successful_queries}/{len(results)}")
+                # Handle other exceptions during task execution
+                error_message = f"Unexpected error executing subquery: {str(e)}"
+                logger.error(f"{log_prefix}Subquery '{description}': {error_message}", exc_info=True)
+                results.append(SubqueryResult(query=description, result={}, error=error_message))
+                
         return results
 
     async def _generate_and_execute_single(
         self, 
-        sql_tool: SQLExecutionTool, 
         description: str, 
         resolved_location_map: Dict[str, str],
         schema_info: str
     ) -> Dict[str, Any]:
-        """Generate and execute a single SQL query using SQLExecutionTool."""
+        """Generate and execute a single SQL query using the injected SQLExecutionTool."""
         log_prefix = f"[Org: {self.organization_id}] [SummaryTool] "
         
         try:
             # Generate SQL query with parameter placeholders
             sql, params = await self._generate_sql_and_params(description, resolved_location_map, schema_info)
             
-            # Execute SQL using SQLExecutionTool
-            # ainvoke now guarantees returning the awaited result due to explicit implementation
-            result_json_str = await sql_tool.ainvoke({
+            # Execute SQL using the injected SQLExecutionTool instance
+            # Use self._sql_tool instead of the passed parameter
+            result_json_str = await self._sql_tool.ainvoke({
                 "sql": sql,
                 "params": params
             })
@@ -686,11 +629,12 @@ class SummarySynthesizerTool(BaseTool):
         logger.debug(f"{log_prefix}Found {len(ids_to_resolve)} unique hierarchy IDs to resolve.")
         
         # Step 2: Resolve IDs to names in a single batch call
-        resolver = HierarchyNameResolverTool(organization_id=self.organization_id)
+        # Use the injected hierarchy resolver instance
+        # resolver = HierarchyNameResolverTool(organization_id=self.organization_id) # REMOVED
         id_name_map = {}
         
         try:
-            resolution_result = await resolver.ainvoke({"name_candidates": list(ids_to_resolve)})
+            resolution_result = await self._hierarchy_resolver.ainvoke({"name_candidates": list(ids_to_resolve)})
             resolution_data = resolution_result.get("resolution_results", {})
             
             # Build lookup map of ID → Name information
@@ -1184,35 +1128,8 @@ class SummarySynthesizerTool(BaseTool):
                 max_retries=settings.LLM_MAX_RETRIES,
             )
             
-            # Prepare the prompt template
-            template = """
-            You are an expert data analyst for a library system. Your job is to synthesize query results into a clear, concise summary.
-            
-            USER QUERY:
-            {query}
-            
-            CONTEXT:
-            {context}
-            
-            QUERY RESULTS:
-            {results}
-            
-            AUTOMATED INSIGHTS:
-            {insights}
-            
-            Your task is to create a helpful, informative summary that addresses the user's original query and highlights key findings.
-            
-            Guidelines:
-            - Be concise but thorough
-            - Highlight notable patterns or anomalies
-            - Include statistical context where relevant (e.g., changes over time, comparisons to averages)
-            - Use precise numbers rather than vague terms
-            - Structure your response for readability
-            - Do not invent data not present in the results
-            - Maintain a professional, objective tone
-            
-            SUMMARY:
-            """
+            # Updated template to extract descriptions and location names (Use imported template)
+            # template = """...""" # Removed original inline definition
             
             # Track success/error counts
             success_count = sum(1 for r in subquery_results if r.successful)
@@ -1273,7 +1190,8 @@ class SummarySynthesizerTool(BaseTool):
                 not insights.organizational_comparisons and not composite_metrics.success_rates):
                 insights_str += "No specific trends, anomalies, or comparisons were automatically detected in the data.\n"
             
-            prompt = PromptTemplate(input_variables=["query", "context", "results", "insights"], template=template)
+            # Use imported template constant directly
+            prompt = PromptTemplate(input_variables=["query", "context", "results", "insights"], template=SUMMARY_SYNTHESIS_TEMPLATE)
             synthesis_chain = prompt | llm | StrOutputParser()
             
             summary = synthesis_chain.invoke({

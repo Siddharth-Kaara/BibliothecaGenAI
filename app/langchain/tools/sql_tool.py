@@ -15,23 +15,9 @@ from pydantic import BaseModel, Field
 
 from app.core.config import settings
 from app.db.schema_definitions import SCHEMA_DEFINITIONS
+from app.utils import json_default
 
 logger = logging.getLogger(__name__)
-
-# Helper function for JSON serialization
-def json_default(obj):
-    if isinstance(obj, uuid.UUID):
-        # Convert UUID to string
-        return str(obj)
-    if isinstance(obj, (datetime.datetime, datetime.date, datetime.time)):
-        # Keep this for potential future use or if params contain dates
-        return obj.isoformat()
-    if isinstance(obj, decimal.Decimal):
-        # Convert Decimal to float for JSON serialization
-        # Use str(obj) if exact decimal representation as string is needed
-        return float(obj)
-    # Let the base class default method raise the TypeError
-    raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
 
 class SQLExecutionTool(BaseTool):
     """Tool for executing pre-generated SQL queries against databases, ensuring results are scoped to the user's organization."""
@@ -257,17 +243,11 @@ class SQLExecutionTool(BaseTool):
         try:
             results = await self._execute_sql(sql, params, db_name)
             row_count = len(results.get('rows', []))
-            logger.info(f"{log_prefix}Completed successfully. Returned {row_count} rows.")
+            logger.debug(f"{log_prefix}Completed successfully. Returned {row_count} rows.")
             
-            text_summary = f"Executed query successfully, retrieved {row_count} rows."
-            if results.get("metadata", {}).get("truncated"):
-                text_summary += f" (Results truncated to {results['metadata']['rows_shown']} rows from {results['metadata']['total_rows_returned']} total)."
-
-            output_dict = {
-                "table": results,
-                "text": text_summary
-            }
-            return json.dumps(output_dict, default=json_default)
+            # Return the entire result dictionary (containing columns/rows/metadata) serialized as JSON string
+            # Use the imported json_default from utils
+            return json.dumps(results, default=json_default)
             
         except ValueError as ve:
              logger.error(f"{log_prefix}Failed execution: {ve}", exc_info=False)

@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     TOOL_RETRY_DELAY: float = Field(default=1.0, description="Base delay in seconds between tool execution retries.")
     TOOL_EXECUTION_RETRIES: int = Field(default=2, description="Number of retries allowed for failed tool executions.")
     LLM_MAX_RETRIES: int = Field(default=2, description="Max retries for LLM calls via underlying client (total attempts = N+1).")
+    # Rate Limiter settings for Summary Tool LLM calls
+    LLM_SUMMARY_MAX_RATE: int = Field(default=10, description="Max calls allowed for Summary Tool LLM within the time period.")
+    LLM_SUMMARY_TIME_PERIOD: int = Field(default=60, description="Time period in seconds for the Summary Tool LLM rate limit.")
+    SUBQUERY_TIMEOUT_SECONDS: int = Field(default=60, description="Timeout in seconds for individual subqueries executed by SummarySynthesizerTool.")
     
     # Security
     SECRET_KEY: str = ""
