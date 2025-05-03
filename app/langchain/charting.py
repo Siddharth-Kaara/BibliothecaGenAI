@@ -2,6 +2,7 @@ import logging
 from typing import List, Optional, Dict, Any, Tuple
 from pydantic import BaseModel, Field
 import numbers # Import for checking numeric types
+import copy # Import copy for deep copying
 
 # Local Imports needed for type hints if we add functions later
 from app.schemas.chat import ApiChartSpecification, TableData
@@ -22,44 +23,105 @@ class ChartSpecFinalInstruction(BaseModel):
     x_label: Optional[str] = Field(default=None, description="Optional: A descriptive label for the X-axis. Defaults to x_column if not provided.")
     y_label: Optional[str] = Field(default=None, description="Optional: A descriptive label for the Y-axis. Defaults to y_column if not provided.")
 
+# --- NEW: Helper function to transform wide summary data for Pie charts ---
+def _transform_wide_summary_to_pie_data(
+    source_table: Dict[str, Any]
+    # Removed llm_spec_x_col, llm_spec_y_col parameters
+) -> Optional[Dict[str, Any]]:
+    """
+    Transforms a single-row, multi-column table (like a summary of multiple metrics)
+    into the 2-column (Category, Value) format required for pie charts.
+    It uses the original column names as the categories.
+
+    Args:
+        source_table: The original table data {'columns': [...], 'rows': [[...]]}.
+
+    Returns:
+        A new table dictionary in the format {'columns': ['Category', 'Value'], 'rows': [['Metric1', Val1], ['Metric2', Val2], ...]}
+        or None if transformation is not applicable or fails.
+    """
+    columns = source_table.get("columns", [])
+    rows = source_table.get("rows", [])
+
+    # Check if transformation is applicable: 1 row, >= 2 columns
+    if len(rows) != 1 or len(columns) < 2:
+        logger.debug("[_transform_wide_summary_to_pie_data] Skipping transformation: Data does not match 1 row, >=2 columns pattern.")
+        return None # Not the pattern we're targeting
+
+    try:
+        # Get the single row of data
+        row_data = rows[0]
+        if len(row_data) != len(columns):
+            logger.warning("[_transform_wide_summary_to_pie_data] Skipping transformation: Row length does not match column count.")
+            return None
+
+        # Create the new long-format data
+        new_columns = ["Category", "Value"]
+        new_rows = []
+        for i, col_name in enumerate(columns):
+             # Use the original column name as the category
+             value = row_data[i]
+             new_rows.append([col_name, value])
+
+        if not new_rows:
+            logger.warning("[_transform_wide_summary_to_pie_data] Transformation resulted in empty data.")
+            return None
+            
+        transformed_table = {
+            "columns": new_columns,
+            "rows": new_rows,
+            "metadata": {"transformed_for_pie": True} # Mark as transformed
+        }
+        logger.info(f"Successfully transformed wide summary data for pie chart. Original cols: {columns} -> New cols: {new_columns}")
+        return transformed_table
+
+    except (IndexError, TypeError) as e:
+        logger.warning(f"Failed to transform wide summary data for pie chart: {e}. Original cols: {columns}", exc_info=True)
+        return None # Transformation failed
+
 
 # --- Validation Functions for Specific Chart Types ---
 
 def _validate_pie_chart_spec(api_chart: ApiChartSpecification, columns: List[str], rows: List[List[Any]]) -> Tuple[bool, Optional[str]]:
     """Validates specs specifically for a pie chart.
-
-    Returns:
-        (is_valid: bool, failure_reason: Optional[str])
+       Assumes data might have been pre-transformed.
     """
     # Rule 1: No color column allowed
     if api_chart.color_column is not None:
         logger.warning(f"Pie chart spec '{api_chart.title}' had color_column '{api_chart.color_column}'. Invalid.")
-        api_chart.color_column = None # Attempt correction, but still mark invalid if it was present
-        # return False, "Pie charts should not have a color_column specified." # Strict: Fail if present
-        # Lenient: Correct and proceed for now
+        # Lenient: Backend should ensure color_column is null if transformation occurred. Frontend ignores it anyway.
+        # We will correct this in the main function if needed.
 
-    # Rule 2: Exactly 2 columns required (category, value)
+    # Rule 2: Exactly 2 columns required (category, value) - This validation runs AFTER potential transformation
     if len(columns) != 2:
-         logger.warning(f"Pie chart spec '{api_chart.title}': Source table does not have exactly 2 columns (has {len(columns)}). Invalid.")
-         return False, "Pie chart requires exactly 2 data columns (category, value)."
+         logger.warning(f"Pie chart spec '{api_chart.title}': Source table (potentially transformed) does not have exactly 2 columns (has {len(columns)}: {columns}). Invalid.")
+         return False, "Pie chart requires source data with exactly 2 columns (category, value)."
 
-    # Rule 3: Ensure x_column and y_column match the columns present
-    if not (api_chart.x_column == columns[0] and api_chart.y_column == columns[1]) and \
-       not (api_chart.x_column == columns[1] and api_chart.y_column == columns[0]):
-           logger.warning(f"Pie chart spec '{api_chart.title}': x/y columns ('{api_chart.x_column}', '{api_chart.y_column}') don't match source table columns {columns}. Invalid.")
-           # Attempt correction based on actual columns
-           api_chart.x_column = columns[0]
-           api_chart.y_column = columns[1]
-           # return False, "Pie chart x/y columns do not match the 2 source columns." # Strict: Fail
-           # Lenient: Correct and proceed for now
+    # Rule 3: Ensure x_column and y_column match the *actual* columns present
+    # The main function will have already enforced standard names ('Category', 'Value') if transformation occurred.
+    if api_chart.x_column not in columns or api_chart.y_column not in columns:
+           logger.warning(f"Pie chart spec '{api_chart.title}': Specified x/y columns ('{api_chart.x_column}', '{api_chart.y_column}') don't match actual source table columns {columns}. Invalid.")
+           # This check might be redundant if main function enforces names post-transformation, but good safety check.
+           return False, f"Pie chart x/y columns ('{api_chart.x_column}', '{api_chart.y_column}') not found in data columns {columns}."
+    
+    # Rule 3b: Check x and y are different columns
+    if api_chart.x_column == api_chart.y_column:
+           logger.warning(f"Pie chart spec '{api_chart.title}': x_column and y_column are the same ('{api_chart.x_column}'). Invalid.")
+           return False, "Pie chart x_column and y_column must be different."
 
     # Rule 4: Check if y_column data is numeric (check first row if available)
     if rows:
-        y_col_index = columns.index(api_chart.y_column)
-        first_row_y_val = rows[0][y_col_index]
-        if not isinstance(first_row_y_val, numbers.Number):
-            logger.warning(f"Pie chart spec '{api_chart.title}': y_column '{api_chart.y_column}' data ('{first_row_y_val}') does not appear numeric. Invalid.")
-            return False, f"Pie chart requires numeric data for the value column ('{api_chart.y_column}')."
+        # Find index based on potentially corrected column name
+        try:
+             y_col_index = columns.index(api_chart.y_column)
+             first_row_y_val = rows[0][y_col_index]
+             if not isinstance(first_row_y_val, numbers.Number):
+                 logger.warning(f"Pie chart spec '{api_chart.title}': y_column '{api_chart.y_column}' data ('{first_row_y_val}') does not appear numeric. Invalid.")
+                 return False, f"Pie chart requires numeric data for the value column ('{api_chart.y_column}')."
+        except (ValueError, IndexError):
+             # This case should be caught by Rule 3, but defensively check here too
+             logger.warning(f"Pie chart spec '{api_chart.title}': Could not find index for y_column '{api_chart.y_column}' in columns {columns}. Invalid.")
+             return False, f"Pie chart y_column '{api_chart.y_column}' not found in data columns."
 
     return True, None # All pie chart rules passed
 
@@ -171,16 +233,36 @@ def process_and_validate_chart_specs(
                 continue # Skip to next chart spec
             # --- End Type Hint Validation ---
             
-            # --- Prepare Data & Column List (Potentially Transform for Multi-Metric) ---
+            # --- Prepare Data & Column List (Potentially Transform for Multi-Metric OR Pie Chart) ---
             data_for_chart = source_table # Start with original
             columns_to_validate = columns # Start with original columns
             is_multi_metric = False
+            is_pie_transformed = False # Flag for pie transformation
             llm_specified_x_col = getattr(chart_spec, 'x_column', "") # Store original spec for checks
             llm_specified_y_col = getattr(chart_spec, 'y_column', "")
             llm_specified_color_col = getattr(chart_spec, 'color_column', None)
             
+            # --- START: Pie Chart Wide Summary Transformation ---
+            if type_hint == 'pie':
+                 # Check if source table looks like a wide summary (1 row, >= 2 cols)
+                 if len(rows) == 1 and len(columns) >= 2:
+                     logger.info(f"Pie chart '{spec_title}' detected wide summary data pattern (1 row, cols: {columns}). Attempting deterministic transformation.")
+                     # Attempt transformation - relies only on the data shape, ignores LLM column spec for this case.
+                     transformed_pie_data = _transform_wide_summary_to_pie_data(source_table)
+                     if transformed_pie_data:
+                         data_for_chart = transformed_pie_data
+                         columns_to_validate = transformed_pie_data["columns"] # Should be ['Category', 'Value']
+                         is_pie_transformed = True # Set flag
+                         logger.debug(f"Pie chart transformation successful. New columns: {columns_to_validate}")
+                     else:
+                         # Transformation failed, log and potentially invalidate
+                         logger.warning(f"Pie chart '{spec_title}' deterministic transformation from wide summary failed. Chart may be invalid.")
+                         # Keep original data for now, validation will likely fail it
+            # --- END: Pie Chart Wide Summary Transformation ---
+
             # Check for multi-metric bar/line case REQUIRING transformation
-            if type_hint in ['bar', 'line'] and llm_specified_color_col:
+            # Note: This runs AFTER pie check, transformation logic is separate
+            if not is_pie_transformed and type_hint in ['bar', 'line'] and llm_specified_color_col:
                  # CASE 1: LLM correctly specified Value/Metric columns AS PER PROMPT INSTRUCTIONS
                  if llm_specified_y_col == "Value" and llm_specified_color_col == "Metric":
                      logger.info(f"Chart spec '{spec_title}' correctly indicates multi-metric {type_hint}. Applying wide-to-long transformation.")
@@ -242,16 +324,17 @@ def process_and_validate_chart_specs(
             # --- End Data Preparation/Transformation ---
 
             # Create base API spec object AFTER potential transformation
+            # Use DEEP COPY to avoid modifying original spec object from LLM
             api_chart = ApiChartSpecification(
-                type_hint=type_hint,
+                type_hint=type_hint, # Use original field name 'type_hint'
                 title=spec_title,
-                # Use the column names FROM THE SPECIFICATION initially
-                x_column=llm_specified_x_col,
+                x_column=llm_specified_x_col, # Initial values from LLM spec
                 y_column=llm_specified_y_col,
                 color_column=llm_specified_color_col,
                 x_label=getattr(chart_spec, "x_label", None),
                 y_label=getattr(chart_spec, "y_label", None),
-                data=data_for_chart # Use potentially transformed data
+                # Ensure data is in TableData format before assigning
+                data=TableData(**copy.deepcopy(data_for_chart)) # Convert dict to TableData, ensure deep copy
             )
 
             # --- **ENFORCE Standard Columns if Transformation Occurred** ---
@@ -260,7 +343,19 @@ def process_and_validate_chart_specs(
                 api_chart.y_column = "Value"
                 api_chart.color_column = "Metric"
                 # x_column remains as specified by LLM (and used for transformation)
-                logger.debug(f"Enforced y_column='Value' and color_column='Metric' for chart '{spec_title}' due to successful transformation.")
+                logger.debug(f"Enforced y_column='Value' and color_column='Metric' for chart '{spec_title}' due to successful multi-metric transformation.")
+            elif is_pie_transformed:
+                 # If pie transformation happened, enforce Category/Value and null color
+                 api_chart.x_column = "Category" # Standard name from transformer
+                 api_chart.y_column = "Value"    # Standard name from transformer
+                 api_chart.color_column = None   # Pie must have null color
+                 logger.debug(f"Enforced x='Category', y='Value', color=null for chart '{spec_title}' due to successful pie transformation.")
+            elif type_hint == 'pie' and not is_pie_transformed:
+                 # If it's a pie chart that wasn't transformed (e.g., data was already correct, or failed validation earlier),
+                 # still enforce null color column as per pie chart rules.
+                 api_chart.color_column = None
+                 logger.debug(f"Enforced color_column=null for pie chart '{spec_title}' (no transformation occurred).")
+
             # --- End Enforcement ---
 
             # --- Generic Column Existence Validation & Correction (on potentially transformed columns) ---
@@ -302,19 +397,19 @@ def process_and_validate_chart_specs(
                  filtered_out_info.append({"title": spec_title, "reason": failure_reason})
                  continue
                  
-            # --- Type-Specific Validation (operates on potentially transformed data) ---
+            # --- Type-Specific Validation (operates on potentially transformed data and corrected spec) ---
             type_specific_valid = True
             type_specific_reason = None
-            current_rows = data_for_chart.get("rows", []) # Use potentially transformed rows
+            current_rows = api_chart.data.rows # Use data directly from TableData object
+            current_columns = api_chart.data.columns # Use columns directly from TableData object
 
             if type_hint == 'pie':
-                 # Pass potentially updated api_chart object if columns were corrected earlier?
-                 # Pie validation uses columns_to_validate which should be correct. 
-                 type_specific_valid, type_specific_reason = _validate_pie_chart_spec(api_chart, columns_to_validate, current_rows)
+                 # Pass the corrected api_chart object directly
+                 type_specific_valid, type_specific_reason = _validate_pie_chart_spec(api_chart, current_columns, current_rows)
             elif type_hint == 'bar':
-                 type_specific_valid, type_specific_reason = _validate_bar_chart_spec(api_chart, columns_to_validate, current_rows)
+                 type_specific_valid, type_specific_reason = _validate_bar_chart_spec(api_chart, current_columns, current_rows)
             elif type_hint == 'line':
-                 type_specific_valid, type_specific_reason = _validate_line_chart_spec(api_chart, columns_to_validate, current_rows)
+                 type_specific_valid, type_specific_reason = _validate_line_chart_spec(api_chart, current_columns, current_rows)
 
             if not type_specific_valid:
                 valid_chart = False

@@ -567,10 +567,11 @@ def agent_node(state: AgentState, llm_with_structured_output):
              return_dict["messages"] = [AIMessage(content=original_message.content, id=original_message.id, usage_metadata=original_message.usage_metadata)]
              # Ensure operational_calls list is empty if final structure is set
              operational_calls = []
-        # Clear the resolved map when leaving agent node if final structure is set
-        # This prevents potentially stale maps being used later if the agent loops without resolving again
-        if "resolved_location_map" in return_dict:
-             return_dict["resolved_location_map"] = None
+        # *** Persist resolved_location_map even when final structure is set ***
+        # The final processing step might need it to add context about missing data.
+        # If the map becomes stale due to complex loops, that's a different issue to address if observed.
+        # For now, prioritize providing context in the final response.
+        pass # Keep the map as it is in return_dict
 
     # If operational calls were identified and a final_structure was NOT set, they remain in return_dict["messages"][0].tool_calls
     logger.debug(f"[AgentNode] Exiting agent node. Final Structure Set: {final_structure is not None}. Proceeding Tool Calls in Message History: {len(return_dict['messages'][0].tool_calls) if return_dict['messages'] and isinstance(return_dict['messages'][0], AIMessage) else 0}")
@@ -739,15 +740,11 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
     last_message = state["messages"][-1] if state["messages"] else None
     tool_map = {tool.name: tool for tool in tools}
     tool_executions = []
-    new_messages = []
-    new_tables = []
     successful_calls = 0
     operational_tool_calls = []
-    latest_resolved_map = None # Track map resolved in this turn
 
-    # Initialize update dictionary and failure tracking
-    update_dict = {"resolved_location_map": None} # Default to clearing map
-    failure_patterns = state.get("failure_patterns", {}).copy()
+    # Initialize structure to hold map resolved ONLY in this turn
+    location_map_this_turn = {} # Initialize map for THIS turn's results
 
     # Filter out non-operational "tool calls" (Final API Structure)
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
@@ -758,7 +755,12 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
 
     if not operational_tool_calls:
         logger.debug(f"[ToolsNode] No operational tool calls found in last message.")
-        return update_dict # Return dict with map cleared
+        return {
+            "messages": [],
+            "tables": [],
+            "failure_patterns": state.get("failure_patterns", {}),
+            "recovery_guidance": state.get("recovery_guidance"),
+        }
 
     logger.debug(f"[ToolsNode] Dispatching {len(operational_tool_calls)} operational tool calls: {[tc.get('name') for tc in operational_tool_calls]}")
 
@@ -777,7 +779,7 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
             })
         else:
              logger.error(f"[ToolsNode] Operational tool '{tool_name}' requested but not found.")
-             new_messages.append(ToolMessage(
+             tool_executions.append(ToolMessage(
                 content=f"Error: Tool '{tool_name}' not found.",
                 tool_call_id=tool_id,
                 name=tool_name
@@ -785,8 +787,12 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
 
     if not tool_executions:
         logger.warning(f"[ToolsNode] No operational tools could be prepared for execution.")
-        update_dict["messages"] = new_messages # Add error messages if any
-        return update_dict # Return dict with map cleared
+        return {
+            "messages": [ToolMessage(content="Error: No operational tools could be prepared for execution.", tool_call_id="", name="")],
+            "tables": [],
+            "failure_patterns": state.get("failure_patterns", {}),
+            "recovery_guidance": state.get("recovery_guidance"),
+        }
 
     sem = asyncio.Semaphore(settings.MAX_CONCURRENT_TOOLS)
     # Define async execution function with retry logic
@@ -858,7 +864,12 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
 
     results = await asyncio.gather(*[execute_with_retry(exec_data) for exec_data in tool_executions])
 
-    # Result processing: Extract tables and potential new resolved map
+    # --- Result processing: Extract tables and potential new resolved map ---
+    new_messages = [] # Initialize lists for THIS turn's results here
+    new_tables = []
+    # Copy failure patterns from input state to potentially update them
+    failure_patterns = state.get("failure_patterns", {}).copy() # <<< Copy failure patterns here
+
     for result in results:
         tool_name = result.get("tool_name", "unknown")
         tool_id = result.get("tool_id", "")
@@ -871,53 +882,69 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
             table_data = None
             parsed_content = None
 
-            # JSON parsing logic
+            # JSON parsing logic - Enhanced to handle potential nested structures
             if isinstance(raw_content, str):
-                try: parsed_content = json.loads(raw_content)
-                except json.JSONDecodeError: parsed_content = raw_content
-            else: parsed_content = raw_content
+                try: 
+                    parsed_content = json.loads(raw_content)
+                except json.JSONDecodeError:
+                    # If direct parsing fails, it might be simple string output
+                    parsed_content = raw_content
+                    logger.debug(f"Tool {tool_name} returned non-JSON string content: {raw_content[:100]}")
+            elif isinstance(raw_content, dict):
+                # If it's already a dict, use it directly
+                parsed_content = raw_content
+            else:
+                # Handle other types if necessary (e.g., lists, primitives)
+                parsed_content = raw_content
+                logger.debug(f"Tool {tool_name} returned non-dict/non-string content of type {type(raw_content)}")
 
-            # Table extraction logic for SQL tool
-            if isinstance(parsed_content, dict):
-                 if tool_name in ["sql_query", "execute_sql"]:
-                     if isinstance(parsed_content.get("table"), dict): table_data = parsed_content["table"]
-                     elif isinstance(parsed_content.get('columns'), list) and isinstance(parsed_content.get('rows'), list): table_data = parsed_content
+            # Table extraction logic for SQL tool - only add SUCCESSFUL data tables
+            if tool_name in ["sql_query", "execute_sql"]:
+                # Check various possible structures for the actual table data
+                if isinstance(parsed_content, dict):
+                    if isinstance(parsed_content.get("table"), dict) and \
+                       isinstance(parsed_content["table"].get("columns"), list) and \
+                       isinstance(parsed_content["table"].get("rows"), list):
+                        table_data = parsed_content["table"]
+                    elif isinstance(parsed_content.get('columns'), list) and \
+                         isinstance(parsed_content.get('rows'), list):
+                        # Check if it's NOT an error table structure returned by the tool on failure
+                        if not (len(parsed_content["columns"]) == 1 and parsed_content["columns"][0].lower() == "error"):
+                            table_data = parsed_content
+                        else:
+                             logger.warning(f"[ToolsNode] Tool '{tool_name}' returned an error table structure despite success=True. Ignoring table.")
+                    
+                if table_data: # Append ONLY if valid data table found
+                    new_tables.append(table_data)
+                    logger.info(f"[ToolsNode] Extracted table from successful '{tool_name}' call with {len(table_data.get('rows', []))} rows")
+                elif isinstance(parsed_content, dict):
+                    # Log if it looked like a dict but didn't contain a valid table structure
+                    logger.warning(f"[ToolsNode] Successful '{tool_name}' call returned dict, but no valid table structure found. Keys: {list(parsed_content.keys())}")
 
-                     if table_data and isinstance(table_data.get('columns'), list) and isinstance(table_data.get('rows'), list):
-                         new_tables.append(table_data)
-                         logger.info(f"[ToolsNode] Extracted table from '{tool_name}' with {len(table_data.get('rows', []))} rows")
-                     elif table_data: logger.warning(f"[ToolsNode] '{tool_name}' invalid table structure. Keys: {list(table_data.keys())}")
+            # Hierarchy Resolver: Update the map for THIS TURN
+            elif tool_name == "hierarchy_name_resolver" and isinstance(parsed_content, dict):
+                resolution_results = parsed_content.get("resolution_results", {})
+                if resolution_results:
+                    temp_map = {}
+                    for name, res_info in resolution_results.items():
+                        if res_info.get("status") == "found" and res_info.get("id"):
+                            temp_map[name.lower()] = str(res_info["id"])
+                    if temp_map:
+                        # Update the map specific to this execution pass
+                        location_map_this_turn.update(temp_map) # <<< Update this turn's map
+                        logger.info(f"[ToolsNode] Updated resolved location map this turn with {len(temp_map)} entries.")
 
-                 # Hierarchy Resolver: Extract the map to store in state
-                 elif tool_name == "hierarchy_name_resolver":
-                     resolution_results = parsed_content.get("resolution_results", {})
-                     if resolution_results:
-                         temp_map = {}
-                         for name, res_info in resolution_results.items():
-                             if res_info.get("status") == "found" and res_info.get("id"):
-                                 # Store lowercase name -> ID
-                                 temp_map[name.lower()] = str(res_info["id"])
-                         if temp_map:
-                             # --- MERGE results instead of overwriting ---
-                             if latest_resolved_map is None:
-                                 latest_resolved_map = {}
-                             latest_resolved_map.update(temp_map)
-                             # --- End Merge ---
-                             logger.info(f"[ToolsNode] Updated resolved location map with {len(temp_map)} entries. Current map: {latest_resolved_map}")
-        else:
-            # Handle tool execution failures and track patterns
+        else: # Handle tool execution failures
             error_message = result.get("error_message", "Unknown error")
             logger.warning(f"[ToolsNode] Tool call '{tool_name}' (ID: {tool_id}) failed: {error_message}")
-
-            # Append to messages if not already present
+            # ... (Construct ToolMessage with error content) ...
             if not any(getattr(m, 'tool_call_id', None) == tool_id for m in new_messages if isinstance(m, ToolMessage)):
-                error_content = f"Tool execution failed: {error_message}"
-                new_messages.append(ToolMessage(content=error_content, tool_call_id=tool_id, name=tool_name))
+                 new_messages.append(ToolMessage(content=error_message, tool_call_id=tool_id, name=tool_name))
 
             # Track failure patterns
             if tool_name not in failure_patterns:
                 failure_patterns[tool_name] = []
-
+            # ... (Hashing logic for args_hash) ...
             args_hash = None
             try:
                 args_str = json.dumps(tool_args, sort_keys=True, default=str) if tool_args else ""
@@ -925,7 +952,7 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
             except Exception as hash_err:
                 logger.warning(f"[ToolsNode] Could not hash args for {tool_name}: {hash_err}")
                 args_hash = hash(str(tool_args)) if tool_args else None
-
+            
             failure_signature = {
                 "tool_id": tool_id,
                 "error_message": error_message,
@@ -933,37 +960,32 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
                 "args_hash": args_hash,
                 "args_summary": str(tool_args)[:100] if tool_args else None
             }
-
+            
             failure_patterns[tool_name].append(failure_signature)
             if len(failure_patterns[tool_name]) > 5:
                 failure_patterns[tool_name] = failure_patterns[tool_name][-5:]
+            
+            # CRITICAL: Ensure no error table is added to new_tables
 
-    # Update state
+    # --- Update state ---
     logger.info(f"[ToolsNode] Updating state with {len(new_messages)} messages, {len(new_tables)} tables.")
 
-    if new_messages:
-        update_dict["messages"] = new_messages
+    # Construct the update dictionary AFTER processing all results
+    update_dict: AgentState = {
+        "messages": new_messages, # Messages from THIS turn
+        "tables": new_tables,    # Tables extracted THIS turn
+        "failure_patterns": failure_patterns, # Potentially updated failure patterns
+        # Preserve recovery guidance from the input state
+        "recovery_guidance": state.get("recovery_guidance"),
+    }
 
-    if new_tables:
-        existing_tables = state.get('tables', [])
-        combined_tables = existing_tables + new_tables
-        logger.info(f"[ToolsNode] Found {len(new_tables)} new table(s). State will have {len(combined_tables)} total tables.")
-        update_dict["tables"] = combined_tables
-
-    # Update failure patterns
-    update_dict["failure_patterns"] = failure_patterns
-
-    # Store the NEW resolved map if one was found this turn
-    if latest_resolved_map is not None:
-        update_dict["resolved_location_map"] = latest_resolved_map
-    # Otherwise, the default of None (clearing) remains
-
-    # Preserve recovery guidance if present
-    if "recovery_guidance" in state:
-        update_dict["recovery_guidance"] = state["recovery_guidance"]
+    # Conditionally add the resolved map IF the resolver ran successfully THIS turn
+    if location_map_this_turn: # Check if the map for this turn has entries
+        update_dict["resolved_location_map"] = location_map_this_turn
+    # Otherwise, the key is omitted, preserving the existing state value
 
     logger.info(f"[ToolsNode] Final update_dict keys before return: {list(update_dict.keys())}")
-    logger.debug(f"[ToolsNode] Returning update_dict: {update_dict}") # ADDED LOG
+    logger.debug(f"[ToolsNode] Returning update_dict: {update_dict}")
     return update_dict
 
 def _is_retryable_error(error: Exception) -> bool:
@@ -1318,18 +1340,99 @@ async def process_chat_message(
         final_text = structured_response.text
         if filtered_charts_info:
             logger.info(f"Modifying text response as {len(filtered_charts_info)} chart(s) were filtered out.")
-            # Construct a message about the filtered charts
-            filtered_titles = [info.get('title', 'Untitled Chart') for info in filtered_charts_info]
-            if len(filtered_titles) == 1:
-                warning_suffix = f"\n\n(Note: A chart titled \"{filtered_titles[0]}\" was generated but could not be displayed due to data formatting issues.)"
-            else:
-                 warning_suffix = f"\n\n(Note: {len(filtered_titles)} charts (including \"{filtered_titles[0]}\") were generated but could not be displayed due to data formatting issues.)"
+            # --- REPLACEMENT Logic --- 
+            # Instead of appending, replace the original text if any chart failed validation.
+            # TODO: Could potentially try to salvage parts of the original text if some charts succeeded,
+            # but replacing entirely is safer to avoid misleading the user.
             
-            # Append the warning to the original text
-            final_text += warning_suffix
+            failed_titles = [info.get('title', 'Untitled Chart') for info in filtered_charts_info]
+            
+            if not visualizations: # All requested charts failed
+                 final_text = f"I found the data you requested, but I encountered an issue generating the visualization ('{failed_titles[0]}') due to internal issues."
+            else: # Some charts succeeded, some failed
+                 # Mention successful charts if possible (Requires knowing their titles/types)
+                 # For now, use a generic message indicating partial failure.
+                 final_text = f"I have prepared the visualization(s) shown below. However, I couldn't generate all requested charts (like '{failed_titles[0]}') due to internal issues."
+            # --- End Replacement Logic ---
         # --- End text modification ---
         
-        # Build successful response using formatted tables
+        # --- START: Add context about missing requested entities (REVISED LOGIC) ---
+        resolved_map_from_state = final_state.get('resolved_location_map')
+        all_messages = final_state.get('messages', [])
+        successful_tables = [
+            table for table in final_state.get('tables', [])
+            if not (isinstance(table, dict) and table.get('columns') and len(table['columns']) == 1 and table['columns'][0].lower() == 'error')
+        ]
+
+        if resolved_map_from_state and successful_tables:
+            # Get the map of originally requested names -> successfully resolved names
+            requested_to_resolved_name_map = {}
+            for msg in all_messages:
+                if isinstance(msg, ToolMessage) and msg.name == 'hierarchy_name_resolver':
+                    try:
+                        content_data = json.loads(msg.content)
+                        res_results = content_data.get('resolution_results', {})
+                        for req_name, res_info in res_results.items():
+                            if res_info.get('status') == 'found' and res_info.get('resolved_name'):
+                                requested_to_resolved_name_map[req_name] = res_info['resolved_name']
+                    except json.JSONDecodeError:
+                        continue # Ignore malformed messages
+
+            # Find which successfully resolved names are actually missing from ALL successful tables
+            missing_resolved_names = []
+            name_col_candidates = ["Branch Name", "Location Name", "name"] # Prioritize these
+
+            if requested_to_resolved_name_map:
+                for resolved_name in requested_to_resolved_name_map.values():
+                    found_in_any_table = False
+                    for table in successful_tables:
+                        if not isinstance(table, dict) or not table.get('columns') or not table.get('rows'):
+                            continue # Skip malformed tables
+                        
+                        cols = table['columns']
+                        rows = table['rows']
+                        possible_name_col_indices = []
+
+                        # Prioritize standard name columns
+                        for idx, col_name in enumerate(cols):
+                            if col_name in name_col_candidates:
+                                possible_name_col_indices.append(idx)
+                        
+                        # If no standard name found, consider all string columns as potential name columns
+                        if not possible_name_col_indices:
+                             for idx, col_name in enumerate(cols):
+                                 # Check if first row's data for this column is string (simple heuristic)
+                                 if rows and isinstance(rows[0], list) and len(rows[0]) > idx and isinstance(rows[0][idx], str):
+                                     possible_name_col_indices.append(idx)
+
+                        # Check for the resolved_name in the identified columns for this table
+                        for name_col_index in possible_name_col_indices:
+                            for row in rows:
+                                if isinstance(row, list) and len(row) > name_col_index and row[name_col_index] == resolved_name:
+                                    found_in_any_table = True
+                                    break # Found in this column, stop checking rows
+                            if found_in_any_table:
+                                break # Found in this table, stop checking columns
+                        
+                        if found_in_any_table:
+                             break # Found in any table, stop checking tables for this resolved_name
+
+                    # If not found after checking all tables, add to missing list
+                    if not found_in_any_table:
+                        missing_resolved_names.append(resolved_name)
+                
+            # Modify the final text if needed
+            if missing_resolved_names:
+                missing_names_str = ", ".join(sorted(list(set(missing_resolved_names))))
+                missing_note = f" (Note: Data for {missing_names_str} was not found for the specified period.)"
+                if final_text.endswith('.'):
+                    final_text = final_text[:-1] + missing_note
+                else:
+                    final_text += missing_note
+                logger.info(f"Appended note about missing data for: {missing_names_str}")
+        # --- END: Add context about missing requested entities ---
+        
+        # Build successful response using formatted tables and potentially modified text
         success_response["data"] = {
             "text": final_text, 
             "tables": formatted_tables_to_include, # Use the formatted tables

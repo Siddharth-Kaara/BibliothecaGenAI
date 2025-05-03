@@ -41,8 +41,9 @@ class Settings(BaseSettings):
     LLM_MAX_RETRIES: int = Field(default=2, description="Max retries for LLM calls via underlying client (total attempts = N+1).")
     # Rate Limiter settings for Summary Tool LLM calls
     LLM_SUMMARY_MAX_RATE: int = Field(default=10, description="Max calls allowed for Summary Tool LLM within the time period.")
-    LLM_SUMMARY_TIME_PERIOD: int = Field(default=60, description="Time period in seconds for the Summary Tool LLM rate limit.")
-    SUBQUERY_TIMEOUT_SECONDS: int = Field(default=60, description="Timeout in seconds for individual subqueries executed by SummarySynthesizerTool.")
+    LLM_SUMMARY_TIME_PERIOD: int = Field(default=60, description="Time period in seconds for the summary tool's rate limiter.")
+    SUBQUERY_TIMEOUT_SECONDS: int = Field(default=15, description="Timeout in seconds for individual subqueries in the summary tool.")
+    SQL_EXECUTION_TIMEOUT_SECONDS: int = Field(default=30, description="Timeout in seconds for database query execution in SQLExecutionTool.")
     
     # Security
     SECRET_KEY: str = ""
