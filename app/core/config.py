@@ -95,9 +95,11 @@ class Settings(BaseSettings):
                 if "=" not in db_config:
                     continue
                 db_name, db_url = db_config.split("=", 1)
+                stripped_name = db_name.strip().strip('"')
+                stripped_url = db_url.strip().strip('"')
                 db_configs.append({
-                    "name": db_name.strip(),
-                    "url": db_url.strip()
+                    "name": stripped_name,
+                    "url": stripped_url
                 })
             # Assign directly to the attribute on the instance
             values.POSTGRES_SERVERS = db_configs

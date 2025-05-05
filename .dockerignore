@@ -1,0 +1,41 @@
+# Git files
+.git
+.gitignore
+
+# Docker files
+Dockerfile*
+docker-compose.yml
+
+# Python cache and virtual environment
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Environment files
+.env*
+
+# IDE files
+.vscode/
+.idea/
+
+# Log files
+logs/
+*.log
+
+# Test artifacts
+.pytest_cache/
+htmlcov/
+.coverage*
+
+# OS generated files
+*.DS_Store
+Thumbs.db
+
+# Static files (explicitly ignore)
+/static/
+
+# Local tools/files
+cost_calculator.html
+/logs/
+/docs/ 

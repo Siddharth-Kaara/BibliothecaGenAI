@@ -1150,7 +1150,8 @@ class SummarySynthesizerTool(BaseTool):
                 
                 limited_rows = table_data.get("rows", [])[:5]
                 columns = table_data.get("columns", [])
-                results_str += f"Results (showing up to 5 rows): {json.dumps({"columns": columns, "rows": limited_rows}, indent=2)}\n"
+                json_output = json.dumps({"columns": columns, "rows": limited_rows}, indent=2)
+                results_str += f"Results (showing up to 5 rows): {json_output}\n"
                 results_str += f"Total rows in original result: {len(table_data.get('rows', []))}\n\n"
             
             # Add warning if partial data
