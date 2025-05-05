@@ -41,4 +41,10 @@ fi
 echo "Starting Uvicorn server..."
 echo "Current PATH: $PATH"
 echo "Locating uvicorn: $(which uvicorn || echo 'uvicorn not found by which')"
-exec uvicorn app.main:app --host 0.0.0.0 --port 80 
+exec uvicorn app.main:app \
+    --host 0.0.0.0 \
+    --port 80 \
+    --workers $(( $(nproc) * 2 + 1 )) \  # Optimal worker count formula
+    --timeout-keep-alive 30 \
+    --limit-concurrency 1000 \
+    --limit-max-requests 10000

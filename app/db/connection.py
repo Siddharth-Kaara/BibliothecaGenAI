@@ -95,10 +95,10 @@ def _create_async_engine(db_url: str) -> AsyncEngine:
     async_url = db_url.replace('postgresql://', 'postgresql+asyncpg://')
     
     # Get pool settings, providing higher defaults suitable for concurrency
-    pool_size = getattr(settings, 'DB_POOL_SIZE', 50) # Default to 50 if not set
-    max_overflow = getattr(settings, 'DB_MAX_OVERFLOW', 100) # Default to 100 if not set
-    pool_timeout = getattr(settings, 'DB_POOL_TIMEOUT', 60) # Default to 60s if not set
-    pool_recycle = getattr(settings, 'DB_POOL_RECYCLE', 1800) # Keep 30 min default recycle
+    pool_size = getattr(settings, 'DB_POOL_SIZE', 100) # Increased default for concurrency
+    max_overflow = getattr(settings, 'DB_MAX_OVERFLOW', 200) # Higher overflow buffer
+    pool_timeout = getattr(settings, 'DB_POOL_TIMEOUT', 30) # Faster timeout for full pool
+    pool_recycle = getattr(settings, 'DB_POOL_RECYCLE', 600) # Recycle connections every 10min
     
     logger.info(f"Creating async engine for {async_url.split('@')[1] if '@' in async_url else '?'} with pool_size={pool_size}, max_overflow={max_overflow}, pool_timeout={pool_timeout}s")
 

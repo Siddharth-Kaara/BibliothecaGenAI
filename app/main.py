@@ -87,5 +87,8 @@ if __name__ == "__main__":
         reload=settings.DEBUG,
         log_level=settings.LOG_LEVEL.lower(), # Use level from settings
         # Use default Uvicorn log config unless specified otherwise
-        # log_config=None 
-    ) 
+        # log_config=None,
+        timeout_keep_alive=30,
+        limit_concurrency=1000,
+        limit_max_requests=10000
+    )
