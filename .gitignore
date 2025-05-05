@@ -1,7 +1,9 @@
 .env
+.env.docker
 logs/
 frontend/
 docs/
 static/
 README.md
 __pycache__/
+cost_calculator.html
