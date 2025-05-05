@@ -1,6 +1,7 @@
 from datetime import datetime
-from typing import Dict, List, Optional, Union, Any
+from typing import Dict, List, Optional, Union, Any, Literal
 from pydantic import BaseModel, Field, model_validator, RootModel
+import uuid
 
 # Chat Models
 
@@ -13,7 +14,7 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     """Request schema for the chat endpoint."""
     # user_id: str = Field(..., description="Unique identifier for the user") # Removed
-    organization_id: str = Field(..., description="Unique identifier for the user's organization to scope data access")
+    # organization_id: str = Field(..., description="Unique identifier for the user's organization to scope data access") # REMOVED - Get from token
     message: str = Field(..., description="The user's message")
     session_id: Optional[str] = Field(None, description="Session identifier for conversation tracking")
     chat_history: Optional[List[ChatMessage]] = Field(None, description="Previous chat messages")
@@ -49,13 +50,13 @@ class ChatData(BaseModel):
     """Data for a successful chat response with support for multiple outputs."""
     text: str = Field(..., description="Text response from the chatbot")
     tables: Optional[List[TableData]] = Field(None, description="List of table data (columns and rows), if applicable")
-    visualizations: Optional[List[ApiChartSpecification]] = Field(None, description="List of chart specifications for the frontend to render, if applicable")
+    visualizations: List[ApiChartSpecification] = Field(default_factory=list)
 
 class ChatResponse(BaseModel):
     """Response schema for the chat endpoint."""
-    status: str = Field(..., description="Response status (success or error)")
-    data: Optional[ChatData] = Field(None, description="Response data if status is success")
-    error: Optional[Error] = Field(None, description="Error details if status is error")
+    status: Literal["success", "error", "partial_success"] = "success"
+    data: Optional[ChatData] = None
+    error: Optional[Error] = None
     timestamp: datetime = Field(default_factory=datetime.now, description="Response timestamp")
 
     @model_validator(mode='after')
@@ -66,3 +67,35 @@ class ChatResponse(BaseModel):
         if self.status == "success" and self.data is None:
             raise ValueError("Data must be provided when status is success")
         return self
+
+# --- Add Feedback Schema ---
+class FeedbackRequest(BaseModel):
+    request_id: uuid.UUID = Field(..., description="The unique ID of the ChatMessage being rated.")
+    rating: int = Field(..., ge=1, le=5, description="User rating (e.g., 1-5, or adjust range as needed).") # Example: 1=Bad, 5=Good
+    comment: Optional[str] = Field(None, description="Optional user comment.")
+    session_id: uuid.UUID = Field(..., description="The ID of the chat session for context.")
+
+# Define the response schema for feedback submission
+class FeedbackResponse(BaseModel):
+    feedback_id: str # Changed to str as API returns stringified UUID
+    message: str = "Feedback submitted successfully."
+# --- End Feedback Schema ---
+
+# --- History Schemas ---
+class ChatMessageForHistory(BaseModel):
+    # Mirrors ChatMessage initially, but allows for future field selection/modification
+    request_id: uuid.UUID = Field(..., description="Unique ID for the specific user request/assistant response pair.")
+    role: str = Field(..., description="Role: user or assistant")
+    content: str = Field(..., description="Message content")
+    timestamp: datetime = Field(..., description="Timestamp of the message")
+    # Add feedback info if needed in the future, e.g.:
+    # rating: Optional[int] = None
+    # feedback_comment: Optional[str] = None
+
+    class Config:
+        from_attributes = True # <-- Changed from orm_mode
+
+class HistoryResponse(BaseModel):
+    session_id: uuid.UUID = Field(..., description="The ID of the chat session.")
+    messages: List[ChatMessageForHistory] = Field(..., description="List of chat messages in chronological order.")
+# --- End History Schemas ---

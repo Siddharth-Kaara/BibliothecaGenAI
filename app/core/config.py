@@ -2,6 +2,10 @@ import os
 from typing import Any, Dict, List, Optional, Union
 from pydantic import AnyHttpUrl, PostgresDsn, field_validator, model_validator, Field
 from pydantic_settings import BaseSettings
+from dotenv import load_dotenv
+
+# Load environment variables from .env file if it exists
+load_dotenv()
 
 class Settings(BaseSettings):
     # API settings
@@ -45,6 +49,10 @@ class Settings(BaseSettings):
     SUBQUERY_TIMEOUT_SECONDS: int = Field(default=15, description="Timeout in seconds for individual subqueries in the summary tool.")
     SQL_EXECUTION_TIMEOUT_SECONDS: int = Field(default=30, description="Timeout in seconds for database query execution in SQLExecutionTool.")
     MAX_SQL_RESULT_ROWS: int = 50 # Max rows to return from SQL query tool
+    MAX_SQL_SECURITY_RETRIES: int = 1
+    DEFAULT_HISTORY_LIMIT: int = Field(default=20, description="Default number of messages returned by the /history endpoint.")
+    MAX_HISTORY_LIMIT: int = Field(default=100, description="Maximum number of messages that can be requested from the /history endpoint.")
+    AGENT_TIMEOUT_SECONDS: int = Field(default=120, description="Timeout in seconds for the entire agent process.")
     
     # Security
     SECRET_KEY: str = ""
@@ -58,6 +66,19 @@ class Settings(BaseSettings):
     
     # Cache Configuration
     REDIS_HOST: str = Field(default="localhost")
+    
+    # JWT Settings 
+    JWT_PUBLIC_KEY: str = os.getenv("JWT_PUBLIC_KEY", "YOUR_PUBLIC_KEY_NEEDS_TO_BE_SET_IN_ENV") 
+    JWT_ALGORITHM: str =  "RS256" 
+
+    @field_validator("JWT_PUBLIC_KEY")
+    def format_public_key(cls, v: str) -> str:
+        """Replaces literal \n in the public key string with actual newlines."""
+        if v:
+             # Handle potential escaped backslashes from dotenv parsing if needed
+             # Simple replacement first
+            return v.replace("\\n", "\n") 
+        return v # Return original if empty or None
     
     class Config:
         env_file = ".env"

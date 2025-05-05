@@ -1,10 +1,11 @@
 import logging
 import asyncio
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, AsyncGenerator
 from sqlalchemy import text, inspect, MetaData
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine, async_sessionmaker, AsyncSession
 from sqlalchemy.ext.declarative import declarative_base
 from contextlib import asynccontextmanager
+from fastapi import HTTPException
 
 from app.core.config import settings
 from app.db.schema_definitions import SCHEMA_DEFINITIONS
@@ -14,11 +15,15 @@ logger = logging.getLogger(__name__)
 # Dictionary to store database engines - async only
 async_db_engines: Dict[str, AsyncEngine] = {}
 
+# Globally accessible session factory - initialized after engine creation
+# Using a more specific name for clarity
+chat_management_session_factory: Optional[async_sessionmaker[AsyncSession]] = None
+
 # Create Base for SQLAlchemy models
 Base = declarative_base()
 
 # List of database names considered essential for the application to start
-ESSENTIAL_DATABASES = ["report_management"] 
+ESSENTIAL_DATABASES = ["report_management", "chat_management"] 
 
 async def get_async_db_engine(db_name: str) -> Optional[AsyncEngine]:
     """Get SQLAlchemy async engine for a specific database.
@@ -37,7 +42,7 @@ async def get_async_db_engine(db_name: str) -> Optional[AsyncEngine]:
 
 async def create_db_engines():
     """Create async database engines for all configured databases."""
-    global async_db_engines
+    global async_db_engines, chat_management_session_factory
     logger.info(f"Found {len(settings.POSTGRES_SERVERS)} database configurations to process.")
     
     all_engines_created = True # Flag to track success
@@ -88,6 +93,22 @@ async def create_db_engines():
 
     if not all_engines_created:
         logger.warning("Some database engines failed to create during startup.")
+
+    # --- Initialize the chat_management session factory --- 
+    chat_engine = async_db_engines.get("chat_management")
+    if chat_engine:
+        chat_management_session_factory = async_sessionmaker(
+            bind=chat_engine, 
+            expire_on_commit=False, 
+            class_=AsyncSession
+        )
+        logger.info("Successfully created chat_management_session_factory.")
+    else:
+        if "chat_management" in ESSENTIAL_DATABASES:
+             logger.critical("chat_management engine not found after creation attempt, but it's essential. Session factory cannot be created.")
+        else:
+             logger.warning("chat_management engine not found. Background tasks requiring this DB may fail.")
+    # --- End factory initialization ---
 
 def _create_async_engine(db_url: str) -> AsyncEngine:
     """Create an asynchronous SQLAlchemy engine."""
@@ -307,7 +328,34 @@ async def get_async_db_session(db_name: str):
         raise
     finally:
         await session.close()
+        logger.debug(f"Async session closed for database: {db_name}")
 
 # Initialize database engines
 # Note: This is now an async function, so it needs to be called during application startup
 # Don't call it directly on module import
+
+# --- FastAPI Dependency for Chat DB Session --- 
+async def get_chat_db_session() -> AsyncGenerator[AsyncSession, None]:
+    """FastAPI dependency to get an AsyncSession for the 'chat_management' database."""
+    # Use the globally initialized factory
+    if chat_management_session_factory is None:
+        logger.error("chat_management_session_factory is not initialized. Cannot provide session.")
+        raise HTTPException(
+            status_code=503, # Service Unavailable
+            detail="Database service for chat management is not available."
+        )
+    
+    async with chat_management_session_factory() as session:
+        try:
+            yield session
+            # Only commit here if the endpoint doesn't handle its own commits/rollbacks explicitly.
+            # Since repository functions are called with this session, they might handle commit/rollback.
+            # Let's assume the endpoint or repo function handles transaction completion.
+            # await session.commit() # <-- REMOVED - Let caller manage transaction
+        except Exception:
+            await session.rollback() # Rollback on any exception during the request using this session
+            raise # Re-raise the exception to be handled by FastAPI error handlers
+        finally:
+            # Session is automatically closed by the context manager `async with`
+            logger.debug("Async session closed for database: chat_management in dependency")
+# --- End FastAPI Dependency ---

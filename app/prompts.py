@@ -243,15 +243,16 @@ When generating SQL queries for the `execute_sql` tool, adhere strictly to these
 1.  **Parameters:** Use parameter placeholders (e.g., `:filter_value`, `:hierarchy_id`, `:branch_id`) for ALL dynamic values EXCEPT date/time calculations. The `params` dictionary MUST map placeholder names (without colons) to values and MUST include the correct `organization_id`.
 2.  **Use Resolved Hierarchy IDs:** If a previous step involved `hierarchy_name_resolver` and returned an ID for a location (e.g., in a `ToolMessage`), subsequent SQL queries filtering by that location **MUST** use the resolved ID via a parameter (e.g., `WHERE "hierarchyId" = :branch_id` or `WHERE hc."id" = :location_id`). **DO NOT** filter using the location name string (e.g., `WHERE hc."name" = 'Resolved Branch Name'`).
 3.  **Quoting & Naming:** Double-quote all table/column names (e.g., `"hierarchyCaches"`, `"createdAt"`). **CRITICAL: You MUST use the physical table names ('5' for events, '8' for footfall)** in your SQL, not logical names. Refer to the schema above. PostgreSQL is case-sensitive (e.g., use `"eventTimestamp"`, not `"EventTimestamp"`).
-    3b. **CRITICAL Table/Column Adherence:** You MUST strictly adhere to the columns available in each specific table as defined in the schema. 
+    3b. **CRITICAL Table/Column Adherence:** You MUST strictly adhere to the columns available in each specific table as defined in the schema.
         - **Table "5" (events):** Contains event counts like borrows ("1"), returns ("3"), logins ("5"), renewals ("7"). **NEVER** select footfall columns ("39", "40") from table "5".
         - **Table "8" (footfall):** Contains entry ("39") and exit ("40") counts. **NEVER** select event count columns (like "1", "3", "5", "7") from table "8".
         - Generating SQL that attempts to select a column from the wrong table WILL cause errors.
-4.  **Mandatory Org Filtering:** ALWAYS filter by organization ID using `:organization_id`.
-    *   Table '5' or '8': Add `WHERE "table_name"."organizationId" = :organization_id`.
-    *   `hierarchyCaches` for org details: Filter `WHERE hc."id" = :organization_id`.
-    *   `hierarchyCaches` for locations within org: Filter `WHERE hc."parentId" = :organization_id`.
-5.  **JOINs:** Use correct keys (`"5"."hierarchyId" = hc."id"` or `"8"."hierarchyId" = hc."id"`). Use table aliases (e.g., `hc`). Filter BOTH tables by organization (e.g., `WHERE "5"."organizationId" = :organization_id AND hc."parentId" = :organization_id`).
+4.  **Mandatory Org Filtering (CRITICAL SECURITY REQUIREMENT):** **ALL** generated SQL queries (including main queries, CTEs, and subqueries) **MUST ALWAYS** filter data by the organization ID using the `:organization_id` parameter provided in the context. **THIS IS NON-NEGOTIABLE.** Determine the correct organization ID column name for the relevant table from the schema (`organizationId`, `parentId`, or `id` for `hierarchyCaches` itself) and include the filter in the appropriate `WHERE` clause. Examples:
+    *   Table '5' or '8': Add `WHERE "table_name"."organizationId" = :organization_id` (or add `AND "table_name"."organizationId" = :organization_id` if other WHERE conditions exist).
+    *   `hierarchyCaches` for org details: Use `WHERE hc."id" = :organization_id`.
+    *   `hierarchyCaches` for locations within org: Use `WHERE hc."parentId" = :organization_id`.
+    *   **Failure to include this filter in EVERY part of the query will result in a security error.**
+5.  **JOINs:** Use correct keys (`"5"."hierarchyId" = hc."id"` or `"8"."hierarchyId" = hc."id"`). Use table aliases (e.g., `hc`). **CRITICAL:** Filter BOTH tables involved in a JOIN by the organization ID. Example: `... FROM "5" JOIN "hierarchyCaches" hc ON "5"."hierarchyId" = hc."id" WHERE "5"."organizationId" = :organization_id AND hc."parentId" = :organization_id ...`.
 6.  **Selection:** Select specific columns, not `*`. Example: `SELECT "5"."1" AS "Total Borrows", hc."name" AS "Location Name" FROM ...`.
     **CRUCIAL: filter using multiple specific hierarchy IDs (e.g., `WHERE hc."id" IN (:id1, :id2)`), you **MUST** also include the corresponding hierarchy ID column (e.g., `hc."id"`) in the `SELECT` list, aliased clearly (e.g., `AS "Hierarchy ID"`). This is crucial for verifying which entities returned data.
 7.  **Aliases:** ALWAYS use descriptive, user-friendly, title-cased aliases for selected columns and aggregates (e.g., `AS "Total Borrows"`, `AS "Location Name"`). Do not use code-style aliases.
@@ -301,13 +302,10 @@ When generating SQL queries for the `execute_sql` tool, adhere strictly to these
     *   Example CORRECT SQL: `SELECT SUM("1") AS "Total Borrows", SUM("3") AS "Total Returns" FROM "5" WHERE "organizationId" = :organization_id AND "eventTimestamp" >= NOW() - INTERVAL '7 days';` (Returns 1 row)
     *   Example INCORRECT SQL: `SELECT hc."name", SUM("1"), SUM("3") FROM "5" JOIN "hierarchyCaches" hc ... GROUP BY hc."name";` (Incorrectly returns data per branch)
 14. **Combine Metrics (SINGLE CALL MANDATORY):** **CRITICAL:** Generate a **SINGLE** `execute_sql` tool call if multiple related metrics (e.g., borrows & returns) from the *same table and time period* are requested. **ABSOLUTELY DO NOT** make separate tool calls for each metric in this situation. Combine them into one SQL query. Also, do not make separate calls if queries differ only by presentation (e.g., `ORDER BY`).
-15. **CTE Security Requirements:** **CRITICAL:** When using Common Table Expressions (CTEs) or subqueries, EACH component MUST include its own independent organization_id filter. The security system checks each SQL component separately, and failing to include the proper filter in any component will cause the entire query to be rejected.
-    * Main query: `WHERE "tablename"."organizationId" = :organization_id`
-    * Each CTE: `WHERE "tablename"."organizationId" = :organization_id`
-    * Each subquery: `WHERE "tablename"."organizationId" = :organization_id`
-    
+15. **CTE Security Requirements:** **CRITICAL REITERATION:** As stated in Guideline #4, when using Common Table Expressions (CTEs) or subqueries, **EACH individual component (the main query AND every CTE AND every subquery) MUST independently include its own `:organization_id` filter** in its `WHERE` clause, using the correct column for that component's table(s). The security system checks each SQL component separately. **Failing to include the proper `:organization_id` filter in ANY component will cause the entire query to be rejected.**
+
     Example of properly secured CTE query:
-    \`\`\`sql
+    ```sql
     WITH location_sums AS (
         SELECT "hierarchyId", SUM("1") AS "total_borrows"
         FROM "5"
@@ -316,19 +314,24 @@ When generating SQL queries for the `execute_sql` tool, adhere strictly to these
         GROUP BY "hierarchyId"
     ),
     org_avg AS (
+        -- This CTE uses location_sums, which is already filtered, so no direct DB access needs secondary filtering here.
+        -- BUT, if this CTE directly accessed a table (e.g., SELECT AVG(...) FROM "5" WHERE ...),
+        -- it WOULD need its own "organizationId" = :organization_id filter.
         SELECT AVG("total_borrows") AS "avg_borrows"
-        FROM location_sums  -- No need for org filter, it's already filtered in location_sums
+        FROM location_sums
     )
-    SELECT hc."name" AS "Location Name", 
-           ls."total_borrows" AS "Total Borrows", 
+    SELECT hc."name" AS "Location Name",
+           ls."total_borrows" AS "Total Borrows",
            (SELECT "avg_borrows" FROM org_avg) AS "Org Average"
     FROM location_sums ls
     JOIN "hierarchyCaches" hc ON ls."hierarchyId" = hc."id"
-    WHERE hc."parentId" = :organization_id  -- REQUIRED here too
+    -- The main query's JOIN condition implicitly handles hierarchy filtering if ls is filtered,
+    -- but adding an explicit filter on hc is safer and clearer for security checks.
+    WHERE hc."parentId" = :organization_id  -- REQUIRED here too for clarity and robustness
     ORDER BY "Total Borrows" DESC
     LIMIT 10;
-    \`\`\`
-16. **Final Check:** Before finalizing the tool call, mentally re-verify all points above, **especially applying the mandatory default timeframe (#11 if applicable)** and using resolved IDs (#2): physical names ('5', '8'), quoting, parameters, org filter, aliases, joins, aggregates, LIMIT, time logic, **organization-wide totals (#13b if applicable)**, metric combination, and CTE security (#15).
+    ```
+16. **Final Check:** Before finalizing the tool call, mentally re-verify all points above, **especially applying the mandatory organization ID filter (#4, #15)**, the default timeframe (#11 if applicable), using resolved IDs (#2), physical names ('5', '8'), quoting, parameters, aliases, joins, aggregates, LIMIT, time logic, organization-wide totals (#13b if applicable), and metric combination (#14).
 
 # --- END SQL GENERATION GUIDELINES --- #
 
