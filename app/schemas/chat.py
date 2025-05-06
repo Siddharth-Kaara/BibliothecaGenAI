@@ -58,6 +58,8 @@ class ChatResponse(BaseModel):
     data: Optional[ChatData] = None
     error: Optional[Error] = None
     timestamp: datetime = Field(default_factory=datetime.now, description="Response timestamp")
+    # Session ID must always be present for stateful chat responses
+    session_id: uuid.UUID
 
     @model_validator(mode='after')
     def check_status_consistency(self):

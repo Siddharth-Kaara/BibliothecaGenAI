@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     
     # Agent & Graph settings
     MAX_CONCURRENT_TOOLS: int = Field(default=4, description="Maximum number of tools to execute concurrently.")
-    MAX_STATE_MESSAGES: int = Field(default=20, description="Maximum number of messages to keep in agent state.")
+    MAX_STATE_MESSAGES: int = Field(default=6, description="Maximum number of messages to keep in agent state (last 3 pairs).")
     MAX_GRAPH_ITERATIONS: int = Field(default=25, description="Maximum iterations allowed for the LangGraph agent.")
     MAX_TABLE_ROWS_IN_STATE: int = Field(default=100, description="Maximum rows per table to keep in agent state.")
     TOOL_RETRY_DELAY: float = Field(default=1.0, description="Base delay in seconds between tool execution retries.")

@@ -12,7 +12,7 @@ from app.langchain.agent import process_chat_message
 # Remove old memory imports
 # from app.langchain.memory import add_messages_to_memory, get_memory_for_session
 # Import schemas directly
-from app.schemas.chat import ChatRequest, ChatResponse, FeedbackRequest, FeedbackResponse, HistoryResponse, ChatMessageForHistory # Ensure ChatMessageForHistory is imported if used in responses
+from app.schemas.chat import ChatRequest, ChatResponse, ChatData, FeedbackRequest, FeedbackResponse, HistoryResponse, ChatMessageForHistory # Added ChatData
 
 # --- Add DB Imports ---
 from sqlalchemy.orm import Session
@@ -58,191 +58,201 @@ def _format_db_history_for_agent(history_records: Sequence[ChatMessage]) -> List
     """Formats ChatMessage ORM objects into the list of dicts agent expects."""
     agent_history = []
     for record in history_records:
-        # Add user message first
-        if record.userContent:
-             agent_history.append({"role": "user", "content": record.userContent})
-        # Then add assistant message if it exists
-        if record.assistantContent:
-            agent_history.append({"role": "assistant", "content": record.assistantContent})
+        # Add user message first using correct snake_case attribute
+        if record.user_message_content:
+             agent_history.append({"role": "user", "content": record.user_message_content})
+        # Then add assistant message if it exists using correct snake_case attribute
+        if record.assistant_message_content:
+            agent_history.append({"role": "assistant", "content": record.assistant_message_content})
     return agent_history
 # --- End Helper --- #
 
 @router.post("/chat", response_model=ChatResponse, tags=["chat"])
 async def chat(
     background_tasks: BackgroundTasks,
-    chat_request: ChatRequest,
-    session_id: Optional[str] = Query(None, description="Optional session ID for continuing a conversation"),
+    chat_request: ChatRequest, # Contains message, session_id (optional)
+    # session_id: Optional[str] = Query(None, ...), # REMOVED Query Parameter
     db: AsyncSession = Depends(get_chat_db_session),
     current_user: CurrentUser = Depends(get_current_user)
 ):
     request_id = uuid.uuid4()
     # Get user_id and org_id reliably from the validated CurrentUser object
     user_id = current_user.user_id
-    organization_id = current_user.org_id # Access directly
+    organization_id = current_user.org_id
 
-    # The check below is technically redundant if get_current_user enforces non-None,
-    # but kept for extra safety / explicitness.
+    # Ensure org_id is present (already validated by get_current_user)
     if not organization_id:
-        # This case should ideally not be hit if token validation is correct
         logger.error(f"[ReqID: {request_id}] Organization ID missing from validated user object for user {user_id}. Token/Security config issue?")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal configuration error: Organization ID not found.")
 
-    logger.info(f"Starting chat request {request_id} for org {organization_id}, user {user_id}, session: {session_id}")
-
-    # --- Session Handling & History Retrieval --- #
-    session_uuid: Optional[uuid.UUID] = None
-    db_history_records: Sequence[ChatMessage] = []
-    agent_chat_history: List[Dict[str, str]] = []
-    chat_session: Optional[ChatSession] = None # Store the session object
-
-    try:
-        # Use get_or_create_session from repository
-        chat_session, created = await get_or_create_session(
-            db=db,
-            session_id=session_id,
-            user_id=user_id,
-            organization_id=organization_id
-        )
-        session_uuid = chat_session.sessionId
-        session_id = str(session_uuid) # Update session_id string in case it was created
-
-        if not created and session_uuid: # Only fetch history if it was an existing session
-             # Retrieve history using the authorized function
-             db_history_records = await get_session_history(
-                 db=db,
-                 session_id=session_id,
-                 user_id=user_id,
-                 organization_id=organization_id,
-                 limit=settings.MAX_STATE_MESSAGES, # Use config for history limit
-                 offset=0
-             )
-             logger.debug(f"Retrieved {len(db_history_records)} message objects from DB for history context, request {request_id}")
-             # Format the retrieved history for the agent
-             agent_chat_history = _format_db_history_for_agent(db_history_records)
-
-    except RecordNotFound as e:
-         logger.error(f"[ReqID: {request_id}] Session handling error: {e}. Could not find or create session.")
-         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Chat session error: {e}")
-    except RepositoryError as e:
-        logger.error(f"[ReqID: {request_id}] Repository error during session handling: {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to initialize chat session due to a database error.")
-    except Exception as e: # Catch unexpected errors during session/history phase
-        logger.error(f"[ReqID: {request_id}] Unexpected error retrieving/creating session {session_id} or history for user {user_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="An unexpected error occurred handling the chat session.")
-    # --- End Session Handling & History Retrieval --- #
-
-    # --- Schedule Initial Log --- #
-    if session_uuid: # Ensure we have a valid session ID before logging
-        # Use add_task directly with the repository function and the current db session
-        background_tasks.add_task(
-            log_initial_chat_message,
-            db=db,
-            request_id=request_id,
-            session_id=str(session_uuid),
-            user_id=user_id,
-            organization_id=organization_id,
-            user_content=chat_request.message
-        )
-    else:
-         # This state should ideally not be reachable if session handling is correct
-         logger.error(f"[ReqID: {request_id}] session_uuid is None after session handling. Cannot log initial message.")
-         # Consider raising an error here as it indicates a logic flaw
-         raise HTTPException(status_code=500, detail="Internal error: Failed to establish session ID for logging.")
-    # --- End Schedule Initial Log --- #
-
-    # --- Call Langchain Agent --- #
+    # --- Agent Call Variables (used in both branches) --- #
     agent_response_data = {} # Initialize
     agent_status = "error"
     prompt_tokens = 0
     completion_tokens = 0
 
+    # --- Unified Stateful Logic (Handles New and Existing Sessions) --- #
+    request_session_id_str = chat_request.session_id # Get session_id string from the request body (can be None)
+    session_uuid_obj: Optional[uuid.UUID] = None
+    chat_session: Optional[ChatSession] = None
+    created_session: bool = False
+    db_history_records: Sequence[ChatMessage] = []
+    agent_chat_history: List[Dict[str, str]] = []
+
+    # --- Session Handling, Validation & History Retrieval --- #
     try:
-        # Pass the formatted history to the agent
-        # Use timeout from settings
+        # 1. Validate format if ID was provided
+        if request_session_id_str:
+            try:
+                session_uuid_obj = uuid.UUID(request_session_id_str)
+            except ValueError:
+                logger.warning(f"[ReqID: {request_id}] Invalid session_id format '{request_session_id_str}' provided by user {user_id}.")
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid session ID format.")
+        
+        # 2. Get or Create Session (session_uuid_obj will be None if starting new)
+        chat_session, created_session = await get_or_create_session(
+            db=db,
+            session_id=session_uuid_obj, # Pass None or the validated UUID
+            user_id=user_id,             
+            organization_id=organization_id 
+        )
+        
+        # 3. Handle Cases based on whether ID was provided and if session was found/created
+        if request_session_id_str and chat_session is None:
+            # ID was provided, but session not found by repo function
+            logger.warning(f"[ReqID: {request_id}] Session ID '{request_session_id_str}' provided but not found.")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat session not found.")
+            
+        if chat_session is None: 
+            # This *shouldn't* happen if session_id was None (repo should create or raise error) 
+            # or if session_id was provided (caught above). Safety check.
+            logger.error(f"[ReqID: {request_id}] chat_session is unexpectedly None after get_or_create_session call.")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to establish chat session.")
+
+        # 4. Authorization Check (only needed if session wasn't just created)
+        if not created_session:
+            if chat_session.user_id != user_id or chat_session.organization_id != organization_id:
+                 logger.error(f"[ReqID: {request_id}] AuthZ Error: Session {chat_session.session_id} user/org mismatch. Req: {user_id}/{organization_id}. Sess: {chat_session.user_id}/{chat_session.organization_id}.")
+                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat session not found.") # User doesn't need to know it exists but isn't theirs
+
+        # 5. If we get here, chat_session is valid (either found+authorized or newly created)
+        session_id_str_for_logging_and_agent = str(chat_session.session_id)
+        logger.info(f"Processing STATEFUL chat request {request_id} using session {session_id_str_for_logging_and_agent} (Created: {created_session})")
+
+        # 6. Retrieve history ONLY if the session wasn't newly created
+        if not created_session:
+            db_history_records = await get_session_history(
+                db=db,
+                session_id=session_id_str_for_logging_and_agent,
+                user_id=user_id,
+                organization_id=organization_id,
+                limit=settings.MAX_STATE_MESSAGES,
+                offset=0
+            )
+            logger.debug(f"Retrieved {len(db_history_records)} message objects from DB for history context, request {request_id}")
+            agent_chat_history = _format_db_history_for_agent(db_history_records)
+
+    except HTTPException as http_exc: # Re-raise specific HTTP exceptions (400, 404)
+         raise http_exc
+    except RepositoryError as e: # Catch errors from repo (e.g., DB error during creation)
+        logger.error(f"[ReqID: {request_id}] Repository error during session handling: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to handle chat session due to a database error.")
+    except Exception as e:
+        logger.error(f"[ReqID: {request_id}] Unexpected error handling session or history for user {user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An unexpected error occurred handling the chat session.")
+    # --- End Session Handling --- #
+
+    # --- Background Logging & Agent Call (Stateful - chat_session is guaranteed valid) --- #
+    
+    # Schedule Initial Log
+    background_tasks.add_task(
+        log_initial_chat_message,
+        db=db,
+        request_id=request_id,
+        session_id=session_id_str_for_logging_and_agent, # Use the confirmed session ID
+        user_id=user_id,
+        organization_id=organization_id,
+        user_content=chat_request.message
+    )
+    
+    # Call Langchain Agent (Stateful)
+    try:
         result = await asyncio.wait_for(
             process_chat_message(
                 organization_id=organization_id,
                 message=chat_request.message,
-                session_id=str(session_uuid), # Always pass session_id now
-                chat_history=agent_chat_history, # Pass formatted history
+                session_id=session_id_str_for_logging_and_agent, # Use the confirmed session ID
+                chat_history=agent_chat_history,
                 request_id=str(request_id),
             ),
-            timeout=settings.AGENT_TIMEOUT_SECONDS # Use config for timeout
+            timeout=settings.AGENT_TIMEOUT_SECONDS
         )
 
-        # Validate result structure (basic check)
+        # Validate and process agent result
         if isinstance(result, dict) and "status" in result and "data" in result:
-             agent_status = result.get("status", "error")
-             agent_response_data = result.get("data", {}) if agent_status == "success" else {}
-             prompt_tokens = result.get("prompt_tokens", 0)
-             completion_tokens = result.get("completion_tokens", 0)
-             if agent_status != "success":
-                 logger.warning(f"Agent processing returned status '{agent_status}' for request {request_id}. Result: {result.get('error', 'No error details')}")
-                 # Raise an exception to be caught below, providing agent error details
-                 raise Exception(f"Agent processing failed: {result.get('error', {}).get('message', 'Unknown agent error')}")
+            agent_status = result.get("status", "error")
+            agent_response_data = result.get("data", {}) if agent_status == "success" else {}
+            prompt_tokens = result.get("prompt_tokens", 0)
+            completion_tokens = result.get("completion_tokens", 0)
+            if agent_status != "success":
+                error_detail = result.get('error', {}).get('message', 'Unknown agent error')
+                logger.warning(f"Agent processing returned status '{agent_status}' for STATEFUL request {request_id}. Error: {error_detail}")
+                raise Exception(f"Agent processing failed: {error_detail}")
         else:
-             logger.error(f"Invalid response structure from process_chat_message for request {request_id}. Result: {result}")
-             raise Exception("Invalid response structure received from agent.")
+            logger.error(f"Invalid response structure from process_chat_message for STATEFUL request {request_id}. Result: {result}")
+            raise Exception("Invalid response structure received from agent.")
 
     except asyncio.TimeoutError:
-        logger.error(f"Request timed out after {settings.AGENT_TIMEOUT_SECONDS} seconds (ReqID: {request_id})")
+        logger.error(f"STATEFUL request timed out after {settings.AGENT_TIMEOUT_SECONDS} seconds (ReqID: {request_id})")
         # Log timeout to DB if desired (might need a separate status or error field in ChatMessage)
         raise HTTPException(
-             status_code=status.HTTP_408_REQUEST_TIMEOUT,
-             detail={
-                 "code": "REQUEST_TIMEOUT",
-                 "message": f"The request took too long to process (>{settings.AGENT_TIMEOUT_SECONDS}s). Please try again.",
-                 "details": {"request_id": str(request_id)}
-             }
+            status_code=status.HTTP_408_REQUEST_TIMEOUT,
+            detail={
+                "code": "REQUEST_TIMEOUT",
+                "message": f"The request took too long to process (>{settings.AGENT_TIMEOUT_SECONDS}s). Please try again.",
+                "details": {"request_id": str(request_id)}
+            }
         )
     except Exception as e:
         # Handles both explicit raises from agent failure and unexpected errors
-        logger.error(f"Error during agent processing: {str(e)} (ReqID: {request_id})", exc_info=True)
+        logger.error(f"Error during agent processing for STATEFUL request: {str(e)} (ReqID: {request_id})", exc_info=True)
         # Log error to DB if desired
-        # Use 500 for internal errors, potentially others based on agent error type if available
         raise HTTPException(
-             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-             detail={
-                 "code": "AGENT_PROCESSING_ERROR",
-                 "message": "An error occurred while processing your request with the agent.",
-                 "details": {"error": str(e), "request_id": str(request_id)}
-             }
-         )
-    # --- End Call Langchain Agent --- #
-
-
-    # --- Schedule Completion Log --- #
-    # Log completion regardless of agent success/failure status, but ensure we have essential data
-    if session_uuid:
-        background_tasks.add_task(
-            log_complete_chat_message,
-            db=db,
-            request_id=request_id,
-            session_id=str(session_uuid),
-            user_id=user_id,
-            organization_id=organization_id,
-            user_content=chat_request.message, # Log original user message
-            assistant_content=agent_response_data.get("text") if agent_status == "success" else None, # Log agent text only on success
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "code": "AGENT_PROCESSING_ERROR",
+                "message": "An error occurred while processing your request with the agent.",
+                "details": {"error": str(e), "request_id": str(request_id)}
+            }
         )
-        logger.debug(f"Scheduled background task to log complete message for request {request_id}.")
-    else:
-        # Should not be reachable if initial log succeeded
-         logger.error(f"[ReqID: {request_id}] session_uuid is None before logging completion. Logic error suspected.")
-         # Don't prevent response return, but log the error
+    # --- End Call Langchain Agent (Stateful) --- #
 
-
-    # --- Construct Final Response --- #
-    # We already raised exceptions for errors, so if we reach here, agent call was successful
-    final_response = ChatResponse(
-        status=agent_status, # Should be "success"
-        data=agent_response_data, # The data from the agent
-        error=None, # No error in the successful case
-        timestamp=datetime.now()
+    # Schedule Completion Log
+    background_tasks.add_task(
+        log_complete_chat_message,
+        db=db,
+        request_id=request_id,
+        session_id=session_id_str_for_logging_and_agent, # Use the confirmed session ID
+        user_id=user_id,
+        organization_id=organization_id,
+        user_content=chat_request.message,
+        assistant_content=agent_response_data.get("text") if agent_status == "success" else None,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens
     )
-    return final_response
+    logger.debug(f"Scheduled background task to log complete message for request {request_id}.")
 
+    # --- Construct Final Response (Stateful) --- #
+    final_response = ChatResponse(
+        status=agent_status,
+        data=ChatData(**agent_response_data) if agent_status == "success" and agent_response_data else None,
+        error=None,
+        timestamp=datetime.now(),
+        session_id=chat_session.session_id # Include the actual session ID (found or created)
+    )
+    logger.info(f"Completed STATEFUL chat request {request_id}")
+    return final_response
+    # --- END UNIFIED STATEFUL LOGIC --- #
 
 # --- Add Feedback Endpoint ---
 @router.post("/feedback", status_code=status.HTTP_201_CREATED, tags=["feedback"], response_model=FeedbackResponse)
