@@ -25,7 +25,7 @@ def setup_logging():
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(log_level)
     console_format = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s\n"
     )
     console_handler.setFormatter(console_format)
     root_logger.addHandler(console_handler)
@@ -38,7 +38,7 @@ def setup_logging():
     )
     file_handler.setLevel(log_level)
     file_format = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s\n"
     )
     file_handler.setFormatter(file_format)
     root_logger.addHandler(file_handler)
@@ -68,8 +68,9 @@ def setup_logging():
     logging.getLogger("httpcore").setLevel(default_external_level) # Reduce spam from HTTP library
     logging.getLogger("langchain").setLevel(logging.INFO if log_level > logging.DEBUG else logging.DEBUG) # Langchain core
     logging.getLogger("langgraph").setLevel(logging.INFO if log_level > logging.DEBUG else logging.DEBUG) # Langgraph core
-    logging.getLogger("sqlalchemy.engine").setLevel(default_external_level)
-    logging.getLogger("matplotlib.font_manager").setLevel(default_external_level)
+    # Set SQLAlchemy engine level higher to reduce noise
+    logging.getLogger("sqlalchemy.engine").setLevel(logging.CRITICAL) # Only show critical engine events
+    logging.getLogger("sqlalchemy.engine").propagate = False # Explicitly disable propagation
 
     # --- Configure Uvicorn Loggers --- #
     # Get Uvicorn loggers
@@ -97,11 +98,13 @@ def setup_logging():
     # --- Configure Application Loggers --- #
     # Ensure our core agent/tool logs are visible based on main LOG_LEVEL
     logging.getLogger("app").setLevel(log_level) # Set base level for our app
-    logging.getLogger("app.langchain.agent").setLevel(log_level) # Explicitly match main level
-    logging.getLogger("app.langchain.tools").setLevel(log_level) # Set base for tools
-    # Reduce verbosity of DB connection logs unless main level is DEBUG
-    db_conn_level = logging.INFO if log_level > logging.DEBUG else logging.DEBUG
-    logging.getLogger("app.db.connection").setLevel(db_conn_level)
+    # Set Agent, Tools, and Repo loggers to INFO by default unless main LOG_LEVEL is DEBUG
+    app_debug_level = logging.INFO if log_level > logging.DEBUG else logging.DEBUG
+    logging.getLogger("app.langchain.agent").setLevel(app_debug_level)
+    logging.getLogger("app.langchain.tools").setLevel(app_debug_level) 
+    logging.getLogger("app.repositories.chat_repo").setLevel(app_debug_level)
+    # Set DB connection logs to WARNING by default to reduce noise
+    logging.getLogger("app.db.connection").setLevel(logging.WARNING)
     # Example: If a specific tool is too noisy, set its level higher here
     # logging.getLogger("app.langchain.tools.sql_tool").setLevel(logging.INFO) 
     # --- End Application Logger Configuration --- #

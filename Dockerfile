@@ -1,5 +1,5 @@
 # Stage 1: Build Stage - Installs dependencies and build tools if needed
-FROM python:3.12.7-slim-bookworm AS builder
+FROM python:3.12.9-slim-bookworm AS builder
 
 # Set working directory
 WORKDIR /app
@@ -22,7 +22,7 @@ COPY ./app /app/app
 # Removed static copy
 
 # Stage 2: Final Stage - Copies application code and dependencies from builder
-FROM python:3.12.7-slim-bookworm
+FROM python:3.12.9-slim-bookworm
 
 # Set working directory
 WORKDIR /app

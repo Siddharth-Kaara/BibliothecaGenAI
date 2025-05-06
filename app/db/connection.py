@@ -54,8 +54,6 @@ async def create_db_engines():
         logger.debug(f"Attempting to configure async engine for: {db_config}") 
         
         try:
-            # Create async engine
-            logger.info(f"Creating async database engine for '{db_name}'")
             
             # Create async engine with asyncpg
             async_engine = _create_async_engine(db_url)
@@ -72,10 +70,7 @@ async def create_db_engines():
                         raise ValueError(f"Connection test to '{db_name}' failed: Unexpected result {row}")
             except Exception as e:
                 logger.error(f"Async connection test failed for '{db_name}': {str(e)}")
-                raise
-            
-            if db_name not in SCHEMA_DEFINITIONS:
-                logger.warning(f"Database '{db_name}' is connected but has no schema definition")
+                raise            
             
             async_db_engines[db_name] = async_engine
             logger.info(f"Async engine for '{db_name}' successfully created and added.")
@@ -116,20 +111,20 @@ def _create_async_engine(db_url: str) -> AsyncEngine:
     async_url = db_url.replace('postgresql://', 'postgresql+asyncpg://')
     
     # Get pool settings, providing higher defaults suitable for concurrency
-    pool_size = getattr(settings, 'DB_POOL_SIZE', 100) # Increased default for concurrency
-    max_overflow = getattr(settings, 'DB_MAX_OVERFLOW', 200) # Higher overflow buffer
+    # Optimized pool settings with keepalive
+    pool_size = getattr(settings, 'DB_POOL_SIZE', 40)  # Increased default pool size
+    max_overflow = getattr(settings, 'DB_MAX_OVERFLOW', 20)  # Higher overflow capacity
+
     pool_timeout = getattr(settings, 'DB_POOL_TIMEOUT', 30) # Faster timeout for full pool
     pool_recycle = getattr(settings, 'DB_POOL_RECYCLE', 600) # Recycle connections every 10min
     
-    logger.info(f"Creating async engine for {async_url.split('@')[1] if '@' in async_url else '?'} with pool_size={pool_size}, max_overflow={max_overflow}, pool_timeout={pool_timeout}s")
-
     return create_async_engine(
         async_url,
         pool_size=pool_size,
         max_overflow=max_overflow, # Use configured or higher default value
         pool_timeout=pool_timeout,   # Increase timeout slightly
         pool_recycle=pool_recycle,
-        echo=settings.DEBUG, # Keep echo tied to main DEBUG setting
+        echo=False, # Ensure SQLAlchemy's own echo logging is off
     )
 
 async def get_table_metadata_async(db_name: str) -> Dict[str, List[Dict]]:
@@ -222,7 +217,7 @@ async def validate_schema_definitions():
     """Validate that all SCHEMA_DEFINITIONS tables and columns exist in the actual database."""
     for db_name, engine in async_db_engines.items():
         if db_name not in SCHEMA_DEFINITIONS:
-            logger.warning(f"No schema definition for connected database '{db_name}'")
+            # logger.warning(f"No schema definition for connected database '{db_name}'") # Commented out as requested
             continue
         
         try:

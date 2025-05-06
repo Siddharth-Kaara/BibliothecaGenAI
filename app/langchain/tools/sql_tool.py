@@ -237,28 +237,12 @@ class SQLExecutionTool(BaseTool):
             raise ValueError(f"Error validating SQL organization filter: {filter_check_err}")
         # --- End Security Check for organization_id usage ---
 
-        # --- Security Check: organization_id in parameters dictionary --- 
-        org_id_param = parameters.get('organization_id')
-        if not org_id_param:
-             error_msg = f"SECURITY CHECK FAILED: organization_id missing from parameters. Aborting."
-             logger.error(f"{log_prefix}{error_msg}")
-             raise ValueError(error_msg)
-        
-        # <<< START UUID FORMAT VALIDATION >>>
-        try:
-            # Attempt to parse the provided org_id as a UUID
-            uuid.UUID(str(org_id_param))
-        except ValueError:
-             # Log the specific invalid ID found
-            logger.error(f"{log_prefix}SECURITY CHECK FAILED: Provided organization_id parameter '{org_id_param}' is not a valid UUID format. Aborting.")
-            raise ValueError("Invalid organization_id format provided in parameters.")
-        # <<< END UUID FORMAT VALIDATION >>>
-            
-        if str(org_id_param) != self.organization_id:
-            error_msg = f"SECURITY CHECK FAILED: organization_id mismatch in parameters. Expected {self.organization_id}, got {org_id_param}. Aborting."
-            logger.error(f"{log_prefix}{error_msg}")
-            raise ValueError(error_msg)
-        
+        # We still trust self.organization_id was set correctly during tool init
+        if not self.organization_id:
+            # This check remains as a safeguard in case the tool was misconfigured
+            logger.error(f"{log_prefix}CRITICAL: SQLExecutionTool instance has no self.organization_id set during init. Cannot execute query.")
+            raise ValueError("Tool is missing the required organization context.")
+
         # --- START Query Fingerprint Logging ---
         try:
             # Normalize query: lowercase, replace literals, remove comments
@@ -350,51 +334,60 @@ class SQLExecutionTool(BaseTool):
     async def _run(
         self, sql: str, params: Dict[str, Any], db_name: str = "report_management", run_manager=None
     ) -> str:
-        """Execute the SQL query against the database."""
-        log_prefix = f"[SQLExecutionTool] "
+        """Execute SQL query and return result or error message."""
+        log_prefix = f"[SQLExecutionTool] ({self.name}) "
         logger.info(f"{log_prefix}Executing provided SQL query on DB '{db_name}'.")
-        
-        try:
-            results = await self._execute_sql(sql, params, db_name)
-            row_count = len(results.get('rows', []))
-            logger.debug(f"{log_prefix}Completed successfully. Returned {row_count} rows.")
-            
-            # Return the entire result dictionary (containing columns/rows/metadata) serialized as JSON string
-            # Use the imported json_default from utils
-            return json.dumps(results, default=json_default)
-            
-        except ValueError as ve:
-            logger.error(f"{log_prefix}Failed execution: {ve}", exc_info=False)
-            # Determine error type based on message content (simple heuristic)
-            error_type = "VALIDATION_ERROR"
-            if "took too long" in str(ve) or "timeout limit" in str(ve):
-                error_type = "TIMEOUT_ERROR"
-            elif "Invalid organization_id" in str(ve) or "SECURITY CHECK FAILED" in str(ve):
-                 error_type = "SECURITY_ERROR"
-            elif "failed validation" in str(ve) or "syntax error" in str(ve).lower(): # Check lower case for syntax
-                error_type = "SYNTAX_ERROR"
-            elif "executing the database query" in str(ve): # From SQLAlchemyError catch in _execute_sql
-                error_type = "EXECUTION_ERROR" 
+        logger.debug(f"{log_prefix}LLM-provided SQL: {sql[:300]}... LLM-provided Params: {params}")
 
-            fallback_output = {
-                "error": {
-                    "type": error_type,
-                    "message": f"Failed to execute query: {ve}"
-                },
-                "table": None, # Indicate no table data on error
-                "text": f"Error executing provided SQL: {ve}" # Keep user-facing text simple
+        # Ensure the correct, trusted organization_id is used in the parameters for the query.
+        # This overwrites any organization_id the LLM might have put in params.
+        # self.organization_id is set during tool initialization with the trusted value from user context.
+        corrected_params = params.copy() if params is not None else {}
+        
+        if self.organization_id:
+            original_llm_org_id = corrected_params.get('organization_id')
+            corrected_params['organization_id'] = self.organization_id
+            if original_llm_org_id != self.organization_id:
+                logger.info(f"{log_prefix}Overwriting/Correcting params['organization_id']. LLM provided: '{original_llm_org_id}', Corrected to: '{self.organization_id}'.")
+            else:
+                logger.debug(f"{log_prefix}params['organization_id'] from LLM ('{original_llm_org_id}') matches trusted ID. No correction needed.")
+        else:
+            # This case should ideally not happen if the tool is always initialized with an org_id.
+            logger.error(f"{log_prefix}CRITICAL: SQLExecutionTool instance has no self.organization_id set. Cannot enforce organization scope robustly. Proceeding with LLM-provided params.")
+            # If corrected_params['organization_id'] is missing or invalid, _execute_sql security checks should still catch it.
+
+        try:
+            # Pass corrected_params to the execution logic
+            result_dict = await self._execute_sql(sql, corrected_params, db_name) # type: ignore
+            
+            # Handle different result structures (error or success)
+            if "error" in result_dict and result_dict["error"]:
+                error_type = result_dict["error"].get("type", "UNKNOWN_ERROR")
+                error_message = result_dict["error"].get("message", "An unknown error occurred during SQL execution.")
+                # Log specific error types that might indicate LLM issues vs. system issues
+                logger.warning(f"{log_prefix}SQL execution resulted in error. Type: {error_type}, Message: {error_message}")
+                # Return the error part of the dict as a JSON string for the LLM to process
+                # Ensure the output matches what the agent expects for tool errors
+                return json.dumps({"error": result_dict["error"], "table": None, "text": result_dict.get("text", error_message)}, default=json_default)
+            
+            # Successfully executed query, return results as JSON string
+            # If result_dict contains 'table' and 'columns' directly, or nested under a 'data' key
+            final_result_package = {
+                "columns": result_dict.get("columns", []),
+                "rows": result_dict.get("rows", []),
+                "text": result_dict.get("text") # Optional summary text from tool itself
             }
-            return json.dumps(fallback_output, default=json_default)
+            logger.info(f"{log_prefix}SQL execution successful. Returning {len(final_result_package['rows'])} rows.")
+            return json.dumps(final_result_package, default=json_default)
+
+        except ValueError as ve: # Catch validation errors from _execute_sql (like org filter missing)
+            logger.error(f"{log_prefix}ValueError during SQL execution: {ve}", exc_info=True)
+            return json.dumps({"error": {"type": "VALIDATION_ERROR", "message": str(ve)}, "table": None, "text": f"Error validating SQL: {str(ve)}"}, default=json_default)
+        except SQLAlchemyError as db_err:
+            logger.error(f"{log_prefix}Database error during SQL execution: {db_err}", exc_info=True)
+            return json.dumps({"error": {"type": "DATABASE_ERROR", "message": f"Database execution error: {str(db_err)}"}, "table": None, "text": f"Error executing SQL due to database issue: {str(db_err)}"}, default=json_default)
         except Exception as e:
-            logger.exception(f"{log_prefix}Unexpected critical error during SQL execution for org {self.organization_id}, SQL: '{sql[:100]}...': {e}", exc_info=True)
-            fallback_output = {
-                 "error": {
-                     "type": "UNEXPECTED_ERROR",
-                     "message": "An unexpected critical error occurred during execution."
-                 },
-                 "table": None,
-                 "text": f"An unexpected critical error occurred while executing the query." # Keep user-facing text simple
-             }
-            return json.dumps(fallback_output, default=json_default)
+            logger.error(f"{log_prefix}Unexpected error in _run: {e}", exc_info=True)
+            return json.dumps({"error": {"type": "TOOL_ERROR", "message": f"An unexpected error occurred in the SQL tool: {str(e)}"}, "table": None, "text": f"Unexpected tool error: {str(e)}"}, default=json_default)
 
     # BaseTool handles ainvoke implementation for us when _run is async
