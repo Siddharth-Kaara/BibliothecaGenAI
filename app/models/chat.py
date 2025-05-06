@@ -66,7 +66,7 @@ class InteractionFeedback(Base):
 
     # Define constraints using actual database column names
     __table_args__ = (UniqueConstraint('requestId', 'userId', name='unique_user_request_feedback'), # Use DB column names
-                      CheckConstraint('rating >= 1 AND rating <= 5', name='rating_check'))
+                      CheckConstraint('rating >= 0 AND rating <= 1', name='rating_check'))
 
     # Column definitions
     feedback_id: Mapped[uuid.UUID] = mapped_column('feedbackId', UUID(as_uuid=True), primary_key=True, default=generate_uuid)

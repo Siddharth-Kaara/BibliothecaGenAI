@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Dict, List, Optional, Union, Any, Literal
-from pydantic import BaseModel, Field, model_validator, RootModel
+from pydantic import BaseModel, Field, model_validator, RootModel, ConfigDict
 import uuid
 
 # Chat Models
@@ -48,12 +48,17 @@ class Error(BaseModel):
 
 class ChatData(BaseModel):
     """Data for a successful chat response with support for multiple outputs."""
+    model_config = ConfigDict(from_attributes=True)
+
     text: str = Field(..., description="Text response from the chatbot")
     tables: Optional[List[TableData]] = Field(None, description="List of table data (columns and rows), if applicable")
     visualizations: List[ApiChartSpecification] = Field(default_factory=list)
 
 class ChatResponse(BaseModel):
     """Response schema for the chat endpoint."""
+    model_config = ConfigDict(from_attributes=True)
+
+    request_id: Optional[uuid.UUID] = Field(None, description="Unique identifier for the specific request-response cycle, present on success.")
     status: Literal["success", "error", "partial_success"] = "success"
     data: Optional[ChatData] = None
     error: Optional[Error] = None
@@ -73,7 +78,7 @@ class ChatResponse(BaseModel):
 # --- Add Feedback Schema ---
 class FeedbackRequest(BaseModel):
     request_id: uuid.UUID = Field(..., description="The unique ID of the ChatMessage being rated.")
-    rating: int = Field(..., ge=1, le=5, description="User rating (e.g., 1-5, or adjust range as needed).") # Example: 1=Bad, 5=Good
+    rating: int = Field(..., ge=0, le=1, description="User rating (0=Thumbs Down, 1=Thumbs Up).") # Changed to 0 and 1
     comment: Optional[str] = Field(None, description="Optional user comment.")
     session_id: uuid.UUID = Field(..., description="The ID of the chat session for context.")
 

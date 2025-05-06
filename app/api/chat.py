@@ -203,28 +203,41 @@ async def chat(
             raise Exception("Invalid response structure received from agent.")
 
     except asyncio.TimeoutError:
-        logger.error(f"STATEFUL request timed out after {settings.AGENT_TIMEOUT_SECONDS} seconds (ReqID: {request_id})")
-        # Log timeout to DB if desired (might need a separate status or error field in ChatMessage)
-        raise HTTPException(
-            status_code=status.HTTP_408_REQUEST_TIMEOUT,
-            detail={
-                "code": "REQUEST_TIMEOUT",
-                "message": f"The request took too long to process (>{settings.AGENT_TIMEOUT_SECONDS}s). Please try again.",
-                "details": {"request_id": str(request_id)}
-            }
+        logger.warning(f"Agent processing timed out for STATEFUL request {request_id} after {settings.AGENT_TIMEOUT_SECONDS} seconds.")
+        # Log timeout completion - maybe with error status?
+        background_tasks.add_task(
+            log_complete_chat_message,
+            db=db,
+            request_id=request_id,
+            session_id=session_id_str_for_logging_and_agent,
+            user_id=user_id,
+            organization_id=organization_id,
+            user_content=chat_request.message,
+            assistant_content="[Agent Timeout]",
+            prompt_tokens=prompt_tokens, # Log tokens accumulated before timeout if available
+            completion_tokens=completion_tokens,
         )
+        raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="Chat processing timed out.")
+
     except Exception as e:
-        # Handles both explicit raises from agent failure and unexpected errors
-        logger.error(f"Error during agent processing for STATEFUL request: {str(e)} (ReqID: {request_id})", exc_info=True)
-        # Log error to DB if desired
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "code": "AGENT_PROCESSING_ERROR",
-                "message": "An error occurred while processing your request with the agent.",
-                "details": {"error": str(e), "request_id": str(request_id)}
-            }
+        logger.error(f"Error during agent processing for STATEFUL request {request_id}: {e}", exc_info=True)
+        # Log error completion
+        background_tasks.add_task(
+            log_complete_chat_message,
+            db=db,
+            request_id=request_id,
+            session_id=session_id_str_for_logging_and_agent,
+            user_id=user_id,
+            organization_id=organization_id,
+            user_content=chat_request.message,
+            assistant_content=f"[Agent Error]: {str(e)[:500]}", # Log truncated error
+            prompt_tokens=prompt_tokens, # Log tokens accumulated before error if available
+            completion_tokens=completion_tokens,
         )
+        # Determine appropriate status code based on error type if possible
+        status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+        detail = "An error occurred during chat processing."
+        raise HTTPException(status_code=status_code, detail=detail)
     # --- End Call Langchain Agent (Stateful) --- #
 
     # Schedule Completion Log
@@ -243,15 +256,42 @@ async def chat(
     logger.debug(f"Scheduled background task to log complete message for request {request_id}.")
 
     # --- Construct Final Response (Stateful) --- #
-    final_response = ChatResponse(
-        status=agent_status,
-        data=ChatData(**agent_response_data) if agent_status == "success" and agent_response_data else None,
-        error=None,
-        timestamp=datetime.now(),
-        session_id=chat_session.session_id # Include the actual session ID (found or created)
-    )
-    logger.info(f"Completed STATEFUL chat request {request_id}")
-    return final_response
+    if agent_status == "success":
+        # Construct response data
+        response_data = ChatData(**agent_response_data)
+        response = ChatResponse(
+            status="success",
+            request_id=request_id,
+            data=response_data,
+            session_id=chat_session.session_id # Use the confirmed session UUID
+        )
+
+        # Schedule final log AFTER constructing success response
+        background_tasks.add_task(
+            log_complete_chat_message,
+            db=db,
+            request_id=request_id,
+            session_id=session_id_str_for_logging_and_agent,
+            user_id=user_id,
+            organization_id=organization_id,
+            user_content=chat_request.message, # Use original message
+            assistant_content=response_data.text if response_data else None, # Get text from ChatData
+            prompt_tokens=prompt_tokens, # Use extracted tokens
+            completion_tokens=completion_tokens,
+            # metadata=None # Pass metadata if agent provides it
+        )
+        return response # Return successful response
+    else:
+        # Handle agent error status
+        final_response = ChatResponse(
+            status=agent_status,
+            data=ChatData(**agent_response_data) if agent_status == "success" and agent_response_data else None,
+            error=None,
+            timestamp=datetime.now(),
+            session_id=chat_session.session_id # Include the actual session ID (found or created)
+        )
+        logger.info(f"Completed STATEFUL chat request {request_id}")
+        return final_response
     # --- END UNIFIED STATEFUL LOGIC --- #
 
 # --- Add Feedback Endpoint ---
@@ -264,7 +304,7 @@ async def submit_feedback(
     """Submits feedback for a specific chat message."""
     # Get user_id and org_id reliably from the validated CurrentUser object
     user_id = current_user.user_id
-    organization_id = current_user.org_id # Access directly
+    organization_id = current_user.org_id 
 
     # Redundant check, but safe
     if not organization_id:
@@ -282,7 +322,7 @@ async def submit_feedback(
             user_id=user_id,
             organization_id=organization_id
         )
-        feedback_id_value = str(feedback_record.feedbackId) # Ensure it's string
+        feedback_id_value = str(feedback_record.feedback_id) 
         logger.info(f"Successfully saved feedback with ID: {feedback_id_value}")
         return FeedbackResponse(status="success", feedback_id=feedback_id_value)
 

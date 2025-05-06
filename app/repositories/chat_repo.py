@@ -4,7 +4,7 @@ from typing import List, Optional, Tuple, Sequence, Any, Dict
 
 from sqlalchemy import select, update, desc, func, Row, TextClause, text
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import joinedload, selectinload
+from sqlalchemy.orm import joinedload, selectinload, load_only
 import sqlalchemy.exc
 
 from app.models.chat import ChatSession, ChatMessage, InteractionFeedback
@@ -289,28 +289,35 @@ async def get_session_history(
     except ValueError:
         raise RecordNotFound(f"Invalid session ID format: {session_id}")
 
+    # Define the columns needed for ChatMessageForHistory schema
+    # Note: We need both user/assistant content/timestamps to determine role/content/timestamp later
+    columns_to_load = [
+        ChatMessage.request_id,
+        ChatMessage.user_message_content,
+        ChatMessage.assistant_message_content,
+        ChatMessage.user_message_timestamp,
+        ChatMessage.assistant_message_timestamp
+    ]
+
     # Join ChatMessage with ChatSession to filter by user and org
     stmt = (
-        select(ChatMessage)
-        .join(ChatSession, ChatMessage.session_id == ChatSession.session_id) # Use snake_case for join
+        select(ChatMessage) # Still select the model
+        .options(load_only(*columns_to_load)) # But only load specific columns
+        .join(ChatSession, ChatMessage.session_id == ChatSession.session_id)
         .where(
             ChatMessage.session_id == session_uuid,
             ChatSession.user_id == user_id,
             ChatSession.organization_id == organization_id
         )
-        .order_by(ChatMessage.created_at.asc()) # Order by creation time
+        .order_by(desc(ChatMessage.created_at)) # Assuming order by creation is desired for history
         .limit(limit)
         .offset(offset)
     )
-
-    try:
-        result = await db.execute(stmt)
-        messages = result.scalars().all()
-        logger.debug(f"Retrieved {len(messages)} messages for session {session_id}")
-        return messages
-    except Exception as e:
-        logger.error(f"Database error retrieving history for session {session_id}: {e}", exc_info=True)
-        raise RepositoryError(f"Failed to retrieve chat history for session {session_id}.") from e
+    result = await db.execute(stmt)
+    messages = result.scalars().all()
+    logger.debug(f"Retrieved {len(messages)} history messages for session {session_id}")
+    # Return in ascending order (oldest first) for typical history display
+    return messages[::-1]
 
 async def add_feedback(
     db: AsyncSession,
@@ -324,8 +331,10 @@ async def add_feedback(
     logger.info(f"Adding feedback for request {request_id}, session {session_id}, user {user_id}, rating {rating}")
     try:
         # Query for the specific message, joining with session to verify ownership
+        # Eagerly load related feedback using selectinload
         message_stmt = (
             select(ChatMessage)
+            .options(selectinload(ChatMessage.feedback_entries)) # Eager load feedback
             .join(ChatSession, ChatMessage.session_id == ChatSession.session_id)
             .where(
                 ChatMessage.request_id == request_id,
@@ -340,16 +349,15 @@ async def add_feedback(
             logger.warning(f"Feedback rejected: ChatMessage not found or not authorized for request {request_id}, session {session_id}, user {user_id}, org {organization_id}")
             raise RecordNotFound(f"Original interaction not found or not authorized for request ID {request_id}.")
 
-        # Check for existing feedback for this specific request ID using the correct attribute name
-        feedback_stmt = select(InteractionFeedback).where(InteractionFeedback.request_id == request_id)
-        feedback_result = await db.execute(feedback_stmt)
-        existing_feedback = feedback_result.scalar_one_or_none()
+        # Check the eager-loaded feedback (should be 0 or 1)
+        existing_feedback = chat_message.feedback_entries[0] if chat_message.feedback_entries else None
 
         if existing_feedback:
             # Compare UUID objects directly (DB is UUID, model is UUID, input is UUID)
             if existing_feedback.user_id != user_id:
                  logger.error(f"Feedback integrity issue: Attempt by user {user_id} to update feedback originally submitted by user {existing_feedback.user_id} for request {request_id}.")
-                 raise RecordNotFound("Feedback record conflict or mismatch.")
+                 # Raise a specific error to prevent unauthorized updates
+                 raise FeedbackIntegrityError(f"User {user_id} cannot update feedback owned by user {existing_feedback.user_id}.")
             logger.info(f"Updating existing feedback for request {request_id}")
             existing_feedback.rating = rating
             feedback_to_return = existing_feedback
@@ -359,24 +367,29 @@ async def add_feedback(
             # Create InteractionFeedback object - use model attribute names
             new_feedback = InteractionFeedback(
                 feedback_id=uuid.uuid4(),
-                request_id=request_id,
+                request_id=request_id, # Use request_id from the validated chat_message
                 user_id=user_id,
                 rating=rating,
+                interaction=chat_message # Link back to the message object
             )
             db.add(new_feedback)
             feedback_to_return = new_feedback
             
         # Commit transaction after adding/updating
         await db.commit()
+        await db.refresh(feedback_to_return) # Refresh to get DB state if needed
         logger.info(f"Successfully submitted feedback for request {request_id}")
         return feedback_to_return
-    except ValueError:
+    except ValueError: # Catch potential UUID conversion errors if session_id was passed incorrectly
         await db.rollback()
         logger.warning(f"Invalid session ID format provided for feedback: {session_id}")
         raise RecordNotFound("Invalid session ID format provided.")
     except RecordNotFound as e:
         await db.rollback()
-        raise e
+        raise e # Re-raise RecordNotFound
+    except FeedbackIntegrityError as e:
+        await db.rollback()
+        raise e # Re-raise FeedbackIntegrityError
     except sqlalchemy.exc.IntegrityError as e:
         await db.rollback()
         logger.error(f"Database integrity error submitting feedback for request {request_id}: {e}", exc_info=True)
