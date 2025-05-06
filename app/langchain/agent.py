@@ -13,6 +13,10 @@ import openai
 from openai import APIConnectionError, APITimeoutError, RateLimitError 
 import copy
 import sqlparse 
+from sqlalchemy import inspect, MetaData, text
+
+from app.db.connection import get_async_db_engine
+from app.db.schema_definitions import SCHEMA_DEFINITIONS
 
 # LangChain & LangGraph Imports
 from langchain_core.messages import BaseMessage, FunctionMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
@@ -38,42 +42,52 @@ usage_logger = logging.getLogger("usage")
 
 
 # --- Helper Function to Get Schema String --- #
+def _format_column_description(col: Dict[str, Any]) -> str:
+    # ... (rest of _format_column_description - unchanged)
+    pass
+
+@functools.lru_cache(maxsize=4) # Add LRU cache decorator
 def _get_schema_string(db_name: str = "report_management") -> str:
-    """Gets schema information from predefined schema definitions as a formatted string."""
-    from app.db.schema_definitions import SCHEMA_DEFINITIONS 
-    logger.debug(f"[_get_schema_string] Fetching schema for database: {db_name}")
-    
+    """Generates a formatted string representation of the schema for a given database.
+       Uses LRU cache to avoid repeated computation/fetching.
+       Gets schema information from predefined SCHEMA_DEFINITIONS.
+    """
+    # Check cache first implicitly by decorator
+    logger.debug(f"[_get_schema_string] Generating/Fetching schema for database: {db_name}") # Log reflects potential fetch
+
     if db_name not in SCHEMA_DEFINITIONS:
         error_msg = f"No schema definition found for database {db_name}."
         logger.warning(f"[_get_schema_string] {error_msg}")
         return error_msg
-    
+
     db_info = SCHEMA_DEFINITIONS[db_name]
     schema_info = [
         f"Database: {db_name}",
         f"Description: {db_info['description']}",
         ""
     ]
-    
+
     for table_name, table_info in db_info['tables'].items():
-        schema_info.append(f"Table: {table_name}")
+        # Use the 'name' field if present, otherwise use the key
+        physical_table_name = table_info.get('name', table_name)
+        schema_info.append(f"Table: {physical_table_name} (Logical Name: {table_name})")
         schema_info.append(f"Description: {table_info['description']}")
-        
+
         schema_info.append("Columns:")
         for column in table_info['columns']:
             primary_key = " (PRIMARY KEY)" if column.get('primary_key') else ""
             foreign_key = f" (FOREIGN KEY -> {column.get('foreign_key')})" if column.get('foreign_key') else ""
             timestamp_note = " (Timestamp for filtering)" if 'timestamp' in column['type'].lower() else ""
             schema_info.append(f"  {column['name']} ({column['type']}){primary_key}{foreign_key} - {column['description']}{timestamp_note}")
-        
-        if 'example_queries' in table_info:
+
+        if 'example_queries' in table_info and table_info['example_queries']:
             schema_info.append("Example queries:")
             for query in table_info['example_queries']:
                 schema_info.append(f"  {query}")
-        
+
         schema_info.append("")  # Empty line between tables
-    
-    logger.debug(f"[_get_schema_string] Successfully retrieved schema for {db_name}")
+
+    logger.debug(f"[_get_schema_string] Successfully generated/retrieved schema for {db_name}")
     return "\n".join(schema_info)
 
 
@@ -356,23 +370,23 @@ def create_llm_with_tools_and_final_response_structure(organization_id: str):
 
 # --- Agent Node: Decides action - call a tool or invoke FinalApiResponseStructure ---
 def _get_sql_call_signature(args: Dict[str, Any]) -> tuple:
-    """Generates a signature for an execute_sql call, ignoring ORDER BY and LIMIT clauses."""
+    """
+    Generates a signature for an execute_sql call based on the
+    normalized SQL text and its parameters.
+    """
     sql = args.get("sql", "")
     params = args.get("params", {})
-    
-    # Attempt to remove ORDER BY and LIMIT clauses from the end of the main query
-    # This regex looks for ORDER BY or LIMIT at the end, possibly preceded/followed by whitespace/semicolon
-    # It handles potential trailing whitespace and semicolons more robustly.
-    # We use re.IGNORECASE as SQL keywords aren't always consistently cased.
-    core_sql = re.sub(r'\s*(?:ORDER\s+BY\s+.*?|LIMIT\s+\d+)\s*;?\s*$', '', sql, flags=re.IGNORECASE | re.DOTALL).strip()
-    # Fallback if regex fails or removes too much (simple safety check)
-    if not core_sql or len(core_sql) < 10: # Arbitrary short length check
-        core_sql = sql # Use original if regex result seems invalid
-        
-    # Create a canonical representation of parameters
-    params_signature = json.dumps(params, sort_keys=True)
-    
-    return (core_sql, params_signature)
+
+    # Normalize SQL: lowercase and consolidate whitespace
+    # Keep structural elements like LIMIT, OFFSET, ORDER BY
+    normalized_sql = ' '.join(sql.lower().split())
+
+    # Create a canonical representation of parameters (sorted tuple of items)
+    # Using tuple makes it hashable directly
+    params_signature_items = tuple(sorted(params.items()))
+
+    # Return a tuple including the tool name for absolute clarity
+    return ("execute_sql", normalized_sql, params_signature_items)
 
 def agent_node(state: AgentState, llm_with_structured_output):
     """Invokes the LLM ONCE to decide the next action or final response structure.
@@ -728,87 +742,130 @@ def agent_node(state: AgentState, llm_with_structured_output):
 
 def _preprocess_state_for_llm(state: AgentState) -> AgentState:
     """
-    Preprocess the state to ensure it's optimized for LLM context window.
-    This helps prevent issues with the LLM failing due to context limitations.
+    Preprocess the state to ensure it's optimized for LLM context window AND
+    preserves the integrity of AIMessage/ToolMessage pairs.
+    This helps prevent issues with the LLM failing due to context limitations
+    or invalid message sequences.
     """
     processed_state = {k: v for k, v in state.items()}
-    
-    # Handle messages pruning 
-    if 'messages' in processed_state and len(processed_state['messages']) > settings.MAX_STATE_MESSAGES:
-        messages = processed_state['messages']
-        logger.debug(f"Pruning messages from {len(messages)} to {settings.MAX_STATE_MESSAGES}")
-        # Keep the first system message if present
-        system_msg = next((msg for msg in messages if isinstance(msg, SystemMessage)), None)
-        first_user_msg = next((msg for msg in messages if isinstance(msg, HumanMessage)), None)
-        last_user_msg = next((msg for msg in reversed(messages) if isinstance(msg, HumanMessage)), None)
-        tool_messages = [msg for msg in messages if isinstance(msg, ToolMessage)]
-        recent_tool_messages = tool_messages[-5:]
-        ai_messages = [msg for msg in messages if isinstance(msg, AIMessage)]
-        recent_ai_messages = ai_messages[-3:]
-        keep_messages = set() # Store message IDs (hashable) instead of objects
-        if system_msg: keep_messages.add(id(system_msg))
-        if first_user_msg: keep_messages.add(id(first_user_msg))
-        if last_user_msg: keep_messages.add(id(last_user_msg))
-        for msg in recent_tool_messages: keep_messages.add(id(msg))
-        for msg in recent_ai_messages: keep_messages.add(id(msg))
+    max_messages = settings.MAX_STATE_MESSAGES
 
-        preserved_messages: List[BaseMessage] = []
-        # Use the same check as before (id(msg) in keep_messages)
-        # but remove the redundant added_ids set as keep_messages now holds unique IDs
-        for msg in messages:
-             if id(msg) in keep_messages:
-                 preserved_messages.append(msg)
-                 keep_messages.remove(id(msg)) # Ensure duplicates aren't added if first/last overlap
+    if 'messages' in processed_state and len(processed_state['messages']) > max_messages:
+        original_messages = processed_state['messages']
+        logger.debug(f"Starting pruning messages from {len(original_messages)} down to target ~{max_messages}")
 
-        # Re-sort preserved messages to approximate original order (System, FirstUser, Middle, LastUser/AI/Tools)
-        # This simple sort isn't perfect but better than arbitrary set order.
-        # A more robust approach might involve storing original indices.
-        preserved_messages.sort(key=lambda m: messages.index(m))
+        preserved_messages_reversed: List[BaseMessage] = []
+        system_message: Optional[SystemMessage] = None
+        temp_tool_messages: List[ToolMessage] = []
+        num_preserved = 0
 
-        if len(preserved_messages) > settings.MAX_STATE_MESSAGES:
-            # Refined pruning logic if needed after preserving key messages
-            # This section might need adjustment depending on the exact desired preservation strategy
-            # For now, let's keep it simple: prioritize system, first user, last user, recent AI/Tool
-            # This part seems overly complex and might be the source of issues if preservation count exceeds max.
-            # Let's simplify the pruning after identifying core messages:
-            
-            # Simplified approach: If still too many, trim from the middle (after system/first user)
-            num_to_remove = len(preserved_messages) - settings.MAX_STATE_MESSAGES
-            if num_to_remove > 0:
-                start_index = 0
-                if system_msg in preserved_messages: start_index += 1
-                if first_user_msg in preserved_messages and first_user_msg is not system_msg: start_index +=1
-                
-                end_index = len(preserved_messages)
-                if last_user_msg in preserved_messages: end_index -=1
-                # Remove 'num_to_remove' messages from the middle section
-                del preserved_messages[start_index : start_index + num_to_remove]
+        # Find and preserve the system message first
+        original_without_system = []
+        for msg in original_messages:
+            if isinstance(msg, SystemMessage) and system_message is None:
+                system_message = msg
+            else:
+                original_without_system.append(msg)
 
-        processed_state['messages'] = preserved_messages
-        logger.debug(f"After pruning, kept {len(processed_state['messages'])} messages")
-    
-    # Process tables - limit large ones
+        # Iterate backwards through messages (excluding system message)
+        for msg in reversed(original_without_system):
+            # Stop preserving if we've hit the target count
+            if num_preserved >= max_messages:
+                logger.debug(f"Reached approx max message limit ({max_messages}), stopping preservation.")
+                break
+
+            if isinstance(msg, ToolMessage):
+                # Collect tool messages potentially belonging to the preceding AI turn
+                temp_tool_messages.insert(0, msg) # Insert at beginning to maintain order
+                logger.debug(f"Temporarily holding ToolMessage (ID: {msg.tool_call_id})")
+                # Don't add to preserved_messages_reversed or increment num_preserved yet
+
+            elif isinstance(msg, AIMessage):
+                associated_tool_messages = []
+                is_pair = False
+                if msg.tool_calls:
+                    # This AI message called tools. Check if we have its responses in temp.
+                    matching_tool_ids = {tc['id'] for tc in msg.tool_calls}
+                    # Check if temp_tool_messages contains *only* responses for this AI msg
+                    if temp_tool_messages and all(tm.tool_call_id in matching_tool_ids for tm in temp_tool_messages):
+                        # Found a complete pair (or set of pairs)
+                        associated_tool_messages = temp_tool_messages # These belong together
+                        is_pair = True
+                        logger.debug(f"Identified AIMessage (ID: {msg.id}) with {len(associated_tool_messages)} matching ToolMessage(s).")
+                        # Clear temp ONLY after successful pairing below
+                    else:
+                        # This AIMessage expected tool calls, but temp_tool_messages is empty or doesn't match.
+                        if temp_tool_messages:
+                            logger.warning(f"Discarding {len(temp_tool_messages)} ToolMessage(s) orphaned before AIMessage(TC) (ID: {msg.id}).")
+                            temp_tool_messages = [] # Clear orphans before preserving AIMessage(TC)
+                        logger.debug(f"Identified orphaned AIMessage(TC) (ID: {msg.id}) - ToolMessages potentially missing/pruned.")
+                else:
+                     # Simple AIMessage, no tool calls. Any temp_tool_messages are orphans.
+                     if temp_tool_messages:
+                        logger.warning(f"Discarding {len(temp_tool_messages)} ToolMessage(s) orphaned before simple AIMessage (ID: {msg.id}).")
+                        temp_tool_messages = [] # Clear orphans
+
+                # Now, decide whether to preserve this AIMessage and potentially its tools
+                messages_to_add = [msg] + associated_tool_messages # AIMsg + its tools (if any)
+                current_block_size = len(messages_to_add)
+
+                # Check if adding this block fits
+                if num_preserved + current_block_size <= max_messages + 2: # Soft limit
+                    preserved_messages_reversed.extend(reversed(messages_to_add)) # Add block newest-first
+                    num_preserved += current_block_size
+                    logger.debug(f"Preserved {type(msg).__name__} block (size {current_block_size}). Total preserved: {num_preserved}")
+                    if is_pair:
+                        temp_tool_messages = [] # Crucial: Clear temp ONLY after successful pairing
+                else:
+                    logger.debug(f"Stopping preservation: Adding {type(msg).__name__} block (size {current_block_size}) would exceed limits ({num_preserved}/{max_messages}).")
+                    break # Stop processing older messages
+
+            elif isinstance(msg, HumanMessage):
+                # Human message encountered. Any temp_tool_messages are orphans.
+                if temp_tool_messages:
+                    logger.warning(f"Discarding {len(temp_tool_messages)} ToolMessage(s) orphaned before HumanMessage.")
+                    temp_tool_messages = [] # Clear orphans
+
+                # Preserve the HumanMessage if space allows
+                if num_preserved < max_messages:
+                    preserved_messages_reversed.append(msg)
+                    num_preserved += 1
+                    logger.debug(f"Preserved HumanMessage. Total preserved: {num_preserved}")
+                else:
+                     logger.debug(f"Stopping preservation: Adding HumanMessage would exceed limits ({num_preserved}/{max_messages}).")
+                     break # Stop processing older messages
+
+        # Final assembly
+        final_preserved_messages = []
+        if system_message:
+            final_preserved_messages.append(system_message)
+
+        # Add the messages preserved during backward iteration (newest-first)
+        # Reverse them to get chronological order before adding
+        preserved_messages_reversed.reverse()
+        final_preserved_messages.extend(preserved_messages_reversed)
+
+        processed_state['messages'] = final_preserved_messages
+        logger.debug(f"Final pruned message count: {len(processed_state['messages'])}. Structure preserved: {[(type(m).__name__ + ('(TC)' if isinstance(m, AIMessage) and m.tool_calls else '')) for m in processed_state['messages']]}")
+
+    # --- Existing table truncation logic remains unchanged --- #
     if 'structured_results' in processed_state and processed_state['structured_results']:
-        original_structured_results = state['structured_results'] # Get original for row count
+        original_structured_results = state['structured_results'] 
         processed_structured_results = []
         for i, result in enumerate(processed_state['structured_results']):
-            processed_result = result.copy() # Shallow copy is fine, we only modify table
+            processed_result = result.copy()
             if 'table' in processed_result and isinstance(processed_result['table'], dict):
-                processed_table = processed_result['table'].copy() # Copy table dict
-                max_rows = settings.MAX_TABLE_ROWS_IN_STATE 
+                processed_table = processed_result['table'].copy()
+                max_rows = settings.MAX_TABLE_ROWS_IN_STATE
                 if 'rows' in processed_table and len(processed_table['rows']) > max_rows:
                     logger.debug(f"Truncating table index {i} rows from {len(processed_table['rows'])} to {max_rows}")
                     processed_table['rows'] = processed_table['rows'][:max_rows]
                     if 'metadata' not in processed_table: processed_table['metadata'] = {}
                     processed_table['metadata']['truncated'] = True
-                    # Get original row count from corresponding original result
                     original_table = original_structured_results[i].get('table', {})
                     processed_table['metadata']['original_rows'] = len(original_table.get('rows', []))
-                # Update the table within the copied result dict
                 processed_result['table'] = processed_table
-            # Append the processed result (with potentially truncated table) to the new list
             processed_structured_results.append(processed_result)
-        # Replace the old list with the processed one
         processed_state['structured_results'] = processed_structured_results
 
     return processed_state

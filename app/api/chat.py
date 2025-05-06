@@ -1,7 +1,7 @@
 import logging
 import uuid
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any, Sequence
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Query, Body, Path
@@ -164,6 +164,9 @@ async def chat(
 
     # --- Background Logging & Agent Call (Stateful - chat_session is guaranteed valid) --- #
     
+    # Define a variable to hold assistant content for logging, default to None
+    assistant_content_for_log: Optional[str] = None
+
     # Schedule Initial Log
     background_tasks.add_task(
         log_initial_chat_message,
@@ -204,94 +207,74 @@ async def chat(
 
     except asyncio.TimeoutError:
         logger.warning(f"Agent processing timed out for STATEFUL request {request_id} after {settings.AGENT_TIMEOUT_SECONDS} seconds.")
-        # Log timeout completion - maybe with error status?
-        background_tasks.add_task(
-            log_complete_chat_message,
-            db=db,
-            request_id=request_id,
-            session_id=session_id_str_for_logging_and_agent,
-            user_id=user_id,
-            organization_id=organization_id,
-            user_content=chat_request.message,
-            assistant_content="[Agent Timeout]",
-            prompt_tokens=prompt_tokens, # Log tokens accumulated before timeout if available
-            completion_tokens=completion_tokens,
-        )
+        # SET assistant_content_for_log for timeout case
+        assistant_content_for_log = "[Agent Timeout]"
+        # DO NOT schedule log_complete_chat_message here
         raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="Chat processing timed out.")
 
     except Exception as e:
         logger.error(f"Error during agent processing for STATEFUL request {request_id}: {e}", exc_info=True)
-        # Log error completion
-        background_tasks.add_task(
-            log_complete_chat_message,
-            db=db,
-            request_id=request_id,
-            session_id=session_id_str_for_logging_and_agent,
-            user_id=user_id,
-            organization_id=organization_id,
-            user_content=chat_request.message,
-            assistant_content=f"[Agent Error]: {str(e)[:500]}", # Log truncated error
-            prompt_tokens=prompt_tokens, # Log tokens accumulated before error if available
-            completion_tokens=completion_tokens,
-        )
+        # SET assistant_content_for_log for error case
+        assistant_content_for_log = f"[Agent Error]: {str(e)[:500]}" # Log truncated error
+        # DO NOT schedule log_complete_chat_message here
         # Determine appropriate status code based on error type if possible
         status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
         detail = "An error occurred during chat processing."
         raise HTTPException(status_code=status_code, detail=detail)
     # --- End Call Langchain Agent (Stateful) --- #
 
-    # Schedule Completion Log
-    background_tasks.add_task(
-        log_complete_chat_message,
-        db=db,
-        request_id=request_id,
-        session_id=session_id_str_for_logging_and_agent, # Use the confirmed session ID
-        user_id=user_id,
-        organization_id=organization_id,
-        user_content=chat_request.message,
-        assistant_content=agent_response_data.get("text") if agent_status == "success" else None,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens
-    )
-    logger.debug(f"Scheduled background task to log complete message for request {request_id}.")
-
     # --- Construct Final Response (Stateful) --- #
     if agent_status == "success":
         # Construct response data
         response_data = ChatData(**agent_response_data)
+        # Set assistant_content_for_log for success case
+        assistant_content_for_log = response_data.text if response_data else None
         response = ChatResponse(
             status="success",
             request_id=request_id,
             data=response_data,
             session_id=chat_session.session_id # Use the confirmed session UUID
         )
-
-        # Schedule final log AFTER constructing success response
-        background_tasks.add_task(
-            log_complete_chat_message,
-            db=db,
-            request_id=request_id,
-            session_id=session_id_str_for_logging_and_agent,
-            user_id=user_id,
-            organization_id=organization_id,
-            user_content=chat_request.message, # Use original message
-            assistant_content=response_data.text if response_data else None, # Get text from ChatData
-            prompt_tokens=prompt_tokens, # Use extracted tokens
-            completion_tokens=completion_tokens,
-            # metadata=None # Pass metadata if agent provides it
-        )
-        return response # Return successful response
+        # DO NOT schedule log_complete_chat_message here anymore
+        # It will be scheduled once after this if/else block
     else:
-        # Handle agent error status
-        final_response = ChatResponse(
+        # Handle agent error status (this path might be less likely if exceptions above raise HTTPException)
+        # If an exception was raised above, this 'else' block might not be reached.
+        # However, if agent_status is set to 'error' by process_chat_message without raising an exception
+        # that gets caught by the outer try-except, this path is relevant.
+        logger.info(f"[ReqID: {request_id}] Agent returned status '{agent_status}' but did not raise an exception caught by the main handler. Constructing error response.")
+        if not assistant_content_for_log: # Ensure it's set if not already by an earlier specific error
+             assistant_content_for_log = agent_response_data.get("text") or "[Agent Error - No specific message]"
+
+        response = ChatResponse( # Use response instead of final_response for consistency
             status=agent_status,
-            data=ChatData(**agent_response_data) if agent_status == "success" and agent_response_data else None,
-            error=None,
-            timestamp=datetime.now(),
-            session_id=chat_session.session_id # Include the actual session ID (found or created)
+            request_id=request_id, # Add request_id
+            data=None, # No data on error
+            error={"message": assistant_content_for_log}, # Include error message
+            timestamp=datetime.now(timezone.utc), # Use timezone aware
+            session_id=chat_session.session_id
         )
-        logger.info(f"Completed STATEFUL chat request {request_id}")
-        return final_response
+
+    # --- SINGLE, FINAL COMPLETION LOG --- #
+    # This task will be scheduled regardless of success or caught agent error (that led to HTTPException)
+    # It relies on assistant_content_for_log being set appropriately in all paths.
+    # If an HTTPException was raised, the response is sent before this, but the task is still added.
+    background_tasks.add_task(
+        log_complete_chat_message,
+        db=db,
+        request_id=request_id,
+        session_id=session_id_str_for_logging_and_agent,
+        user_id=user_id,
+        organization_id=organization_id,
+        user_content=chat_request.message,
+        assistant_content=assistant_content_for_log, # Use the determined content
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens
+    )
+    logger.debug(f"[ReqID: {request_id}] Scheduled FINAL background task to log complete message.")
+
+    logger.info(f"Completed STATEFUL chat request {request_id} with status: {response.status}")
+    return response
     # --- END UNIFIED STATEFUL LOGIC --- #
 
 # --- Add Feedback Endpoint ---
