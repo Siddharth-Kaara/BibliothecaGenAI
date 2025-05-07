@@ -14,6 +14,7 @@ from openai import APIConnectionError, APITimeoutError, RateLimitError
 import copy
 import sqlparse 
 from sqlalchemy import inspect, MetaData, text
+from fastapi import HTTPException
 
 from app.db.connection import get_async_db_engine
 from app.db.schema_definitions import SCHEMA_DEFINITIONS
@@ -870,24 +871,102 @@ def _preprocess_state_for_llm(state: AgentState) -> AgentState:
 
     return processed_state
 
-# --- Helper Function to Apply Resolved IDs --- #
-def _apply_resolved_ids_to_sql_args(sql: str, params: Dict[str, Any], resolved_map: Dict[str, str]) -> Tuple[str, Dict[str, Any]]:
-    """
-    Replaces name-based filters in SQL with ID-based filters using a resolved map.
-    Uses sqlparse for robust identification and replacement of name filters.
+# --- Helper Function to Apply Resolved IDs to SQL PARAMS  ---
+def _preprocess_sql_params(
+    params: Optional[Dict[str, Any]], 
+    resolved_map: Optional[Dict[str, str]],
+    current_organization_id: str, # Trusted organization_id for the request
+    log_prefix: str = "[SQL Param Preprocessing]"
+) -> Dict[str, Any]:
+    """Processes SQL parameters to ensure correct organization_id and resolve placeholders for known ID types."""
+    if params is None:
+        # If LLM provides no params, but SQL expects :organization_id, ensure it's added.
+        logger.debug(f"{log_prefix} Original params dictionary is None. Initializing with trusted organization_id.")
+        return {"organization_id": current_organization_id}
 
-    Args:
-        sql: The original SQL query string.
-        params: The original parameters dictionary.
-        resolved_map: A dictionary mapping lowercase location names to resolved UUIDs.
+    processed_params = params.copy() # Work on a copy
 
-    Returns:
-        A tuple containing the modified SQL string and the updated parameters dictionary.
-    """
+    # Ensure organization_id is present and correct, or inject it if missing/wrong from LLM.
+    # This is a security measure to enforce data scoping.
+    llm_org_id = processed_params.get("organization_id")
+    if llm_org_id != current_organization_id:
+        logger.warning(
+            f"{log_prefix} LLM provided organization_id '{llm_org_id}' does not match trusted ID '{current_organization_id}' or was missing. Overwriting/injecting trusted ID."
+        )
+        processed_params["organization_id"] = current_organization_id
+    else:
+        logger.debug(f"{log_prefix} Confirmed organization_id '{current_organization_id}' from LLM matches trusted ID or was correctly set.")
+
     if not resolved_map:
-        return sql, params # No map, nothing to do
+        logger.debug(f"{log_prefix} resolved_location_map is None or empty. Skipping further parameter substitution.")
+        return processed_params
+    
+    logger.debug(f"{log_prefix} Current resolved_map for substitution: {resolved_map}")
 
-    logger.debug(f"[SQL Correction] Applying resolved IDs using sqlparse. Map: {resolved_map}")
+    # Known ID keys that might need resolution if their value isn't a UUID
+    known_id_keys_for_resolution = {"branch_id", "hierarchy_id", "location_id", "hierarchyId"} # Case-sensitive match for keys in params
+
+    for key, value in list(processed_params.items()): # Iterate over a copy for safe modification
+        logger.debug(f"{log_prefix} Processing param - Key: '{key}', Value: '{value}', Type: {type(value)}")
+        substituted_this_iteration = False
+
+        if key in known_id_keys_for_resolution and isinstance(value, str):
+            try:
+                uuid.UUID(value) # Check if it's already a valid UUID string
+                logger.debug(f"{log_prefix} Param '{key}' ('{value}') is already a valid UUID. No substitution needed.")
+            except ValueError:
+                logger.debug(f"{log_prefix} Param '{key}' ('{value}') is a string but not a UUID. Attempting lookup in resolved_map using value as key.")
+                if value in resolved_map: # e.g., if value is 'argyle' (lowercase) and 'argyle' is a key in resolved_map
+                    resolved_uuid = resolved_map[value]
+                    processed_params[key] = resolved_uuid
+                    substituted_this_iteration = True
+                    logger.info(f"{log_prefix} SUCCESS: Substituted non-UUID value for known ID key '{key}' (was '{value}') with resolved UUID '{resolved_uuid}' using map key '{value}'.")
+                else:
+                    logger.warning(f"{log_prefix} FAILED_LOOKUP (val): Param '{key}' has non-UUID value '{value}', but no match found in resolved_map using '{value}' as key.")
+        
+        # Check for placeholder values like '<resolved_name_id>' if not already substituted
+        if not substituted_this_iteration and isinstance(value, str) and value.startswith("<resolved_") and value.endswith("_id>"):
+            logger.debug(f"{log_prefix} Param '{key}' has placeholder value '{value}'. Attempting extraction and lookup.")
+            # Try to extract key from placeholder itself, e.g., <resolved_argyle_id> -> argyle
+            placeholder_content_match = re.match(r"<resolved_([a-zA-Z0-9_.-]+)_id>", value) # Allow . and - in resolved names
+            
+            extracted_key_from_placeholder = None
+            if placeholder_content_match:
+                extracted_key_from_placeholder = placeholder_content_match.group(1).lower()
+                logger.debug(f"{log_prefix} Extracted key '{extracted_key_from_placeholder}' from placeholder '{value}'.")
+                if extracted_key_from_placeholder in resolved_map:
+                    resolved_uuid = resolved_map[extracted_key_from_placeholder]
+                    processed_params[key] = resolved_uuid
+                    substituted_this_iteration = True
+                    logger.info(f"{log_prefix} SUCCESS: Substituted placeholder for '{key}' (was '{value}') with resolved UUID '{resolved_uuid}' using extracted map key '{extracted_key_from_placeholder}'.")
+                else:
+                    logger.warning(f"{log_prefix} FAILED_LOOKUP (extracted_placeholder): Param '{key}' ('{value}'), extracted key '{extracted_key_from_placeholder}' not in resolved_map: {list(resolved_map.keys())}")    
+            else:
+                logger.warning(f"{log_prefix} Param '{key}' ('{value}') looks like a placeholder but regex did not match content.")
+
+            # Fallback: If placeholder extraction failed or didn't find a match, 
+            # try using the parameter key itself (lowercased) if it wasn't a known_id_key.
+            # This handles cases like LLM using param `argyle_id = "<some_placeholder>"` where `argyle_id` itself might be the map key
+            if not substituted_this_iteration and key.lower() in resolved_map and key not in known_id_keys_for_resolution:
+                resolved_uuid = resolved_map[key.lower()]
+                processed_params[key] = resolved_uuid
+                substituted_this_iteration = True
+                logger.info(f"{log_prefix} SUCCESS: Substituted placeholder/value for '{key}' (was '{value}') with resolved UUID '{resolved_uuid}' using param key '{key.lower()}' as map key.")
+            elif not substituted_this_iteration and key.lower() not in resolved_map and key not in known_id_keys_for_resolution:
+                 logger.warning(f"{log_prefix} FAILED_LOOKUP (param_key): Param '{key}' ('{value}'), its lowercased key '{key.lower()}' also not in resolved_map (and not a known_id_key). Placeholder remains.")
+
+        if not substituted_this_iteration and isinstance(value, str) and value.startswith("<") and value.endswith(">"):
+             logger.warning(f"{log_prefix} Param '{key}' ('{value}') appears to be an unresolved placeholder and was not substituted by any rule.")
+
+    logger.debug(f"{log_prefix} Final processed params: {processed_params}")
+    return processed_params
+
+# --- Helper Function to Apply Resolved IDs to SQL STRING (EXISTING) ---
+def _apply_resolved_ids_to_sql_args(sql: str, params: Dict[str, Any], resolved_map: Dict[str, str]) -> Tuple[str, Dict[str, Any]]:
+    if not resolved_map:
+        return sql, params
+
+    logger.debug(f"[SQL Correction] Applying resolved IDs to SQL string using sqlparse. Map: {resolved_map}")
     updated_params = params.copy()
     new_params_added: Dict[str, str] = {}
     param_counter = 0
@@ -899,42 +978,36 @@ def _apply_resolved_ids_to_sql_args(sql: str, params: Dict[str, Any], resolved_m
             logger.warning("[SQL Correction] Failed to parse SQL with sqlparse. Returning original.")
             return sql, params
         
-        stmt = parsed[0] # Assume single statement
+        stmt = parsed[0]
 
-        # --- Recursive Token Traversal --- #
         def traverse_and_replace(token_list: List[sqlparse.sql.Token]):
             nonlocal param_counter, modified
             i = 0
             while i < len(token_list):
                 token = token_list[i]
-                replacement_made = False # Flag to check if token at index i was replaced
+                replacement_made = False
                 
-                # Look for Comparison tokens (e.g., col = 'value', col IN ('v1', 'v2'))
                 if isinstance(token, sqlparse.sql.Comparison):
                     left_identifier = None
                     operator_token = None
                     right_operand = None
                     
-                    # Simple structure check: Identifier Operator Operand
                     comp_tokens = [t for t in token.flatten() if not t.is_whitespace]
                     if len(comp_tokens) >= 3 and isinstance(comp_tokens[0], sqlparse.sql.Identifier):
                         left_identifier = comp_tokens[0]
                         operator_token = comp_tokens[1]
-                        right_operand = comp_tokens[2] # This could be Identifier, Parenthesis, etc.
+                        right_operand = comp_tokens[2]
                     
                     if left_identifier and operator_token and right_operand:
-                        # Check if left operand is a name column (e.g., hc."name")
                         left_str = str(left_identifier).lower()
-                        if left_str.endswith('."name"'): # Simple check for alias."name"
-                            alias = left_str.split('.')[0] # Extract alias (e.g., hc)
+                        if left_str.endswith('.\"name\"'): # Using .\"name\" to match literal quotes if present
+                            alias = left_str.split('.')[0]
                             names_to_resolve = []
                             new_param_dict = {}
 
-                            # Check operator and extract name(s)
                             if operator_token.value == '=' and right_operand.ttype is sqlparse.tokens.String.Single:
                                 names_to_resolve = [right_operand.value.strip("'")]
                             elif operator_token.value.upper() == 'IN' and isinstance(right_operand, sqlparse.sql.Parenthesis):
-                                # Extract names from IN list ('Name1', 'Name2', ...)
                                 names_to_resolve = [ 
                                     t.value.strip("'") for t in right_operand.flatten() 
                                     if t.ttype is sqlparse.tokens.String.Single
@@ -953,13 +1026,11 @@ def _apply_resolved_ids_to_sql_args(sql: str, params: Dict[str, Any], resolved_m
                                         new_param_dict[param_name] = resolved_id
                                         param_counter += 1
                                     else:
-                                        logger.warning(f"[SQL Correction] Name '{name}' found in SQL filter but not in resolved map. Skipping.")
+                                        logger.warning(f"[SQL Correction] Name '{name}' in SQL filter not in resolved map. Skipping.")
 
                                 if resolved_ids:
-                                    # Construct replacement SQL segment tokens
-                                    id_column_token = sqlparse.sql.Identifier(f'{alias}."id"') # Use captured alias
+                                    id_column_token = sqlparse.sql.Identifier(f'{alias}.\"id\"')
                                     new_comparison_tokens = []
-
                                     if len(resolved_ids) == 1:
                                         op_token = sqlparse.sql.Token(sqlparse.tokens.Operator, '=')
                                         param_token = sqlparse.sql.Token(sqlparse.tokens.Name.Placeholder, param_names_for_sql[0])
@@ -968,42 +1039,34 @@ def _apply_resolved_ids_to_sql_args(sql: str, params: Dict[str, Any], resolved_m
                                                                  op_token, 
                                                                  sqlparse.sql.Token(sqlparse.tokens.Whitespace, ' '), 
                                                                  param_token]
-                                    else: # IN clause
+                                    else:
                                         op_token = sqlparse.sql.Token(sqlparse.tokens.Keyword, 'IN')
-                                        # Create parameter tokens list for Parenthesis
                                         param_tokens_inner = []
-                                        for idx, param_name in enumerate(param_names_for_sql):
-                                             param_tokens_inner.append(sqlparse.sql.Token(sqlparse.tokens.Name.Placeholder, param_name))
+                                        for idx, param_name_in_sql in enumerate(param_names_for_sql):
+                                             param_tokens_inner.append(sqlparse.sql.Token(sqlparse.tokens.Name.Placeholder, param_name_in_sql))
                                              if idx < len(param_names_for_sql) - 1:
                                                  param_tokens_inner.append(sqlparse.sql.Token(sqlparse.tokens.Punctuation, ','))
                                                  param_tokens_inner.append(sqlparse.sql.Token(sqlparse.tokens.Whitespace, ' '))
                                         parenthesis = sqlparse.sql.Parenthesis(param_tokens_inner)
-                                        
                                         new_comparison_tokens = [id_column_token, 
                                                                  sqlparse.sql.Token(sqlparse.tokens.Whitespace, ' '), 
                                                                  op_token,
                                                                  sqlparse.sql.Token(sqlparse.tokens.Whitespace, ' '), 
                                                                  parenthesis]
                                     
-                                    # Replace the original comparison token (token at index i)
-                                    token_list[i:i+1] = new_comparison_tokens # Replace slice
+                                    token_list[i:i+1] = new_comparison_tokens
                                     replacement_made = True
                                     modified = True
                                     new_params_added.update(new_param_dict)
-                                    logger.info(f"[SQL Correction] Replaced name filter '{str(token).strip()}' with ID filter.")
-                                    # Adjust index because we potentially replaced 1 token with multiple
+                                    logger.info(f"[SQL Correction] Replaced name filter '{str(token).strip()}' with ID filter using sqlparse.")
                                     i += len(new_comparison_tokens) - 1 
                                 else:
-                                    logger.warning(f"[SQL Correction] Could not resolve any names in filter: '{str(token).strip()}'. Keeping original.")
+                                    logger.warning(f"[SQL Correction] Could not resolve names in filter: '{str(token).strip()}'. Keeping original.")
                 
-                # Recursively process nested structures like Parenthesis, Function calls etc.
                 if not replacement_made and hasattr(token, 'tokens'):
                     traverse_and_replace(token.tokens)
-                
-                i += 1 # Move to next token
-        # --- End Recursive Traversal --- #
+                i += 1
         
-        # Start traversal from the top-level statement tokens
         traverse_and_replace(stmt.tokens)
 
     except Exception as e:
@@ -1013,31 +1076,23 @@ def _apply_resolved_ids_to_sql_args(sql: str, params: Dict[str, Any], resolved_m
     if modified:
         updated_params.update(new_params_added)
         modified_sql = str(stmt)
-        logger.info(f"[SQL Correction] Applied ID filters using sqlparse. Modified SQL tail: ...{modified_sql[-200:]}. Added params: {new_params_added}")
+        logger.info(f"[SQL Correction] Applied ID filters to SQL string. Modified SQL tail: ...{modified_sql[-200:]}. Added params: {new_params_added}")
         return modified_sql, updated_params
     else:
-        logger.debug("[SQL Correction] No name filters found matching resolved map keys using sqlparse.")
+        logger.debug("[SQL Correction] No name filters found in SQL string matching resolved map keys using sqlparse.")
         return sql, params
 
 # --- Tool Node Handler ---
 async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[str, Any]:
-    """
-    Enhanced asynchronous tools node handler. Executes OPERATIONAL tools only.
-    Corrects execute_sql calls using resolved IDs if available in state.
-    Adds resulting tables to the state and stores resolved ID map.
-    """
     request_id = state.get("request_id")
     logger.debug(f"[ToolsNode] Entering tool handler.")
     last_message = state["messages"][-1] if state["messages"] else None
     tool_map = {tool.name: tool for tool in tools}
-    tool_executions = []
-    successful_calls = 0
+    tool_execution_results = []
     operational_tool_calls = []
+    location_map_this_turn = {} 
+    successful_calls = 0 # Initialize successful_calls counter
 
-    # Initialize structure to hold map resolved ONLY in this turn
-    location_map_this_turn = {} # Initialize map for THIS turn's results
-
-    # Filter out non-operational "tool calls" (Final API Structure)
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
         operational_tool_calls = [
             tc for tc in last_message.tool_calls
@@ -1048,443 +1103,233 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
         logger.debug(f"[ToolsNode] No operational tool calls found in last message.")
         return {
             "messages": [],
-            "structured_results": state.get("structured_results", {}),
+            "structured_results": state.get("structured_results", []),
             "failure_patterns": state.get("failure_patterns", {}),
             "recovery_guidance": state.get("recovery_guidance"),
+            "resolved_location_map": state.get("resolved_location_map")
         }
 
     logger.debug(f"[ToolsNode] Dispatching {len(operational_tool_calls)} operational tool calls: {[tc.get('name') for tc in operational_tool_calls]}")
 
-    # Prepare tool execution details
+    prepared_tool_invocations = []
+
     for tool_call in operational_tool_calls:
         tool_name = tool_call.get("name")
-        tool_id = tool_call.get("id", "")
-        tool_args = tool_call.get("args", {})
-        if tool_name in tool_map:
-            tool_executions.append({
-                "tool": tool_map[tool_name],
-                "args": tool_args,
-                "id": tool_id,
-                "name": tool_name,
-                "retries_left": settings.TOOL_EXECUTION_RETRIES
-            })
-        else:
-             logger.error(f"[ToolsNode] Operational tool '{tool_name}' requested but not found.")
-             tool_executions.append(ToolMessage(
-                content=f"Error: Tool '{tool_name}' not found.",
-                tool_call_id=tool_id,
-                name=tool_name
-             ))
+        tool_id = tool_call.get("id", f"tool_call_{uuid.uuid4()}")
+        raw_tool_args = tool_call.get("args", {})
+        
+        current_tool_instance = tool_map.get(tool_name)
+        if not current_tool_instance:
+            logger.error(f"[ToolsNode] Tool '{tool_name}' (ID: {tool_id}) requested by LLM not found. Skipping.")
+            error_content = json.dumps({"error": {"type": "TOOL_NOT_FOUND", "message": f"Tool '{tool_name}' is not available."}})
+            tool_execution_results.append(ToolMessage(content=error_content, name=tool_name, tool_call_id=tool_id))
+            continue
 
-    if not tool_executions:
-        logger.warning(f"[ToolsNode] No operational tools could be prepared for execution.")
-        return {
-            "messages": [ToolMessage(content="Error: No operational tools could be prepared for execution.", tool_call_id="", name="")],
-            "structured_results": state.get("structured_results", {}),
-            "failure_patterns": state.get("failure_patterns", {}),
-            "recovery_guidance": state.get("recovery_guidance"),
-        }
+        processed_tool_args = raw_tool_args.copy()
 
-    sem = asyncio.Semaphore(settings.MAX_CONCURRENT_TOOLS)
+        if tool_name == "execute_sql":
+            trusted_org_id_for_tool = getattr(current_tool_instance, 'organization_id', None)
+            if not trusted_org_id_for_tool:
+                 logger.error(f"[ToolsNode] CRITICAL: SQLExecutionTool for call {tool_id} missing organization_id. Cannot process securely.")
+                 error_content = json.dumps({"error": {"type": "TOOL_CONFIG_ERROR", "message": "SQL tool is missing organization context."}})
+                 tool_execution_results.append(ToolMessage(content=error_content, name=tool_name, tool_call_id=tool_id))
+                 continue # Skip this tool call
+            
+            # 1. Preprocess parameters (e.g., org_id enforcement, non-UUID string to ID resolution)
+            current_sql_params = processed_tool_args.get("params")
+            logger.debug(f"[ToolsNode] Preprocessing params for 'execute_sql' (ID: {tool_id}) with trusted org_id: {trusted_org_id_for_tool}. Original params: {current_sql_params}")
+            preprocessed_params = _preprocess_sql_params(
+                params=current_sql_params,
+                resolved_map=state.get("resolved_location_map"),
+                current_organization_id=trusted_org_id_for_tool 
+            )
+            processed_tool_args["params"] = preprocessed_params # Update args with param-preprocessed params
+            
+            # 2. Apply SQL string literal correction (name -> ID in SQL string itself)
+            current_sql_string = processed_tool_args.get("sql", "")
+            if state.get("resolved_location_map") and current_sql_string: 
+                logger.debug(f"[ToolsNode] Applying SQL string literal correction for 'execute_sql' (ID: {tool_id}). SQL before: ...{current_sql_string[-100:]}")
+                modified_sql, final_params_after_sql_rewrite = _apply_resolved_ids_to_sql_args(
+                    sql=current_sql_string, 
+                    params=preprocessed_params, # Pass the already param-preprocessed params
+                    resolved_map=state.get("resolved_location_map")
+                )
+                processed_tool_args["sql"] = modified_sql
+                processed_tool_args["params"] = final_params_after_sql_rewrite 
+                logger.debug(f"[ToolsNode] Final SQL for call {tool_id} (tail): ...{modified_sql[-200:] if modified_sql else '[EMPTY SQL]'}. Final Params: {final_params_after_sql_rewrite}")
+            else:
+                logger.debug(f"[ToolsNode] Skipping SQL string literal correction for 'execute_sql' (ID: {tool_id}) (no resolved_map, empty SQL, or already handled). Params remain: {processed_tool_args.get('params')}")
+        # End of execute_sql specific processing
 
-    # --- Helper Function to Augment SQL --- #
-    def _augment_sql_for_verification(sql: str, id_keys_in_params: List[str]) -> Tuple[str, bool]:
-        """Adds a special ID column to SELECT and GROUP BY if needed for verification, using sqlparse more robustly."""
+        prepared_tool_invocations.append({
+            "tool": current_tool_instance,
+            "args": processed_tool_args, # Use the (potentially) processed arguments
+            "id": tool_id,
+            "name": tool_name,
+            "retries_left": settings.TOOL_EXECUTION_RETRIES
+        })
+    # End of loop preparing tool invocations
+    
+    # Execute all prepared tool invocations concurrently
+    execution_tasks = []
+    for invocation_detail in prepared_tool_invocations:
+        # tool_to_call = invocation_detail["tool"] # Not directly used here, execute_with_retry takes the dict
+        # tool_input_args = invocation_detail["args"]
+        tool_call_id_for_exec = invocation_detail["id"]
+        logger.debug(f"[ToolsNode] Adding tool '{invocation_detail['name']}' (ID: {tool_call_id_for_exec}) to parallel execution queue with args: {invocation_detail['args']}")
+        execution_tasks.append(
+            execute_with_retry(invocation_detail) # execute_with_retry expects the whole dict
+        )
+    
+    results_from_execution = []
+    if execution_tasks: # Only gather if there are tasks
         try:
-            parsed = sqlparse.parse(sql)
-            if not parsed:
-                logger.warning("[SQL Augment] Failed to parse SQL. Skipping augmentation.")
-                return sql, False
-            
-            stmt = parsed[0] # Assume single statement
-            id_column_found = False
-            verification_alias_found = False
-            target_id_column_expr = 'hc."id"' # Default target
-            verification_alias = '"__verification_id__"' # Alias to add
+            results_from_execution = await asyncio.gather(*execution_tasks, return_exceptions=False) # Let execute_with_retry handle exceptions and return structured results
+        except Exception as gather_err: # Fallback if gather itself has an issue (rare)
+            logger.error(f"[ToolsNode] Unexpected error during asyncio.gather for tool executions: {gather_err}", exc_info=True)
+            # Create a generic error message for all calls that were supposed to run
+            for tool_call_details_on_error in prepared_tool_invocations:
+                tool_execution_results.append(ToolMessage(
+                    content=json.dumps({"error": {"type": "TOOL_GATHER_ERROR", "message": f"Async gathering of tool results failed: {str(gather_err)}"}}),
+                    name=tool_call_details_on_error["name"],
+                    tool_call_id=tool_call_details_on_error["id"]
+                ))
+    # else: no tasks, results_from_execution remains empty
 
-            select_list_tokens: Optional[sqlparse.sql.TokenList] = None
-            group_by_clause_tokens: Optional[sqlparse.sql.TokenList] = None
+    # Process results from asyncio.gather (or empty list if no tasks/gather error)
+    temp_structured_results = []
+    updated_failure_patterns = state.get("failure_patterns", {}).copy()
+    current_recovery_guidance: Optional[str] = None
 
-            # --- Find SELECT list and GROUP BY clause using sqlparse types --- #
-            # Find the IdentifierList directly following the SELECT keyword
-            select_keyword_found = False
-            for token in stmt.tokens:
-                if token.ttype is sqlparse.tokens.DML and token.value.upper() == 'SELECT':
-                    select_keyword_found = True
-                    continue # Move to the next token, which should be the list
-                if select_keyword_found and isinstance(token, sqlparse.sql.IdentifierList):
-                    select_list_tokens = token
-                    break # Found the select list
-                # Handle case where SELECT list isn't explicitly an IdentifierList (e.g., SELECT *)    
-                elif select_keyword_found and token.ttype is not sqlparse.tokens.Whitespace:
-                     # This might be a single identifier or wildcard, treat it as the list endpoint
-                     logger.debug(f"[SQL Augment] Treating token '{token.value}' as SELECT list.")
-                     select_list_tokens = token # Use the token itself as marker
-                     break
+    for result_item in results_from_execution:
+        # execute_with_retry is expected to return a dictionary with specific keys
+        if not isinstance(result_item, dict): # Defensive check
+            logger.error(f"[ToolsNode] Unexpected item type in results_from_execution (expected dict): {type(result_item)} - {str(result_item)[:200]}")
+            continue
 
-            # Find the GROUP BY clause
-            for token in reversed(stmt.tokens):
-                if isinstance(token, sqlparse.sql.Where): # Stop searching if we hit WHERE going backwards
-                     break
-                if token.ttype is sqlparse.tokens.Keyword and token.value.upper() == 'GROUP BY':
-                    # Find the actual list following GROUP BY
-                    idx = stmt.token_index(token)
-                    if idx + 1 < len(stmt.tokens):
-                        # Skip whitespace
-                        next_token_idx = idx + 1
-                        while next_token_idx < len(stmt.tokens) and stmt.tokens[next_token_idx].is_whitespace:
-                            next_token_idx += 1
-                        if next_token_idx < len(stmt.tokens):
-                            group_by_clause_tokens = stmt.tokens[next_token_idx]
-                            logger.debug(f"[SQL Augment] Found GROUP BY clause tokens: {group_by_clause_tokens}")
-                    break
+        tool_call_id_from_res = result_item.get("id")
+        tool_name_from_res = result_item.get("name")
+        tool_content_str = result_item.get("content_str") # This is the JSON string content of the ToolMessage
+        is_error = result_item.get("is_error", False)
+        original_args_for_tool = result_item.get("original_args", {}) # Args used for this specific call
 
-            if select_list_tokens is None:
-                logger.warning("[SQL Augment] Could not reliably identify SELECT list using sqlparse. Skipping augmentation.")
-                return sql, False
-            # --- End Finding Clauses --- #
+        if not (tool_call_id_from_res and tool_name_from_res and tool_content_str is not None):
+            logger.error(f"[ToolsNode] Invalid result item from tool execution (missing id, name, or content): {result_item}")
+            continue # Skip this malformed result
 
-            # --- Check if augmentation is needed --- #
-            select_list_str = str(select_list_tokens).lower()
-            if verification_alias.lower().strip('"') in select_list_str:
-                logger.debug(f"[SQL Augment] Verification alias '{verification_alias}' already present. No augmentation needed.")
-                return sql, False
-            if target_id_column_expr.lower() in select_list_str:
-                logger.debug(f"[SQL Augment] Target ID column ({target_id_column_expr}) found in SELECT. No augmentation needed.")
-                return sql, False
-            # --- End Check --- #
+        # Always append a ToolMessage for graph history
+        tool_execution_results.append(ToolMessage(content=tool_content_str, name=tool_name_from_res, tool_call_id=tool_call_id_from_res))
 
-            # --- Augmentation Needed --- #
-            logger.info(f"[SQL Augment] Augmenting SQL to include verification ID column ({target_id_column_expr}).")
-            
-            # 1. Add to SELECT list using token insertion
-            # Create the new token sequence: comma, whitespace, identifier AS alias
-            select_addition_tokens = [
-                sqlparse.sql.Token(sqlparse.tokens.Punctuation, ','),
-                sqlparse.sql.Token(sqlparse.tokens.Whitespace, ' '),
-                sqlparse.sql.Identifier(sqlparse.parse(f'{target_id_column_expr} AS {verification_alias}')[0].tokens) # Parse to get Identifier structure
-            ]
-            
-            # Insert before the FROM keyword, handled by sqlparse structure
-            # Find the last non-whitespace token within the select list or immediately after if it's not an IdentifierList
-            if isinstance(select_list_tokens, sqlparse.sql.TokenList):
-                select_list_tokens.tokens.extend(select_addition_tokens)
-            elif isinstance(select_list_tokens, sqlparse.sql.Token):
-                 # If select list was just a single token (like *), insert AFTER it
-                 stmt.insert_after(select_list_tokens, select_addition_tokens)
-            else:
-                 # Fallback/Error: Shouldn't happen if check above passed
-                 logger.error("[SQL Augment] Unexpected type for select_list_tokens during insertion. Aborting.")
-                 return sql, False
-
-            logger.debug(f"[SQL Augment] Modified SELECT list.")
-
-            # 2. Add to GROUP BY if it exists
-            if group_by_clause_tokens is not None:
-                # Check if the target ID column is already in the GROUP BY list
-                group_by_str = str(group_by_clause_tokens).lower()
-                if target_id_column_expr.lower() not in group_by_str:
-                    # Create the new token sequence: comma, whitespace, identifier
-                    groupby_addition_tokens = [
-                        sqlparse.sql.Token(sqlparse.tokens.Punctuation, ','),
-                        sqlparse.sql.Token(sqlparse.tokens.Whitespace, ' '),
-                        sqlparse.sql.Identifier(sqlparse.parse(target_id_column_expr)[0].tokens) # Just the column
-                    ]
-                    # Append to the existing GROUP BY list
-                    if isinstance(group_by_clause_tokens, sqlparse.sql.IdentifierList):
-                         group_by_clause_tokens.tokens.extend(groupby_addition_tokens)
-                    elif isinstance(group_by_clause_tokens, sqlparse.sql.Identifier):
-                         # If GROUP BY was a single identifier, create a list and replace the original token
-                         original_group_by_token = group_by_clause_tokens
-                         new_group_by_list = sqlparse.sql.IdentifierList([original_group_by_token] + groupby_addition_tokens)
-                         try:
-                             original_token_idx = stmt.token_index(original_group_by_token)
-                             # Replace the original Identifier token with the new IdentifierList
-                             stmt.tokens[original_token_idx] = new_group_by_list
-                             logger.debug(f"[SQL Augment] Replaced single GROUP BY token with list.")
-                         except ValueError:
-                              logger.error("[SQL Augment] Failed to find index of original single GROUP BY token. Aborting GROUP BY modification.")
-                        
-                    else:
-                         logger.warning(f"[SQL Augment] Unexpected token type for GROUP BY clause: {type(group_by_clause_tokens)}. Attempting simple append.")
-                         # Less ideal fallback: find token index and insert after
-                         group_by_idx = stmt.token_index(group_by_clause_tokens)
-                         stmt.insert_at(group_by_idx + 1, groupby_addition_tokens)
-                         
-                    logger.debug(f"[SQL Augment] Added {target_id_column_expr} to GROUP BY clause.")
-                else:
-                     logger.debug(f"[SQL Augment] Target ID column {target_id_column_expr} already in GROUP BY.")
-
-            # Return the modified SQL by converting the statement back to string
-            augmented_sql = str(stmt)
-            logger.info(f"[SQL Augment] SQL Augmented successfully. New SQL tail: ...{augmented_sql[-250:]}")
-            return augmented_sql, True
-
-        except Exception as e:
-            logger.error(f"[SQL Augment] Error during SQL augmentation: {e}", exc_info=True)
-            return sql, False # Return original on error
-    # --- END Helper Function --- #
-
-    # Define async execution function with retry logic
-    async def execute_with_retry(execution_details):
-        tool_name = execution_details["name"]
-        args = execution_details["args"]
-        current_resolved_map = state.get("resolved_location_map") # Get map from CURRENT state
-        # Initialize augmented flag
-        sql_was_augmented = False 
-
-        # --- Apply SQL Correction for resolved name literals (if map exists) --- #
-        if tool_name == "execute_sql" and current_resolved_map:
-            logger.debug(f"[ToolsNode] Checking SQL args for potential ID correction using map: {current_resolved_map}")
-            original_sql = args.get("sql")
-            original_params = args.get("params")
-            if original_sql and original_params:
-                try:
-                    corrected_sql, corrected_params = _apply_resolved_ids_to_sql_args(
-                        original_sql, original_params, current_resolved_map
-                    )
-                    # Update args ONLY if changes were made
-                    if corrected_sql != original_sql or corrected_params != original_params:
-                        execution_details["args"] = {"sql": corrected_sql, "params": corrected_params}
-                        logger.info(f"[ToolsNode] Corrected SQL arguments for name literals for tool ID {execution_details['id']}")
-                        args = execution_details["args"] # Use corrected args going forward
-                except Exception as correction_err:
-                     logger.error(f"[ToolsNode] Error applying SQL name literal correction for tool {tool_name}: {correction_err}", exc_info=True)
-                     # Proceed with original args on correction error
-        # --- End SQL Correction for name literals --- #
-
-        # --- Apply SQL Augmentation for Verification ID --- #
-        if tool_name == "execute_sql" and current_resolved_map:
-            sql_to_check = args.get("sql")
-            params_to_check = args.get("params", {})
-            resolved_ids_in_params = set()
-            id_keys_for_augmentation = [] # Store keys like :argyle_id, :beaches_id
-
-            if sql_to_check:
-                resolved_id_values = set(current_resolved_map.values()) # Get all potential IDs
-                for key, value in params_to_check.items():
-                    if isinstance(value, str) and value in resolved_id_values:
-                        resolved_ids_in_params.add(value)
-                        id_keys_for_augmentation.append(key) # Store the param key
-                    elif isinstance(value, list):
-                        for item in value:
-                             if isinstance(item, str) and item in resolved_id_values:
-                                 resolved_ids_in_params.add(item)
-                                 # We don't store list keys currently for augmentation logic trigger
-                    # Also check if the key itself implies an ID (e.g., argyle_id)
-                    elif isinstance(value, str) and key.endswith('_id') and value in resolved_id_values:
-                         resolved_ids_in_params.add(value)
-                         id_keys_for_augmentation.append(key)
-            
-            # Check if MULTIPLE distinct resolved IDs are being filtered
-            if len(resolved_ids_in_params) > 1:
-                 logger.debug(f"[ToolsNode] Multiple resolved IDs ({resolved_ids_in_params}) found in params for tool {tool_name}. Checking if augmentation needed.")
-                 try:
-                     augmented_sql, sql_was_augmented = _augment_sql_for_verification(sql_to_check, id_keys_for_augmentation)
-                     if sql_was_augmented:
-                          execution_details["args"]["sql"] = augmented_sql
-                          logger.info(f"[ToolsNode] Augmented SQL for verification for tool ID {execution_details['id']}")
-                          args = execution_details["args"] # Use augmented args
-                 except Exception as augment_err:
-                      logger.error(f"[ToolsNode] Error applying SQL verification augmentation for tool {tool_name}: {augment_err}", exc_info=True)
-            else:
-                logger.debug(f"[ToolsNode] Augmentation not needed (found {len(resolved_ids_in_params)} resolved IDs in params). Proceeding with original/corrected SQL.")
-        # --- End SQL Augmentation for Verification ID --- #
-
-
-        tool = execution_details["tool"]
-        tool_id = execution_details["id"]
-        retries = execution_details["retries_left"]
-        try:
-            async with sem:
-                 logger.debug(f"[ToolsNode] Executing tool '{tool_name}' (ID: {tool_id}) with args: {args}")
-                 content = await tool.ainvoke(args)
-                 if asyncio.iscoroutine(content): content = await content
-                 content_str = json.dumps(content, default=str) if isinstance(content, (dict, list)) else str(content)
-                 logger.debug(f"[ToolsNode] Tool '{tool_name}' (ID: {tool_id}) completed.")
-                 return {
-                     "success": True,
-                     "message": ToolMessage(content=content_str, tool_call_id=tool_id, name=tool_name),
-                     "raw_content": content,
-                     "tool_name": tool_name,
-                     "tool_id": tool_id,
-                     "args": args
-                 }
-        except Exception as e:
-            error_msg = str(e)
-            error_msg_for_log = f"Error executing tool '{tool_name}' (ID: {tool_id}): {error_msg}"
-            if retries > 0 and _is_retryable_error(e):
-                retry_num = settings.TOOL_EXECUTION_RETRIES - retries + 1
-                delay = settings.TOOL_RETRY_DELAY * retry_num
-                logger.warning(f"[ToolsNode] {error_msg_for_log} - Retrying ({retries} left, delay {delay}s).", exc_info=False)
-                await asyncio.sleep(delay)
-                execution_details["retries_left"] = retries - 1
-                return await execute_with_retry(execution_details)
-            else:
-                logger.error(f"[ToolsNode] {error_msg_for_log}", exc_info=True)
-                return {
-                    "success": False,
-                    "error": f"{error_msg_for_log}",
-                    "error_message": error_msg,
-                    "tool_name": tool_name,
-                    "tool_id": tool_id,
-                    "args": args
-                }
-
-    results = await asyncio.gather(*[execute_with_retry(exec_data) for exec_data in tool_executions])
-
-    # --- Result processing: Extract tables and potential new resolved map ---
-    new_messages = [] # Initialize lists for THIS turn's results here
-    turn_structured_results = [] # NEW: Store structured {table, filters} for this turn
-    # Copy failure patterns from input state to potentially update them
-    failure_patterns = state.get("failure_patterns", {}).copy() # <<< Copy failure patterns here
-    # Initialize filters for THIS turn's successful SQL calls
-    successful_sql_filters_this_turn = {}
-
-    for result in results:
-        tool_name = result.get("tool_name", "unknown")
-        tool_id = result.get("tool_id", "")
-        tool_args = result.get("args", {})
-
-        if result["success"]:
+        if not is_error:
             successful_calls += 1
-            new_messages.append(result["message"])
-            raw_content = result.get("raw_content")
-            table_data = None
-            parsed_content = None
-            sql_params_for_this_call = None # Store params for this specific SQL call
-
-            # JSON parsing logic - Enhanced to handle potential nested structures
-            if isinstance(raw_content, str):
-                try: 
-                    parsed_content = json.loads(raw_content)
-                except json.JSONDecodeError:
-                    # If direct parsing fails, it might be simple string output
-                    parsed_content = raw_content
-                    logger.debug(f"Tool {tool_name} returned non-JSON string content: {raw_content[:100]}")
-            elif isinstance(raw_content, dict):
-                # If it's already a dict, use it directly
-                parsed_content = raw_content
-            else:
-                # Handle other types if necessary (e.g., lists, primitives)
-                parsed_content = raw_content
-                logger.debug(f"Tool {tool_name} returned non-dict/non-string content of type {type(raw_content)}")
-
-            # Table extraction logic for SQL tool - only add SUCCESSFUL data tables
-            if tool_name in ["sql_query", "execute_sql"]:
-                # Store the parameters if the SQL execution was successful
-                if isinstance(tool_args, dict) and "params" in tool_args:
-                    sql_params_for_this_call = tool_args["params"]
-                    # Only store if it's not an error table
-                    is_error_table = False
-                    if isinstance(parsed_content, dict):
-                        if isinstance(parsed_content.get("table"), dict) and \
-                           isinstance(parsed_content["table"].get("columns"), list) and \
-                           len(parsed_content["table"]["columns"]) == 1 and \
-                           parsed_content["table"]["columns"][0].lower() == "error":
-                            is_error_table = True
-                        elif isinstance(parsed_content.get('columns'), list) and \
-                             len(parsed_content['columns']) == 1 and \
-                             parsed_content['columns'][0].lower() == "error":
-                            is_error_table = True
-                            
-                    if not is_error_table:
-                        # Merge params, prioritizing newer calls if keys overlap (though unlikely in single turn)
-                        successful_sql_filters_this_turn.update(tool_args["params"])
-                        logger.debug(f"[ToolsNode] Stored successful SQL filters for call {tool_id}: {tool_args['params']}")
-                    else:
-                        logger.debug(f"[ToolsNode] Not storing filters for call {tool_id} as it returned an error table structure.")
-
-                # Check various possible structures for the actual table data
-                if isinstance(parsed_content, dict):
-                    if isinstance(parsed_content.get("table"), dict) and \
-                       isinstance(parsed_content["table"].get("columns"), list) and \
-                       isinstance(parsed_content["table"].get("rows"), list):
-                        table_data = parsed_content["table"]
-                    elif isinstance(parsed_content.get('columns'), list) and \
-                         isinstance(parsed_content.get('rows'), list):
-                        # Check if it's NOT an error table structure returned by the tool on failure
-                        if not (len(parsed_content["columns"]) == 1 and parsed_content["columns"][0].lower() == "error"):
-                            table_data = parsed_content
-                        else:
-                             logger.warning(f"[ToolsNode] Tool '{tool_name}' returned an error table structure despite success=True. Ignoring table.")
-                    
-                if table_data: # Append ONLY if valid data table found
-                    # NEW: Create structured result
-                    turn_structured_results.append({
-                        "table": table_data,
-                        "filters": sql_params_for_this_call or {} # Use params specific to this call
-                    })
-                    logger.info(f"[ToolsNode] Created structured result from successful '{tool_name}' call (ID: {tool_id}) with {len(table_data.get('rows', []))} rows")
-                elif isinstance(parsed_content, dict):
-                    # Log if it looked like a dict but didn't contain a valid table structure
-                    logger.warning(f"[ToolsNode] Successful '{tool_name}' call (ID: {tool_id}) returned dict, but no valid table structure found. Keys: {list(parsed_content.keys())}")
-
-            # Hierarchy Resolver: Update the map for THIS TURN
-            elif tool_name == "hierarchy_name_resolver" and isinstance(parsed_content, dict):
-                resolution_results = parsed_content.get("resolution_results", {})
-                if resolution_results:
-                    temp_map = {}
-                    for name, res_info in resolution_results.items():
-                        if res_info.get("status") == "found" and res_info.get("id"):
-                            temp_map[name.lower()] = str(res_info["id"])
-                    if temp_map:
-                        # Update the map specific to this execution pass
-                        location_map_this_turn.update(temp_map) # <<< Update this turn's map
-                        logger.info(f"[ToolsNode] Updated resolved location map this turn with {len(temp_map)} entries.")
-
-        else: # Handle tool execution failures
-            error_message = result.get("error_message", "Unknown error")
-            logger.warning(f"[ToolsNode] Tool call '{tool_name}' (ID: {tool_id}) failed: {error_message}")
-            # ... (Construct ToolMessage with error content) ...
-            if not any(getattr(m, 'tool_call_id', None) == tool_id for m in new_messages if isinstance(m, ToolMessage)):
-                 new_messages.append(ToolMessage(content=error_message, tool_call_id=tool_id, name=tool_name))
-
-            # Track failure patterns
-            if tool_name not in failure_patterns:
-                failure_patterns[tool_name] = []
-            # ... (Hashing logic for args_hash) ...
-            args_hash = None
             try:
-                args_str = json.dumps(tool_args, sort_keys=True, default=str) if tool_args else ""
-                args_hash = hash(args_str)
-            except Exception as hash_err:
-                logger.warning(f"[ToolsNode] Could not hash args for {tool_name}: {hash_err}")
-                args_hash = hash(str(tool_args)) if tool_args else None
-            
-            failure_signature = {
-                "tool_id": tool_id,
-                "error_message": error_message,
-                "timestamp": datetime.datetime.now().isoformat(),
-                "args_hash": args_hash,
-                "args_summary": str(tool_args)[:100] if tool_args else None
-            }
-            
-            failure_patterns[tool_name].append(failure_signature)
-            if len(failure_patterns[tool_name]) > 5:
-                failure_patterns[tool_name] = failure_patterns[tool_name][-5:]
-            
-            # CRITICAL: Ensure no error table is added to new_tables
+                tool_content_dict = json.loads(tool_content_str)
+                if tool_name_from_res == "hierarchy_name_resolver":
+                    # Update map for THIS turn with results from hierarchy_name_resolver
+                    current_resolved_map_from_tool = tool_content_dict.get("resolution_results", {})
+                    for name, res_data in current_resolved_map_from_tool.items():
+                        if isinstance(res_data, dict) and res_data.get("status") == "found" and "id" in res_data:
+                            location_map_this_turn[name.lower()] = res_data["id"]
+                    if current_resolved_map_from_tool:
+                         logger.info(f"[ToolsNode] Updated resolved location map (this turn) with {len(location_map_this_turn)} entries from '{tool_name_from_res}'.")
+                
+                elif tool_name_from_res == "execute_sql":
+                    # Check if the tool itself returned a structured error (e.g., DB connection, permission)
+                    # These are errors that SQLExecutionTool reports in its JSON output, not exceptions during invoke.
+                    if tool_content_dict.get("error"):
+                        logger.warning(f"[ToolsNode] Tool '{tool_name_from_res}' (ID: {tool_call_id_from_res}) executed but returned a structured error: {tool_content_dict.get('error')}")
+                        # The error is already in the ToolMessage; no separate structured result here.
+                        # It will be handled by the general error processing logic below for failure_patterns.
+                        is_error = True # Treat as error for failure pattern logging
 
-    # --- Update state ---
-    logger.info(f"[ToolsNode] Updating state with {len(new_messages)} messages, {len(turn_structured_results)} structured results.")
+                    elif tool_content_dict.get("columns") is not None and tool_content_dict.get("rows") is not None:
+                        table_data = {
+                            "columns": tool_content_dict["columns"],
+                            "rows": tool_content_dict["rows"],
+                            "text": tool_content_dict.get("text") # Optional summary text from tool
+                        }
+                        # Use the original_args_for_tool that were ACTUALLY used for this successful call
+                        sql_filters_used = original_args_for_tool.get("params", {})
+                        temp_structured_results.append({"table": table_data, "filters": sql_filters_used})
+                        logger.info(f"[ToolsNode] Created structured result from successful '{tool_name_from_res}' call (ID: {tool_call_id_from_res}) with {len(table_data['rows'])} rows. Filters used: {sql_filters_used}")
+                    else:
+                         logger.warning(f"[ToolsNode] Successful '{tool_name_from_res}' call (ID: {tool_call_id_from_res}) returned parsable JSON, but no expected table structure or error field found. Keys: {list(tool_content_dict.keys())}")
 
-    # Construct the update dictionary AFTER processing all results
-    update_dict: Dict[str, Any] = { # Use Dict here as AgentState type hint isn't perfect for partial updates
-        "messages": new_messages, # Messages from THIS turn
-        "structured_results": turn_structured_results, # NEW: Use structured results list
-        "failure_patterns": failure_patterns, # Potentially updated failure patterns
-        # Preserve recovery guidance from the input state
-        "recovery_guidance": state.get("recovery_guidance"),
+            except json.JSONDecodeError:
+                logger.warning(f"[ToolsNode] Failed to decode JSON from nominally successful tool call '{tool_name_from_res}' (ID: {tool_call_id_from_res}): {tool_content_str[:150]}...")
+                # This is an unexpected state, treat as error for pattern tracking
+                is_error = True 
+            except Exception as e_struct_proc: # Catch any other errors during processing of successful results
+                logger.error(f"[ToolsNode] Error processing successful result from tool '{tool_name_from_res}' (ID: {tool_call_id_from_res}): {e_struct_proc}", exc_info=True)
+                is_error = True
+        
+        # This 'if is_error' block now also catches errors reported *by* the tool in its JSON, or JSON parsing errors of success cases
+        if is_error:
+            error_info_dict = {}
+            try: 
+                # Try to parse the content string again if it wasn't already parsed or if it's an error string
+                parsed_content_for_error = json.loads(tool_content_str)
+                error_info_dict = parsed_content_for_error.get("error", {}) if isinstance(parsed_content_for_error, dict) else {}
+            except: # If content_str is not valid JSON or doesn't contain "error"
+                pass # error_info_dict remains empty or has its prior state
+            
+            failure_type = error_info_dict.get("type", "UNKNOWN_TOOL_RUNTIME_ERROR")
+            failure_message = error_info_dict.get("message", tool_content_str) # Fallback to full content if no message
+            
+            # Determine signature for failure pattern tracking
+            error_signature_key = tool_name_from_res
+            if tool_name_from_res == "execute_sql":
+                # Use a simplified signature for SQL to group similar errors
+                error_signature_key = _get_sql_call_signature(original_args_for_tool) 
+
+            if error_signature_key not in updated_failure_patterns:
+                updated_failure_patterns[error_signature_key] = []
+            
+            updated_failure_patterns[error_signature_key].append({
+                "error_type": failure_type,
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "details": failure_message,
+                "tool_call_id": tool_call_id_from_res
+            })
+            logger.warning(f"[ToolsNode] Failure recorded for tool '{tool_name_from_res}' (ID: {tool_call_id_from_res}), signature key: '{error_signature_key}', type: '{failure_type}'. Details: {failure_message[:150]}...")
+    # End of loop processing results_from_execution
+
+    # Combine resolved locations from this turn with existing ones from the state
+    final_resolved_map = state.get("resolved_location_map", {}).copy() if state.get("resolved_location_map") else {}
+    if location_map_this_turn: # Only update if new resolutions occurred this turn
+        final_resolved_map.update(location_map_this_turn)
+        logger.info(f"[ToolsNode] Final resolved_location_map contains {len(final_resolved_map)} entries after this turn.")
+
+    # --- Generate Recovery Guidance if there were failures ---
+    if len(operational_tool_calls) > 0 and successful_calls < len(operational_tool_calls):
+        # Identify tools that were prepared but did not result in a successful (not is_error) execution
+        failed_tool_call_ids = set(inv["id"] for inv in prepared_tool_invocations)
+        for res_item in results_from_execution:
+             if isinstance(res_item, dict) and not res_item.get("is_error") and res_item.get("id") in failed_tool_call_ids:
+                 failed_tool_call_ids.remove(res_item.get("id"))
+        
+        failed_tool_names_this_turn = list(set(inv["name"] for inv in prepared_tool_invocations if inv["id"] in failed_tool_call_ids))
+
+        if failed_tool_names_this_turn:
+            current_recovery_guidance = f"Some tools failed in the last step ({', '.join(failed_tool_names_this_turn)}). Please review any errors and try rephrasing your request or correcting the problematic parts."
+            logger.info(f"[ToolsNode] Generated recovery guidance: {current_recovery_guidance}")
+        else:
+             logger.info(f"[ToolsNode] All ({len(operational_tool_calls)}) operational tools completed successfully or had errors handled internally. No specific recovery guidance generated.")
+
+    logger.info(f"[ToolsNode] Updating state with {len(tool_execution_results)} tool messages, {len(temp_structured_results)} new structured results.")
+    
+    # Prepare the dictionary for updating the state
+    update_dict = {
+        "messages": tool_execution_results, # These are ToolMessage objects for LangGraph
+        "structured_results": state.get("structured_results", []) + temp_structured_results, # Append new structured results
+        "failure_patterns": updated_failure_patterns,
+        "recovery_guidance": current_recovery_guidance # Will be None if no new guidance
     }
+    # Only update resolved_location_map in the state if it actually changed
+    if location_map_this_turn or not state.get("resolved_location_map"): # if new items or map was previously None
+        update_dict["resolved_location_map"] = final_resolved_map
 
-    # Conditionally add the resolved map IF the resolver ran successfully THIS turn
-    if location_map_this_turn: # Check if the map for this turn has entries
-        update_dict["resolved_location_map"] = location_map_this_turn
-    # Otherwise, the key is omitted, preserving the existing state value
-
-    logger.info(f"[ToolsNode] Final update_dict keys before return: {list(update_dict.keys())}")
-    logger.debug(f"[ToolsNode] Returning update_dict: {update_dict}")
+    logger.info(f"[ToolsNode] Final update_dict keys before returning: {list(update_dict.keys())}")
     return update_dict
 
 def _is_retryable_error(error: Exception) -> bool:
@@ -2033,3 +1878,85 @@ async def test_azure_openai_connection() -> bool:
     except Exception as e:
         logger.warning(f"Azure OpenAI connection test failed: {str(e)}")
         return False
+
+async def execute_with_retry(invocation_detail: Dict[str, Any]) -> Dict[str, Any]:
+    tool_to_call = invocation_detail["tool"]
+    tool_input_args = invocation_detail["args"]
+    tool_call_id = invocation_detail["id"]
+    tool_name = invocation_detail["name"]
+    # Default to settings.TOOL_EXECUTION_RETRIES if not present in invocation_detail, ensure it's at least 0
+    retries_left = invocation_detail.get("retries_left", getattr(settings, 'TOOL_EXECUTION_RETRIES', 0))
+    
+    original_args_for_logging = tool_input_args.copy() 
+
+    attempt = 0
+    last_exception = None
+
+    # Loop for retries_left + 1 total attempts (e.g., if retries_left is 2, attempts are 0, 1, 2)
+    while attempt <= retries_left:
+        current_attempt_number = attempt + 1
+        max_attempts = retries_left + 1
+        logger.info(f"[ToolRetry] Attempt {current_attempt_number}/{max_attempts} for tool '{tool_name}' (ID: {tool_call_id}). Args: {tool_input_args}")
+        try:
+            tool_output = await tool_to_call.ainvoke(tool_input_args)
+
+            content_str = ""
+            if isinstance(tool_output, (dict, list)):
+                content_str = json.dumps(tool_output)
+            elif isinstance(tool_output, str):
+                content_str = tool_output
+            elif hasattr(tool_output, 'model_dump_json'): # For Pydantic models
+                 content_str = tool_output.model_dump_json()
+            else:
+                content_str = str(tool_output)
+
+            logger.info(f"[ToolRetry] Success for tool '{tool_name}' (ID: {tool_call_id}) on attempt {current_attempt_number}. Output (first 100 chars): {content_str[:100]}")
+            return {
+                "id": tool_call_id,
+                "name": tool_name,
+                "content_str": content_str,
+                "is_error": False,
+                "original_args": original_args_for_logging 
+            }
+        except Exception as e:
+            log_level_is_debug = getattr(settings, 'LOG_LEVEL', 'INFO').upper() == 'DEBUG'
+            logger.warning(f"[ToolRetry] Attempt {current_attempt_number}/{max_attempts} for tool '{tool_name}' (ID: {tool_call_id}) failed. Error: {e}", exc_info=log_level_is_debug)
+            last_exception = e
+            
+            is_retryable = _is_retryable_error(e) # Assumes _is_retryable_error is defined elsewhere
+
+            if attempt < retries_left: # If there are more retries left
+                if is_retryable:
+                    delay = getattr(settings, 'TOOL_RETRY_DELAY_SECONDS', 1) * (2**attempt) # Exponential backoff
+                    logger.info(f"[ToolRetry] Retryable error for '{tool_name}'. Retrying in {delay:.2f} seconds...")
+                    await asyncio.sleep(delay)
+                else:
+                    logger.warning(f"[ToolRetry] Non-retryable error for '{tool_name}' (ID: {tool_call_id}). Stopping retries immediately.")
+                    break # Break from while loop, don't retry non-retryable errors
+            else: # This was the last attempt
+                logger.info(f"[ToolRetry] Last attempt for '{tool_name}' (ID: {tool_call_id}) failed.")
+                break # Break loop as no more retries left
+            
+            attempt += 1
+            
+    # If all retries failed or a non-retryable error occurred and broke the loop
+    error_message_detail = f"Tool '{tool_name}' (ID: {tool_call_id}) failed. Last error: {str(last_exception)}"
+    if attempt > retries_left : # exhausted retries
+        error_message_detail = f"Tool '{tool_name}' (ID: {tool_call_id}) failed after {retries_left + 1} attempts. Last error: {str(last_exception)}"
+    
+    logger.error(error_message_detail)
+    
+    error_type = "TOOL_EXECUTION_FAILED"
+    if isinstance(last_exception, HTTPException):
+        error_type = "HTTP_EXCEPTION_IN_TOOL"
+    elif isinstance(last_exception, ValidationError):
+         error_type = "VALIDATION_ERROR_IN_TOOL"
+    # Consider adding more specific error types based on common exceptions from your tools
+
+    return {
+        "id": tool_call_id,
+        "name": tool_name,
+        "content_str": json.dumps({"error": {"type": error_type, "message": error_message_detail, "details": str(last_exception)}}),
+        "is_error": True,
+        "original_args": original_args_for_logging
+    }

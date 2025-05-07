@@ -331,7 +331,7 @@ class SQLExecutionTool(BaseTool):
             # Raise a generic error message
             raise ValueError("An unexpected error occurred during query execution.") from e
     
-    async def _run(
+    async def _arun(
         self, sql: str, params: Dict[str, Any], db_name: str = "report_management", run_manager=None
     ) -> str:
         """Execute SQL query and return result or error message."""
@@ -339,9 +339,6 @@ class SQLExecutionTool(BaseTool):
         logger.info(f"{log_prefix}Executing provided SQL query on DB '{db_name}'.")
         logger.debug(f"{log_prefix}LLM-provided SQL: {sql[:300]}... LLM-provided Params: {params}")
 
-        # Ensure the correct, trusted organization_id is used in the parameters for the query.
-        # This overwrites any organization_id the LLM might have put in params.
-        # self.organization_id is set during tool initialization with the trusted value from user context.
         corrected_params = params.copy() if params is not None else {}
         
         if self.organization_id:
@@ -352,42 +349,64 @@ class SQLExecutionTool(BaseTool):
             else:
                 logger.debug(f"{log_prefix}params['organization_id'] from LLM ('{original_llm_org_id}') matches trusted ID. No correction needed.")
         else:
-            # This case should ideally not happen if the tool is always initialized with an org_id.
             logger.error(f"{log_prefix}CRITICAL: SQLExecutionTool instance has no self.organization_id set. Cannot enforce organization scope robustly. Proceeding with LLM-provided params.")
-            # If corrected_params['organization_id'] is missing or invalid, _execute_sql security checks should still catch it.
 
         try:
-            # Pass corrected_params to the execution logic
-            result_dict = await self._execute_sql(sql, corrected_params, db_name) # type: ignore
+            result_dict = await self._execute_sql(sql, corrected_params, db_name)
             
-            # Handle different result structures (error or success)
             if "error" in result_dict and result_dict["error"]:
                 error_type = result_dict["error"].get("type", "UNKNOWN_ERROR")
                 error_message = result_dict["error"].get("message", "An unknown error occurred during SQL execution.")
-                # Log specific error types that might indicate LLM issues vs. system issues
                 logger.warning(f"{log_prefix}SQL execution resulted in error. Type: {error_type}, Message: {error_message}")
-                # Return the error part of the dict as a JSON string for the LLM to process
-                # Ensure the output matches what the agent expects for tool errors
                 return json.dumps({"error": result_dict["error"], "table": None, "text": result_dict.get("text", error_message)}, default=json_default)
             
-            # Successfully executed query, return results as JSON string
-            # If result_dict contains 'table' and 'columns' directly, or nested under a 'data' key
             final_result_package = {
                 "columns": result_dict.get("columns", []),
                 "rows": result_dict.get("rows", []),
-                "text": result_dict.get("text") # Optional summary text from tool itself
+                "text": result_dict.get("text")
             }
             logger.info(f"{log_prefix}SQL execution successful. Returning {len(final_result_package['rows'])} rows.")
             return json.dumps(final_result_package, default=json_default)
 
-        except ValueError as ve: # Catch validation errors from _execute_sql (like org filter missing)
+        except ValueError as ve:
             logger.error(f"{log_prefix}ValueError during SQL execution: {ve}", exc_info=True)
             return json.dumps({"error": {"type": "VALIDATION_ERROR", "message": str(ve)}, "table": None, "text": f"Error validating SQL: {str(ve)}"}, default=json_default)
         except SQLAlchemyError as db_err:
             logger.error(f"{log_prefix}Database error during SQL execution: {db_err}", exc_info=True)
             return json.dumps({"error": {"type": "DATABASE_ERROR", "message": f"Database execution error: {str(db_err)}"}, "table": None, "text": f"Error executing SQL due to database issue: {str(db_err)}"}, default=json_default)
         except Exception as e:
-            logger.error(f"{log_prefix}Unexpected error in _run: {e}", exc_info=True)
+            logger.error(f"{log_prefix}Unexpected error in _arun: {e}", exc_info=True)
             return json.dumps({"error": {"type": "TOOL_ERROR", "message": f"An unexpected error occurred in the SQL tool: {str(e)}"}, "table": None, "text": f"Unexpected tool error: {str(e)}"}, default=json_default)
 
-    # BaseTool handles ainvoke implementation for us when _run is async
+    # Synchronous _run for completeness, if BaseTool doesn't auto-generate from _arun
+    # or if some other part of the system might try to call it synchronously.
+    # For robust async operation, _arun is the primary method.
+    def _run(
+        self, sql: str, params: Dict[str, Any], db_name: str = "report_management", run_manager=None
+    ) -> str:
+        logger.warning("[SQLExecutionTool] Synchronous _run called. Consider using async interface if possible.")
+        try:
+            # This is a blocking call for the async event loop.
+            # Not ideal for production async servers if called frequently.
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If an event loop is running, we cannot simply run_until_complete.
+                # This path might lead to issues or require a more sophisticated async-to-sync bridge.
+                # For simplicity, we raise an error or log a strong warning if called in an async context.
+                logger.error("[SQLExecutionTool] Synchronous _run was called from within an existing asyncio event loop. This is not supported and may block the loop. Returning error.")
+                return json.dumps({"error": {"type": "ASYNC_CONTEXT_ERROR", "message": "Synchronous SQL tool execution attempted from async context."}})
+            else:
+                return loop.run_until_complete(self._arun(sql, params, db_name, run_manager))
+        except RuntimeError as re:
+             if "There is no current event loop in thread" in str(re):
+                 # No event loop, create a new one to run the async method
+                 new_loop = asyncio.new_event_loop()
+                 asyncio.set_event_loop(new_loop)
+                 result = new_loop.run_until_complete(self._arun(sql, params, db_name, run_manager))
+                 new_loop.close()
+                 return result
+             else:
+                 raise # Re-raise other RuntimeErrors
+        except Exception as e:
+            logger.error(f"[SQLExecutionTool] Error in synchronous _run wrapper: {e}", exc_info=True)
+            return json.dumps({"error": {"type": "SYNC_WRAPPER_ERROR", "message": f"Error in sync execution: {str(e)}"}})

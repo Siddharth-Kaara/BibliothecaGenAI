@@ -173,43 +173,33 @@ async def log_complete_chat_message(
     session_id: str, 
     user_id: uuid.UUID,
     organization_id: str,
-    user_content: Optional[str], # Kept for context, though potentially redundant if initial log works
+    user_content: Optional[str],
     assistant_content: Optional[str],
     prompt_tokens: Optional[int],
     completion_tokens: Optional[int],
-    # metadata: Optional[Dict[str, Any]] = None # Add if needed
+    assistant_response_metadata: Optional[Dict[str, Any]] = None
 ):
-    """Updates or creates a chat message log with the assistant's response."""
+    """Updates or creates a chat message log with the assistant's response, including full API response metadata."""
     logger.debug(f"Logging complete message details for request {request_id}")
     try:
-        # Find the existing message log created by log_initial_chat_message
-        # Filter by request_id - this should be unique
         stmt = select(ChatMessage).where(ChatMessage.request_id == request_id)
         result = await db.execute(stmt)
         message = result.scalar_one_or_none()
 
         if message:
-            # Verify session ID matches (sanity check)
             if message.session_id != uuid.UUID(session_id):
                  logger.error(f"Session ID mismatch for request {request_id}: Expected {session_id}, found {message.session_id} in DB.")
-                 # Decide how to handle: error, overwrite, ignore?
-                 # For now, log error and proceed with update based on request_id match.
             
-            # Update existing message with assistant details
             logger.debug(f"Updating existing message log for request {request_id}")
             message.assistant_message_content = assistant_content
             message.assistant_message_timestamp = datetime.now(timezone.utc)
             message.prompt_tokens = prompt_tokens
             message.completion_tokens = completion_tokens
-            # message.assistant_response_metadata = metadata # Add if metadata is passed
-            db.add(message) # Add updated object to session
+            message.assistant_response_metadata = assistant_response_metadata
+            db.add(message)
         else:
-            # This case might happen if log_initial_chat_message failed silently
-            # or if called directly without a prior initial log.
-            # Log a warning and create a new record for robustness.
             logger.warning(f"Initial message log for request {request_id} not found. Creating new complete log.")
             
-            # Need to re-verify session access if creating anew
             session_stmt = select(ChatSession).where(
                 ChatSession.session_id == uuid.UUID(session_id),
                 ChatSession.user_id == user_id,
@@ -223,13 +213,13 @@ async def log_complete_chat_message(
             new_message = ChatMessage(
                 request_id=request_id,
                 session_id=uuid.UUID(session_id),
-                user_message_content=user_content, # Log user message here if creating anew
-                user_message_timestamp=datetime.now(timezone.utc), # Approximate user time
+                user_message_content=user_content,
+                user_message_timestamp=datetime.now(timezone.utc),
                 assistant_message_content=assistant_content,
                 assistant_message_timestamp=datetime.now(timezone.utc),
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
-                # assistant_response_metadata=metadata # Add if needed
+                assistant_response_metadata=assistant_response_metadata
             )
             db.add(new_message)
 
@@ -242,7 +232,6 @@ async def log_complete_chat_message(
         error_msg = f"Unexpected error logging complete message for request {request_id}: {e}"
         logger.error(error_msg, exc_info=True)
         await db.rollback()
-        # raise RepositoryError(error_msg) from e
 
 async def get_messages_for_memory(db: AsyncSession, session_id: uuid.UUID, limit: int = 6) -> List[Tuple[str, str]]:
     """Retrieves the last N interaction pairs (user message, assistant message) for agent memory.

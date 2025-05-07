@@ -128,7 +128,7 @@ Available Tools:
 7. **Chart Specification Strategy:** When formulating the final response using `FinalApiResponseStructure`:
     a. **When to Include Charts:** Populate the `chart_specs` list ONLY if:
         - The user explicitly requested a chart/visualization, OR
-        - Presenting complex data (e.g., comparisons across >3 categories/metrics) where visuals aid understanding.
+        - Presenting complex data (e.g., comparisons across >3 categories/metrics, time series with multiple lines) where visuals aid understanding.
         - **EXCEPTION:** If the user **explicitly asked ONLY for a table**, **DO NOT** generate chart specs.
         - **AVOID charts for simple data** (e.g., 2-3 items); prefer `text` summary unless requested.
     b. **Data Prerequisite:** Ensure data exists in `state['tables']`.
@@ -137,51 +137,52 @@ Available Tools:
         -   `source_table_index`: **0-based index** of the relevant table in `state['tables']`.
         -   `type_hint`: Suggest chart type. **MUST be one of: "bar", "pie", "line"**. Do not use other types.
         -   `title`: Clear, descriptive title.
-        -   `x_column`, `y_column`, `color_column` (Optional): Specify **exact column names** from source table.
+        -   `x_column`: Specify **exact column name** from source table for the X-axis.
+        -   `y_columns`: **List of exact column names** from source table for the Y-axis.
+            *   For single-series charts (e.g., one line, one set of bars, pie chart values), this list will contain **one** column name.
+            *   For multi-series charts (e.g., multiple lines on one chart, grouped/stacked bars from different metrics), this list will contain **multiple** source column names (e.g., `["Total Borrows", "Total Returns"]`).
+        -   `color_column` (Optional):
+            *   For single-series charts or pie charts, this should typically be `null` (or omitted).
+            *   For multi-series charts generated from multiple `y_columns`, the backend will automatically use the metric names for coloring. You **SHOULD OMIT** `color_column` or set it to `null` in this case, as the backend sets it to `"Metric"` after transformation.
+            *   Only specify `color_column` if you intend to group by a *different existing categorical column* in the source table for a single-series chart (e.g., a bar chart of 'Total Items' where `x_column` is 'Category' and `color_column` is also 'Category' to color bars by themselves, or `color_column` is 'Status' to group bars by status).
         -   `x_label`, `y_label` (Optional): User-friendly axis labels.
-            *   **Recommendation:** While optional, providing user-friendly `x_label` and `y_label` (e.g., using 'Branch Name' instead of just 'name', or 'Total Borrow Count' instead of 'total_borrows') significantly improves the chart's readability for the end-user. Please generate these descriptive labels when the context allows.
+            *   **Recommendation:** Provide these for clarity. For multi-series charts, if `y_label` is not provided, it will default to "Value" after backend transformation.
 
-    e. **Type-Specific Column Requirements (CRITICAL):**
+    e. **Type-Specific Considerations (using `y_columns`):**
         *   **`type_hint: 'pie'`:**
-            -   Requires a source table with **exactly 2 columns**. 
-            -   `x_column`: **MUST** be the exact name of the source table column containing category labels (slice names).
-            -   `y_column`: **MUST** be the exact name of the source table column containing numeric values (slice sizes).
+            -   Requires a source table that, after any necessary backend transformation (e.g., from a wide summary), results in **exactly 2 columns** (typically "Category", "Value").
+            -   `y_columns`: **MUST** contain a **single** source column name that holds the numeric values for slices. If data is from a wide summary (e.g., 1 row, multiple metric columns like "Borrows", "Returns"), the backend will transform it. Your `y_columns` should still refer to the relevant *original* metric if applicable for clarity, or the value column if the source is already 2-column.
+            -   `x_column`: **MUST** be the source column name for category labels.
             -   `color_column`: **MUST be `null`** (or omitted).
-            -   **Note:** If you provide data comparing metrics (e.g., 1 row with columns "Total Borrows", "Total Returns"), the backend has logic to transform this into the required 2-column ("Category", "Value") format. However, your specification should **still reference the actual column names from the source table** you intend to compare (e.g., `x_column: "Total Borrows", y_column: "Total Returns"` is **incorrect** for a pie chart, but if the data source has columns "CategoryName" and "NumericValue", you MUST use those names).
-            -   Example SQL Result Columns: `["Branch Name", "Total Borrows"]`
-            -   Example Spec: `x_column: "Branch Name", y_column: "Total Borrows", color_column: null`
-        *   **`type_hint: 'bar'` (Single Metric):**
-            -   `x_column`: Name of the column containing category labels (bar labels).
-            -   `y_column`: Name of the column containing numeric values (bar heights).
-            -   `color_column`: Typically `null` (or omitted) unless coloring bars by the x-axis category itself.
-            -   Example SQL Result Columns: `["Branch Name", "Total Borrows"]`
-            -   Example Spec: `x_column: "Branch Name", y_column: "Total Borrows", color_column: null`
-        *   **`type_hint: 'bar'` (Comparing Multiple Metrics - Requires Transformation):**
-            -   If the source table has metrics in separate columns (e.g., `["Branch Name", "Total Borrows", "Total Returns"]`) and you want bars grouped by metric:
-            -   `x_column`: **MUST be the category column** (e.g., `"Branch Name"`).
-            -   `y_column`: **MUST be the literal string `"Value"`** (representing the transformed value column).
-            -   `color_column`: **MUST be the literal string `"Metric"`** (representing the transformed metric name column).
-            -   Example Spec: `x_column: "Branch Name", y_column: "Value", color_column: "Metric"`
-            -   **CRITICAL REMINDER:** Failure to set `y_column` to **exactly** `"Value"` and `color_column` to **exactly** `"Metric"` in this multi-metric case *will* result in an incorrect/missing chart.
-        *   **`type_hint: 'line'**:**
-            -   Typically used for time series.
-            -   `x_column`: Name of the column containing time/date values or sequential categories.
-            -   `y_column`: Name of the column containing numeric values.
-            -   `color_column`: Specify if plotting multiple lines (e.g., different metrics or categories over time). If used, follow multi-metric bar chart logic (use `"Value"` for `y_column`, `"Metric"` or category name for `color_column`) if transformation applies. **Remember: If comparing multiple metrics via color, `y_column` MUST be `"Value"` and `color_column` MUST be `"Metric"`.**
-            -   Example SQL Result Columns: `["Date", "Total Entries"]`
-            -   Example Spec (Single Line): `x_column: "Date", y_column: "Total Entries", color_column: null`
+            -   Example (source table is already `["Branch Name", "Total Borrows"]`):
+                `x_column: "Branch Name", y_columns: ["Total Borrows"], color_column: null`
+        *   **`type_hint: 'bar'` or `type_hint: 'line'` (Single Metric/Series):**
+            -   `x_column`: Name of the column for categories/time.
+            -   `y_columns`: List containing a **single** column name for numeric values.
+            -   `color_column`: Typically `null` (or omitted) unless grouping/coloring by another existing categorical column.
+            -   Example (Single Line/Bar): `x_column: "Date", y_columns: ["Total Entries"], color_column: null`
+        *   **`type_hint: 'bar'` or `type_hint: 'line'` (Multiple Metrics/Series from `y_columns`):**
+            -   This is for creating a single chart with multiple lines or groups of bars (e.g., plotting "Total Borrows" and "Total Returns" over "Date" on the same chart).
+            -   `x_column`: **MUST be the shared category/time column** (e.g., `"Date"`).
+            -   `y_columns`: **MUST be a list of two or more source column names** representing the different metrics to plot (e.g., `["Total Borrows", "Total Returns", "Total Renewals"]`).
+            -   `color_column`: **SHOULD be `null` or omitted.** The backend will transform the data and use the metric names (derived from your `y_columns`) for coloring, effectively setting the final `color_column` to `"Metric"`.
+            -   **Backend Transformation:** Be aware that when you specify multiple `y_columns`, the backend will transform the data. The resulting data used for the chart will have your `x_column`, a `Metric` column (containing the names from your `y_columns`), and a `Value` column (containing the corresponding values). The final chart specification sent to the frontend will use `y_column: "Value"` and `color_column: "Metric"`.
+            -   Example Spec (Multi-Line Chart):
+                `x_column: "Date", y_columns: ["Total Borrows", "Total Returns"], color_column: null`
+                (Backend will process this to effectively use `y_column: "Value"`, `color_column: "Metric"`)
 
     f. **Consistency Check (MANDATORY):** Before finalizing the call, **verify that:**
         * `source_table_index` is valid for `state['tables']`.
         * `type_hint` is one of "bar", "pie", "line".
-        * `x_column`, `y_column`, `color_column` (if not null) in *each* spec **EXACTLY match column names present in the `columns` list of the table at `source_table_index`**, OR match the required `"Value"`/`"Metric"` literals for transformed multi-metric charts (see 7e). **DO NOT invent column names.**
-        * **Pie charts** reference a 2-column table and have `color_column: null`.
+        * `x_column` and all column names in `y_columns` **EXACTLY match column names present in the `columns` list of the table at `source_table_index`**. **DO NOT invent column names.**
+        * If `color_column` is specified (and not null), it also **EXACTLY matches a column name** in the source table.
+        * **Pie charts** ultimately use 2-column data and have `color_column: null`.
     g. **LLM Internal Verification Checklist (MANDATORY):** Before calling `FinalApiResponseStructure`, INTERNALLY VERIFY for EACH `ChartSpecFinalInstruction`:
         1.  **Index Valid?** (Is `source_table_index` valid?)
         2.  **Type Allowed?** (Is `type_hint` one of "bar", "pie", "line"?)
-        3.  **Columns EXIST in Source?** (Do the specified `x_column`, `y_column`, and non-null `color_column` **ACTUALLY EXIST** in the `columns` list of the source table? OR are they the special literals `"Value"`/`"Metric"` if transformation applies?)
-        4.  **Pie Chart Rules?** (If `type_hint` is 'pie', does source have 2 columns & `color_column` is null?)
-        5.  **Multi-Metric Rules Met?** (If `type_hint` is 'bar'/'line' comparing metrics via color, are `y_column` **exactly** `"Value"` and `color_column` **exactly** `"Metric"`?)
+        3.  **Columns EXIST in Source?** (Do `x_column` and all names in `y_columns` **ACTUALLY EXIST** in the `columns` list of the source table? Does a non-null `color_column`, if specified, also exist?)
+        4.  **Pie Chart Rules?** (If `type_hint` is 'pie', are `y_columns` (singular), `x_column` appropriate for 2-column data & `color_column` is null?)
+        5.  **Multi-Metric from `y_columns`?** (If `type_hint` is 'bar'/'line' and `y_columns` has multiple entries, are `x_column` and all `y_columns` valid source columns, and `color_column` is null/omitted?)
         **ACTION:** If any check fails, FIX the `ChartSpecFinalInstruction` or OMIT it.
 
 8. **CRITICAL TOOL CHOICE: `execute_sql` vs. `summary_synthesizer`:**
@@ -316,7 +317,7 @@ When generating SQL queries for the `execute_sql` tool, adhere strictly to these
     *   Example Request: "Compare total borrows and total returns across the organization last week."
     *   Example CORRECT SQL: `SELECT SUM("1") AS "Total Borrows", SUM("3") AS "Total Returns" FROM "5" WHERE "organizationId" = :organization_id AND "eventTimestamp" >= NOW() - INTERVAL '7 days';` (Returns 1 row)
     *   Example INCORRECT SQL: `SELECT hc."name", SUM("1"), SUM("3") FROM "5" JOIN "hierarchyCaches" hc ... GROUP BY hc."name";` (Incorrectly returns data per branch)
-14. **Combine Metrics (SINGLE CALL MANDATORY):** **CRITICAL:** Generate a **SINGLE** `execute_sql` tool call if multiple related metrics (e.g., borrows & returns) from the *same table and time period* are requested. **ABSOLUTELY DO NOT** make separate tool calls for each metric in this situation. Combine them into one SQL query. Also, do not make separate calls if queries differ only by presentation (e.g., `ORDER BY`).
+14. **Combine Metrics (SINGLE CALL MANDATORY):** **CRITICAL:** Generate a **SINGLE** `execute_sql` tool call if multiple related metrics (e.g., borrows & returns) from the *same physical table and time period* are requested. **ABSOLUTELY DO NOT** make separate tool calls for each metric in this situation. Combine them into one SQL query. Also, do not make separate calls if queries differ only by presentation (e.g., `ORDER BY`). **Conversely, if requested metrics reside in *different physical tables* (e.g., borrows from table "5" and entries from table "8"), you MUST generate separate `execute_sql` calls for each table, as a simple combined query is not possible without inappropriate JOINs for these distinct metrics.**
 15. **CTE Security Requirements:** **CRITICAL REITERATION:** As stated in Guideline #4, when using Common Table Expressions (CTEs) or subqueries, **EACH individual component (the main query AND every CTE AND every subquery) MUST independently include its own `:organization_id` filter** in its `WHERE` clause, using the correct column for that component's table(s). The security system checks each SQL component separately. **Failing to include the proper `:organization_id` filter in ANY component will cause the entire query to be rejected.**
 
     Example of properly secured CTE query:
