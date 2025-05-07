@@ -170,6 +170,13 @@ def analyze_results_node(state: AgentState) -> Dict[str, Any]:
             if col_name in id_col_candidates:
                 logger.debug(f"[AnalyzeResultsNode-Final] Found ID column by candidate name: '{col_name}'")
                 return idx
+
+        # If no standard ID column, check for entity name columns that might contain branch names
+        name_col_candidates = ["Branch Name", "name", "branch", "location", "hierarchy_name"]
+        for idx, col_name in enumerate(columns):
+            if any(candidate.lower() in col_name.lower() for candidate in name_col_candidates):
+                logger.debug(f"[AnalyzeResultsNode-Final] Found name column that might contain entity names: '{col_name}'")
+                return idx
         
         logger.warning(f"[AnalyzeResultsNode-Final] Could not find verification alias or standard ID column in {columns}")
         return None
@@ -183,60 +190,129 @@ def analyze_results_node(state: AgentState) -> Dict[str, Any]:
         
         # 1. Find all resolved IDs used in *this* result's filters
         ids_filtered_in_this_query = set()
+        names_filtered_in_this_query = set()
+        
         for key, value in filters.items():
+            # Check for direct ID matches in filter values
             if isinstance(value, str) and value in resolved_id_to_name_map:
                 ids_filtered_in_this_query.add(value)
+                names_filtered_in_this_query.add(resolved_id_to_name_map[value])
             elif isinstance(value, list):
                 for item in value:
                     if isinstance(item, str) and item in resolved_id_to_name_map:
                         ids_filtered_in_this_query.add(item)
+                        names_filtered_in_this_query.add(resolved_id_to_name_map[item])
             elif 'id' in key.lower() or key.startswith('res_id_'): 
                  potential_ids = [value] if isinstance(value, str) else value if isinstance(value, list) else []
                  for item in potential_ids:
                       if isinstance(item, str) and item in resolved_id_to_name_map:
                            ids_filtered_in_this_query.add(item)
+                           names_filtered_in_this_query.add(resolved_id_to_name_map[item])
+            
+            # Check for branch name matches in filter values
+            elif isinstance(value, str):
+                # Check if this value matches any resolved name (case insensitive)
+                for res_name, res_id in resolved_map.items():
+                    if res_name.lower() in value.lower() or value.lower() in res_name.lower():
+                        ids_filtered_in_this_query.add(res_id)
+                        names_filtered_in_this_query.add(res_name)
+            elif key.lower() in ["branch", "branch_name", "branch1", "branch2", "branch3"]:
+                if isinstance(value, str):
+                    # Check for exact or partial match against resolved names
+                    for res_name, res_id in resolved_map.items():
+                        if res_name.lower() in value.lower() or value.lower() in res_name.lower():
+                            ids_filtered_in_this_query.add(res_id)
+                            names_filtered_in_this_query.add(res_name)
                            
-        if not ids_filtered_in_this_query:
+        if not ids_filtered_in_this_query and not names_filtered_in_this_query:
             # This query didn't filter by any specific resolved entities, skip further checks for it
-            logger.debug(f"[AnalyzeResultsNode-Final] Query with filters {filters} did not filter by resolved IDs. Skipping row check.")
+            logger.debug(f"[AnalyzeResultsNode-Final] Query with filters {filters} did not filter by resolved IDs or names. Skipping row check.")
             continue
 
         # Add these filtered IDs to the set of all expected IDs across the whole request
         all_expected_ids.update(ids_filtered_in_this_query)
-        logger.debug(f"[AnalyzeResultsNode-Final] Query filtered by IDs: {ids_filtered_in_this_query}")
+        logger.debug(f"[AnalyzeResultsNode-Final] Query filtered by IDs: {ids_filtered_in_this_query} and names: {names_filtered_in_this_query}")
 
-        # 2. Check if rows were returned for this query
+        # 2. Check if rows were returned for this query AND if they contain actual data
         if not rows:
             logger.debug(f"[AnalyzeResultsNode-Final] Query filtering by {ids_filtered_in_this_query} returned 0 rows. None marked as found.")
             continue # No rows, so none of these IDs were found in this result
-            
-        # 3. Determine which of the filtered IDs were actually present in the returned rows
-        ids_present_in_rows = set()
-        if len(ids_filtered_in_this_query) == 1:
-            # If only one ID was filtered, and rows were returned, that ID is considered found
-            ids_present_in_rows = ids_filtered_in_this_query
-            logger.debug(f"[AnalyzeResultsNode-Final] Query filtered by single ID {ids_filtered_in_this_query} returned rows. Marking as found.")
+        
+        # NEW: Check if rows contain any actual data beyond just IDs or all nulls
+        has_meaningful_data = False
+        # Attempt to identify non-ID columns to check for meaningful data
+        id_column_names = {col_name for col_name in ["id", "hierarchyId", "hierarchy_id", "location_id", "branch_id", "organizationId", "eventSrc"] if col_name in columns}
+        value_column_indices = [i for i, col_name in enumerate(columns) if col_name not in id_column_names]
+
+        if not value_column_indices: # If all columns are considered ID-like, check all non-None
+            logger.debug(f"[AnalyzeResultsNode-Final] No distinct value columns identified for {ids_filtered_in_this_query}. Checking all cells for non-null data.")
+            for row_idx, row_content in enumerate(rows):
+                if not isinstance(row_content, list):
+                    logger.warning(f"[AnalyzeResultsNode-Final] Row {row_idx} is not a list: {row_content}. Skipping for meaningful data check.")
+                    continue
+                if any(cell is not None for cell in row_content):
+                    has_meaningful_data = True
+                    break
         else:
-            # Multiple IDs were filtered (likely IN clause). Need to check the result table.
+            logger.debug(f"[AnalyzeResultsNode-Final] Checking value columns (indices: {value_column_indices}) for {ids_filtered_in_this_query} for non-null data.")
+            for row_idx, row_content in enumerate(rows):
+                if not isinstance(row_content, list):
+                    logger.warning(f"[AnalyzeResultsNode-Final] Row {row_idx} is not a list: {row_content}. Skipping for meaningful data check.")
+                    continue
+                # Check if any of the identified value columns in this row has a non-None value
+                if any(row_content[col_idx] is not None for col_idx in value_column_indices if len(row_content) > col_idx):
+                    has_meaningful_data = True
+                    break
+        
+        if not has_meaningful_data:
+            logger.info(f"[AnalyzeResultsNode-Final] Query filtering by {ids_filtered_in_this_query} returned rows, but all rows appear to contain only NULL values in metric/value columns or no meaningful data. Marking corresponding IDs as 'data not found'.")
+            # Do not add to found_ids if no meaningful data, even if rows were returned.
+            # The ids_filtered_in_this_query will then correctly be part of 'missing_ids' later.
+            continue
+
+        # 3. Determine which of the filtered IDs were actually present in the returned rows (original logic follows)
+        #    This part now assumes that if we reached here, 'has_meaningful_data' is True.
+        if len(ids_filtered_in_this_query) <= 1 and len(names_filtered_in_this_query) <= 1:
+            # If we filtered by only one ID/name and got meaningful data, that entity's data was found
+            # This handles cases where barcode transactional data doesn't include the branch ID in the results
+            found_ids.update(ids_filtered_in_this_query)
+            logger.debug(f"[AnalyzeResultsNode-Final] Query filtered by single ID {ids_filtered_in_this_query} or name {names_filtered_in_this_query} returned rows with meaningful data. Marking as found.")
+        else:
+            # Multiple IDs/names were filtered. Try to identify entities in the result rows.
             id_col_index = find_id_column_index(columns)
+            
             if id_col_index is not None:
-                logger.debug(f"[AnalyzeResultsNode-Final] Checking ID column (Index: {id_col_index}, Name: {columns[id_col_index]}) for IDs {ids_filtered_in_this_query}...")
+                logger.debug(f"[AnalyzeResultsNode-Final] Checking column (Index: {id_col_index}, Name: {columns[id_col_index]}) for entity identification in rows with meaningful data...")
+                
+                # Check for both direct ID matches and name matches
                 for row in rows:
                     if isinstance(row, list) and len(row) > id_col_index:
                         cell_value = row[id_col_index]
                         cell_value_str = str(cell_value) if isinstance(cell_value, uuid.UUID) else cell_value
+                        
+                        # Direct ID match
                         if isinstance(cell_value_str, str) and cell_value_str in ids_filtered_in_this_query:
-                            ids_present_in_rows.add(cell_value_str)
-                logger.debug(f"[AnalyzeResultsNode-Final] IDs actually present in rows for this multi-ID query: {ids_present_in_rows}")
+                            found_ids.add(cell_value_str)
+                        
+                        # Name match - compare with branch names
+                        elif isinstance(cell_value_str, str):
+                            for res_id, res_name in resolved_id_to_name_map.items():
+                                # Get the full resolved name from the map using lowercase key
+                                full_name = None
+                                for k, v in resolved_map.items():
+                                    if k == res_name:
+                                        if cell_value_str and res_id in ids_filtered_in_this_query and (
+                                           cell_value_str.lower() in k.lower() or 
+                                           k.lower() in cell_value_str.lower()):
+                                            found_ids.add(res_id)
+                                            logger.debug(f"[AnalyzeResultsNode-Final] Found entity match: '{cell_value_str}' matches '{k}' (ID: {res_id})")
+                
+                logger.debug(f"[AnalyzeResultsNode-Final] Entities found in rows for this query: {found_ids}")
             else:
-                # Cannot verify which IDs are present if ID column is missing from results
-                logger.warning(f"[AnalyzeResultsNode-Final] Query filtered by multiple IDs {ids_filtered_in_this_query}, but no ID column found in results {columns}. Cannot confirm which IDs were found.")
-                # Potential Strategy: Assume all filtered IDs were found if rows were returned? Risky.
-                # Safer Strategy: Mark none as found if verification isn't possible.
-                ids_present_in_rows = set() # Mark none as found if we can't check
-
-        # Add the IDs confirmed present in rows to the overall 'found_ids' set
-        found_ids.update(ids_present_in_rows)
+                # If we can't identify specific entities but have meaningful data, assume all filtered entities were found
+                # This is more permissive than the previous approach
+                found_ids.update(ids_filtered_in_this_query)
+                logger.debug(f"[AnalyzeResultsNode-Final] Query filtered by multiple IDs {ids_filtered_in_this_query} returned meaningful data but no ID/name column found. Conservatively marking all as found.")
 
     # --- Generate final context --- # 
     if not all_expected_ids:

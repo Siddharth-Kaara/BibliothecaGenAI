@@ -391,9 +391,35 @@ def process_and_validate_chart_specs(
                      logger.warning(f"Pie chart '{spec_title}' transformation from wide summary failed. Chart may be invalid.")
             
             elif not is_summary_transformed and not is_pie_transformed and type_hint in ['bar', 'line'] and llm_specified_color_col and len(llm_specified_y_cols) > 1:
-                log_prefix = f"Multi-series '{spec_title}' (Inferred from {len(llm_specified_y_cols)} y_columns)"
+                log_prefix = f"Multi-series '{spec_title}' (Inferred from {len(llm_specified_y_cols)} y_columns with explicit color_column)"
                 logger.info(f"{log_prefix}: Applying wide-to-long transformation. Y-columns: {llm_specified_y_cols}")
 
+                if not llm_specified_x_col or llm_specified_x_col not in columns_from_source_table:
+                    failure_reason = f"{log_prefix} failed: x_column '{llm_specified_x_col}' (specified by LLM) not found in original source table columns {columns_from_source_table}."
+                    valid_chart = False
+                else:
+                    for y_col_check in llm_specified_y_cols:
+                        if y_col_check not in columns_from_source_table:
+                            failure_reason = f"{log_prefix} failed: y_column '{y_col_check}' (specified by LLM) not found in original source table columns {columns_from_source_table}."
+                            valid_chart = False
+                            break
+                    if not valid_chart: # If any y_column was invalid
+                        pass # Failure reason already set
+                    else:
+                        transformed_data = _transform_wide_to_long(source_table_for_processing, llm_specified_x_col, llm_specified_y_cols)
+                        if transformed_data.get("metadata", {}).get("transformed_from_wide_multi_y"):
+                            data_for_chart = transformed_data
+                            columns_to_validate = transformed_data["columns"]
+                            is_multi_metric = True # Mark as multi-metric
+                            logger.debug(f"{log_prefix}: Transformation successful. New columns for validation: {columns_to_validate}")
+                        else:
+                            failure_reason = f"{log_prefix}: Data transformation using _transform_wide_to_long failed. Original columns: {columns_from_source_table}, ID col: {llm_specified_x_col}, Y-cols: {llm_specified_y_cols}."
+                            valid_chart = False
+            
+            elif not is_summary_transformed and not is_pie_transformed and not is_multi_metric and type_hint in ['bar', 'line'] and len(llm_specified_y_cols) > 1:
+                log_prefix = f"Multi-series '{spec_title}' (Multiple y_columns: {len(llm_specified_y_cols)} without explicit color_column)"
+                logger.info(f"{log_prefix}: Applying standard multi-series transformation. Y-columns: {llm_specified_y_cols}")
+                
                 if not llm_specified_x_col or llm_specified_x_col not in columns_from_source_table:
                     failure_reason = f"{log_prefix} failed: x_column '{llm_specified_x_col}' (specified by LLM) not found in original source table columns {columns_from_source_table}."
                     valid_chart = False
