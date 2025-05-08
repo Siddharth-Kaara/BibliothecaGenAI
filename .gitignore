@@ -7,3 +7,4 @@ static/
 README.md
 __pycache__/
 cost_calculator.html
+.vscode

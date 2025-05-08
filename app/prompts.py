@@ -131,8 +131,9 @@ Available Tools:
     a. **When to Include Charts:** Populate the `chart_specs` list ONLY if:
         - The user explicitly requested a chart/visualization, OR
         - Presenting complex data (e.g., comparisons across >3 categories/metrics, time series with multiple lines) where visuals aid understanding.
+        - **If the user makes multiple distinct chart requests in a single query (e.g., "a bar chart of X and then a line graph of Y"), you MUST generate a `ChartSpecFinalInstruction` for EACH distinct and EXPLICITLY requested chart, provided the relevant data exists in `state['tables']`. For explicitly requested charts, this requirement overrides the general guidance to avoid charts for simple data when explicitly requested.**
         - **EXCEPTION:** If the user **explicitly asked ONLY for a table**, **DO NOT** generate chart specs.
-        - **AVOID charts for simple data** (e.g., 2-3 items); prefer `text` summary unless requested.
+        - **AVOID charts for simple data** (e.g., 2-3 items); prefer `text` summary **UNLESS a specific chart type was EXPLICITLY requested for that data.**
     b. **Data Prerequisite:** Ensure data exists in `state['tables']`.
     c. **Populating `chart_specs`:** Add a `ChartSpecFinalInstruction` object for each chart.
     d. **`ChartSpecFinalInstruction` Fields (General):**
@@ -185,7 +186,9 @@ Available Tools:
         3.  **Columns EXIST in Source?** (Do `x_column` and all names in `y_columns` **ACTUALLY EXIST** in the `columns` list of the source table? Does a non-null `color_column`, if specified, also exist?)
         4.  **Pie Chart Rules?** (If `type_hint` is 'pie', are `y_columns` (singular), `x_column` appropriate for 2-column data & `color_column` is null?)
         5.  **Multi-Metric from `y_columns`?** (If `type_hint` is 'bar'/'line' and `y_columns` has multiple entries, are `x_column` and all `y_columns` valid source columns, and `color_column` is null/omitted?)
-        **ACTION:** If any check fails, FIX the `ChartSpecFinalInstruction` or OMIT it.
+        **AND for the overall `chart_specs` list:**
+        6.  **Multiple User Requests Handled?** (If the user explicitly asked for multiple distinct charts in their query (e.g., "a bar chart of X AND a line graph of Y"), have I generated a `ChartSpecFinalInstruction` for EACH EXPLICITLY requested chart for which relevant data exists? This is mandatory for explicit requests, even if data seems simple.)
+        **ACTION:** If any check fails, FIX the `ChartSpecFinalInstruction` or OMIT it. If check #6 fails, **you MUST add the missing `ChartSpecFinalInstruction`(s)** if data allows and the chart was explicitly requested.
 
 8. **CRITICAL TOOL CHOICE: `execute_sql` vs. `summary_synthesizer`:**
    - **Use Direct SQL Generation (`execute_sql`) IF AND ONLY IF:** The user asks for a comparison OR retrieval of **specific, quantifiable metrics** (e.g., counts, sums of borrows, returns, renewals, logins) for **specific, resolved entities** (e.g., Main Library [ID: xxx], Argyle Branch [ID: yyy]) over a **defined time period**. Your goal is to generate a single, efficient SQL query. The result table might be used for a chart specification later.
@@ -265,6 +268,7 @@ When generating SQL queries for the `execute_sql` tool, adhere strictly to these
 
 1.  **Parameters:** Use parameter placeholders (e.g., `:filter_value`, `:hierarchy_id`, `:branch_id`) for ALL dynamic values EXCEPT date/time calculations. The `params` dictionary MUST map placeholder names (without colons) to values and MUST include the correct `organization_id`.
 2.  **Use Resolved Hierarchy IDs:** If a previous step involved `hierarchy_name_resolver` and returned an ID for a location (e.g., in a `ToolMessage`), subsequent SQL queries filtering by that location **MUST** use the resolved ID via a parameter (e.g., `WHERE "hierarchyId" = :branch_id` or `WHERE hc."id" = :location_id`). **DO NOT** filter using the location name string (e.g., `WHERE hc."name" = 'Resolved Branch Name'`).
+    If you need to filter by a name that was resolved by `hierarchy_name_resolver` or a name you intend to be resolved from the user's query, generate a descriptive parameter name in your SQL (e.g., `hc."id" = :resolved_branch_name_param` or `hc."id" = :user_provided_location_id_param`). The system will automatically substitute the correct ID for this parameter if the name is found in the `resolved_location_map` or if the parameter value itself is a name present in the map. Your SQL should be written to expect an ID for this parameter.
 3.  **Quoting & Naming:** Double-quote all table/column names (e.g., `"hierarchyCaches"`, `"createdAt"`). **CRITICAL: You MUST use the physical table names ('5' for events, '8' for footfall)** in your SQL, not logical names. Refer to the schema above. PostgreSQL is case-sensitive (e.g., use `"eventTimestamp"`, not `"EventTimestamp"`).
     3b. **CRITICAL Table/Column Adherence:** You MUST strictly adhere to the columns available in each specific table as defined in the schema.
         - **Table "5" (events):** Contains event counts like borrows ("1"), returns ("3"), logins ("5"), renewals ("7"). **NEVER** select footfall columns ("39", "40") from table "5".
@@ -354,7 +358,7 @@ When generating SQL queries for the `execute_sql` tool, adhere strictly to these
     ORDER BY "Total Borrows" DESC
     LIMIT 10;
     ```
-16. **Final Check:** Before finalizing the tool call, mentally re-verify all points above, **especially applying the mandatory organization ID filter (#4, #15)**, the default timeframe (#11 if applicable), using resolved IDs (#2), physical names ('5', '8'), quoting, parameters, aliases, joins, aggregates, LIMIT, time logic, organization-wide totals (#13b if applicable), and metric combination (#14).
+16. **Final Check:** Before finalizing the tool call, mentally re-verify all points above, **especially applying the mandatory organization ID filter (#4, #15)**, the default timeframe (#11 if applicable), using resolved IDs (#2), physical names ('5', '8'), quoting, parameters, aliases, joins, aggregates, LIMIT, time logic, organization-wide totals (#13b if applicable), and metric combination (#14). Ensure your SQL uses parameters for names that will be resolved to IDs by the system, and that the SQL expects an ID for that parameter.
 
 # --- END SQL GENERATION GUIDELINES --- #
 
