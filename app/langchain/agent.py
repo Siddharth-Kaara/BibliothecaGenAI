@@ -503,8 +503,8 @@ def agent_node(state: AgentState, llm_with_structured_output):
     if sql_failures: # Check only if there are any SQL failures
         last_sql_failure = sql_failures[-1] # Get the most recent one
         is_specific_security_error = (
-            "SECURITY CHECK FAILED" in last_sql_failure.get("error_message", "") and
-            "organization_id" in last_sql_failure.get("error_message", "")
+            "SECURITY CHECK FAILED" in last_sql_failure.get("details", "") and # CORRECTED KEY
+            "organization_id" in last_sql_failure.get("details", "")     # CORRECTED KEY
         )
 
         if is_specific_security_error:
