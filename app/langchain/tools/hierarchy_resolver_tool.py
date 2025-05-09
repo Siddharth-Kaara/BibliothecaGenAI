@@ -47,195 +47,47 @@ class HierarchyNameResolverTool(BaseTool):
     
     # Advanced name processing
     def _preprocess_name(self, name: str) -> Dict[str, Any]:
-        """Preprocess a name with multiple approaches for more robust matching."""
-        if not name:
-            return {"original": "", "normalized": "", "keywords": [], "identifiers": []}
-            
-        # Basic normalization
-        normalized = name.lower().strip()
+        """Preprocess a name for matching. Returns dict with original, processed name, and extracted identifiers."""
+        original = name
+        processed = name.lower().strip()
         
-        # Extract abbreviation if present in parentheses
-        abbr_match = re.search(r'\(([A-Za-z]+)\)$', normalized)
-        abbreviation = abbr_match.group(1).lower() if abbr_match else None
+        # Remove common suffixes/prefixes that might interfere with matching
+        for word in self.COMMON_WORDS:
+            processed = re.sub(rf'\b{word}\b', '', processed, flags=re.IGNORECASE).strip()
         
-        # Remove abbreviation part for cleaner processing
-        if abbr_match:
-            normalized = normalized[:abbr_match.start()].strip()
+        # Extract core identifiers (don't strip common words from identifiers)
+        identifiers = name.lower().strip()
         
-        # Remove punctuation and special characters
-        cleaned = re.sub(r'[^\w\s]', ' ', normalized)
-        
-        # Tokenize
-        tokens = [t.strip() for t in cleaned.split() if t.strip()]
-        
-        # Extract keywords (non-common words)
-        keywords = [t for t in tokens if t.lower() not in self.COMMON_WORDS]
-        
-        # Check if we have priority keywords
-        has_priority_name = any(kw.lower() in self.PRIORITY_NAMES for kw in keywords)
-        
-        # Create variant without common words for matching
-        identifiers = " ".join(keywords)
+        # Check for priority names
+        has_priority = any(priority in processed for priority in self.PRIORITY_NAMES)
         
         return {
-            "original": name,
-            "normalized": normalized,
-            "keywords": keywords,
-            "identifiers": identifiers,
-            "abbreviation": abbreviation,
-            "has_priority_name": has_priority_name,
-            "priority_match": next((kw for kw in keywords if kw.lower() in self.PRIORITY_NAMES), None)
+            "original": original,
+            "processed": processed,
+            "identifiers": identifiers,  # Now keeps full lowercase name as identifier
+            "has_priority_name": has_priority
         }
 
     def _score_match(self, candidate_processed: Dict[str, Any], db_entry_processed: Dict[str, Any]) -> Dict[str, Any]:
-        """Calculate a comprehensive match score using multiple metrics."""
+        """Score how well a processed candidate matches a processed DB entry."""
+        # Initialize result with no match
+        result = {"match": False, "score": 0, "method": "no_match"}
+        
+        # Early exact match check (case-insensitive)
+        if candidate_processed["processed"] == db_entry_processed["processed"]:
+            return {"match": True, "score": 100, "method": "exact"}
+        
+        # Initialize scores dictionary for fuzzy matching
         scores = {}
-        result = {"match": False, "score": 0, "method": None}
         
-        # 1. Try exact match on normalized name
-        if candidate_processed["normalized"] == db_entry_processed["normalized"]:
-            result = {"match": True, "score": 100, "method": "exact"}
-            return result
+        # Get the candidate and DB entry identifiers
+        candidate_identifier = candidate_processed["identifiers"]
+        db_identifier = db_entry_processed["identifiers"]
         
-        # 2. Check for abbreviation match
-        if (candidate_processed["abbreviation"] and db_entry_processed["abbreviation"] and
-            candidate_processed["abbreviation"] == db_entry_processed["abbreviation"]):
-            result = {"match": True, "score": 95, "method": "abbreviation"}
-            return result
-        
-        # 3. Check for keyword exact match (if they have the same non-common words)
-        if (candidate_processed["keywords"] and db_entry_processed["keywords"] and
-            set(candidate_processed["keywords"]) == set(db_entry_processed["keywords"])):
-            result = {"match": True, "score": 90, "method": "keywords"}
-            return result
-        
-        # 4. Special priority name handling (e.g., "Main" should match "Main Library" very strongly)
-        if candidate_processed["has_priority_name"] and db_entry_processed["has_priority_name"]:
-            priority_name_candidate = candidate_processed["priority_match"]
-            priority_name_db = db_entry_processed["priority_match"]
-            
-            if priority_name_candidate and priority_name_db and priority_name_candidate.lower() == priority_name_db.lower():
-                result = {"match": True, "score": 95, "method": "priority_name"}
-                return result
-        
-        # 5. If candidate has a priority name, check if it exists in the DB entry keywords
-        if candidate_processed["has_priority_name"] and candidate_processed["priority_match"]:
-            priority_name = candidate_processed["priority_match"].lower()
-            db_keywords_lower = [k.lower() for k in db_entry_processed["keywords"]]
-            
-            if priority_name in db_keywords_lower:
-                # This is a strong signal for matching, e.g., "Main Branch" should match "Main Library"
-                priority_match_score = 92
-                result = {"match": True, "score": priority_match_score, "method": "priority_in_db"}
-                return result
-        
-        # 6. Check for leading keyword match (important for branch names like "Main Library" matching "Main")
-        if (candidate_processed["keywords"] and db_entry_processed["keywords"] and
-            len(candidate_processed["keywords"]) > 0 and len(db_entry_processed["keywords"]) > 0):
-            
-            candidate_first = candidate_processed["keywords"][0].lower()
-            db_first = db_entry_processed["keywords"][0].lower()
-            
-            # Special case for full exact match on first keyword
-            if candidate_first == db_first:
-                # Check if the word is a priority name for higher score
-                if candidate_first in self.PRIORITY_NAMES:
-                    result = {"match": True, "score": 92, "method": "primary_priority_keyword"}
-                else:
-                    result = {"match": True, "score": 87, "method": "primary_keyword"}
-                return result
-            
-            # Check if first character matches and one is a prefix of the other
-            # This is to prevent "Main" matching with "Mandarin" too strongly
-            if candidate_first[0] == db_first[0]:
-                min_len = min(len(candidate_first), len(db_first))
-                prefix_match_len = 0
-                
-                for i in range(min_len):
-                    if candidate_first[i] == db_first[i]:
-                        prefix_match_len += 1
-                    else:
-                        break
-                
-                # Calculate percentage of the shorter word that matches as prefix
-                prefix_match_percent = prefix_match_len / min_len
-                
-                # Only consider a good partial prefix match if > 80% of the shorter word matches
-                if prefix_match_percent > 0.8 and prefix_match_len >= 3:
-                    # But reduce score for longer words that only share a prefix
-                    partial_prefix_score = 72 + (prefix_match_percent * 10) # 72-82 range
-                    
-                    # Check if short word "main" is being matched against longer word like "mandarin"
-                    # Stronger words like "main" should have lower prefix match score with longer words
-                    if candidate_first in self.PRIORITY_NAMES and len(db_first) > len(candidate_first) + 3:
-                        partial_prefix_score -= 15  # Significant penalty
-                    
-                    if db_first in self.PRIORITY_NAMES and len(candidate_first) > len(db_first) + 3:
-                        partial_prefix_score -= 15  # Significant penalty
-                        
-                    result = {
-                        "match": partial_prefix_score >= self.min_score_threshold,
-                        "score": partial_prefix_score,
-                        "method": "partial_prefix"
-                    }
-                    if result["match"]:
-                        return result
-                        
-        # 7. Check for significant keyword containment (e.g., "Main" in "Main Library")
-        candidate_kw_set = set(candidate_processed["keywords"])
-        db_kw_set = set(db_entry_processed["keywords"])
-        
-        if candidate_kw_set and db_kw_set:
-            # If ALL candidate keywords are in the DB entry
-            if candidate_kw_set.issubset(db_kw_set):
-                containment_score = 82
-                result = {"match": True, "score": containment_score, "method": "keyword_containment"}
-                return result
-                
-            # If multiple keywords match but not all
-            intersection = candidate_kw_set.intersection(db_kw_set)
-            if len(intersection) > 0:
-                # Score based on percentage of matching keywords
-                containment_ratio = len(intersection) / max(len(candidate_kw_set), len(db_kw_set))
-                keyword_match_score = int(75 * containment_ratio)
-                if keyword_match_score >= self.min_score_threshold:
-                    result = {"match": True, "score": keyword_match_score, "method": "partial_keywords"}
-                    return result
-        
-        # 8. Fallback to advanced string similarity metrics for fuzzy matching
-        # Token sort ratio - less affected by word order
-        token_sort_ratio = fuzz.token_sort_ratio(
-            candidate_processed["normalized"], 
-            db_entry_processed["normalized"]
-        )
-        scores["token_sort"] = token_sort_ratio
-        
-        # Partial ratio helps with substring matches
-        partial_ratio = fuzz.partial_ratio(
-            candidate_processed["normalized"], 
-            db_entry_processed["normalized"]
-        )
-        
-        # Apply a penalty for partial ratio when dealing with priority names
-        # to prevent "Main" from matching with "Mandarin" just because they both start with "Ma"
-        if (candidate_processed["has_priority_name"] or db_entry_processed["has_priority_name"]):
-            # Check if the DB name is significantly longer than priority name
-            if candidate_processed["has_priority_name"] and candidate_processed["priority_match"]:
-                priority_len = len(candidate_processed["priority_match"])
-                normalized_len = len(db_entry_processed["normalized"])
-                
-                # Stronger penalty for short priority names matching with much longer strings
-                if normalized_len > priority_len * 1.5:
-                    partial_ratio = max(50, partial_ratio - 15)  # Penalize partial matches for priority names
-        
-        scores["partial"] = partial_ratio
-        
-        # Token set ratio - good for overlapping words regardless of order
-        token_set_ratio = fuzz.token_set_ratio(
-            candidate_processed["normalized"], 
-            db_entry_processed["normalized"]
-        )
-        scores["token_set"] = token_set_ratio
+        # Calculate fuzzy match scores
+        scores["ratio"] = fuzz.ratio(candidate_identifier, db_identifier)
+        scores["partial"] = fuzz.partial_ratio(candidate_identifier, db_identifier)
+        scores["token_set"] = fuzz.token_set_ratio(candidate_identifier, db_identifier)
         
         # Maximum score across all fuzzy metrics
         max_fuzzy_score = max(scores.values()) if scores else 0
@@ -247,12 +99,44 @@ class HierarchyNameResolverTool(BaseTool):
         
         # Only accept if above threshold
         if max_fuzzy_score >= fuzzy_threshold:
-            best_method = max(scores.items(), key=lambda x: x[1])[0]
-            result = {
-                "match": True,
-                "score": max_fuzzy_score,
-                "method": f"fuzzy_{best_method}"
-            }
+            best_method_key = max(scores.items(), key=lambda x: x[1])[0]
+            current_method_for_log = f"fuzzy_{best_method_key}"
+
+            # Stricter conditions for fuzzy matching
+            is_short_term = len(candidate_identifier.split()) <= 1
+            is_branch_term = "branch" in candidate_identifier.lower()
+            
+            # Special handling for branch names
+            if is_branch_term:
+                # For "X Branch" pattern, require higher score or exact match of the prefix
+                branch_prefix = candidate_identifier.lower().replace(" branch", "").strip()
+                db_prefix = db_identifier.lower().replace(" branch", "").strip()
+                
+                # If it's a specific branch name (e.g., "Main Branch", "DC Branch")
+                if branch_prefix:
+                    # Check if the prefix exactly matches
+                    if branch_prefix == db_prefix:
+                        result = {"match": True, "score": 100, "method": "branch_prefix_exact"}
+                    # For partial matches on branch names, require very high score
+                    elif best_method_key == "partial" and max_fuzzy_score < 95:
+                        logger.debug(f"[{self.name}] Rejecting branch name '{candidate_identifier}' matching to '{db_identifier}' (score: {max_fuzzy_score:.2f}, method: {current_method_for_log})")
+                        result = {"match": False, "score": max_fuzzy_score, "method": current_method_for_log + "_rejected_branch"}
+                    else:
+                        result = {
+                            "match": True,
+                            "score": max_fuzzy_score,
+                            "method": current_method_for_log
+                        }
+            # For non-branch terms
+            elif is_short_term and not candidate_processed["has_priority_name"] and max_fuzzy_score < 95:
+                logger.debug(f"[{self.name}] Rejecting short term '{candidate_identifier}' matching to '{db_identifier}' (score: {max_fuzzy_score:.2f}, method: {current_method_for_log})")
+                result = {"match": False, "score": max_fuzzy_score, "method": current_method_for_log + "_rejected_short"}
+            else:
+                result = {
+                    "match": True,
+                    "score": max_fuzzy_score,
+                    "method": current_method_for_log
+                }
         
         return result
 

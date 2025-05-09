@@ -36,10 +36,18 @@ from app.langchain.tools.summary_tool import SummarySynthesizerTool
 from app.langchain.tools.hierarchy_resolver_tool import HierarchyNameResolverTool
 from app.schemas.chat import ChatData, ApiChartSpecification, TableData
 from app.langchain.charting import ChartSpecFinalInstruction, process_and_validate_chart_specs
-from app.prompts import AGENT_SYSTEM_PROMPT # Import from prompts
+from app.prompts import AGENT_SYSTEM_PROMPT 
 
 logger = logging.getLogger(__name__)
 usage_logger = logging.getLogger("usage") 
+
+# --- Constants ---
+HIERARCHY_RESOLVER_TOOL_NAME = "hierarchy_name_resolver"
+SQL_EXECUTION_TOOL_NAME = "execute_sql"
+STATUS_FOUND = "found"
+STATUS_NOT_FOUND = "not_found"
+ADVISE_LLM_MARKER = "ADVISE LLM:"
+# --- End Constants ---
 
 
 # --- Helper Function to Get Schema String --- #
@@ -133,150 +141,141 @@ class AgentState(TypedDict):
     sql_security_retry_count: Annotated[int, operator.add] = 0
     # --- ADDED: Cache for hierarchy resolution results within a single request --- #
     request_hierarchy_cache: Optional[Dict[str, Dict[str, Any]]] = None
+    # --- ADDED: Retry counter for missing entity discrepancies --- #
+    missing_entities_retry_count: Annotated[int, operator.add] = 0
 
 
 # --- NAnalysis Node to Check for Missing Entities ---
 def analyze_results_node(state: AgentState) -> Dict[str, Any]:
     """Analyzes structured results (table + filters) against resolved entities (using IDs). 
        Determines missing entities by checking if queries filtering by specific IDs returned rows containing meaningful data.
-       Generates context for the LLM about missing data.
+       Generates context for the LLM about missing data, including checking chat history for prior mentions.
     """
     request_id = state.get("request_id")
-    logger.debug(f"[AnalyzeResultsNode-Final] Entering node...")
+    logger.debug(f"[AnalyzeResultsNode-Final] Entering node... Request ID: {request_id}")
     
     resolved_map = state.get("resolved_location_map") # {name_lower: id}
     structured_results = state.get("structured_results", []) # List of {"table": ..., "filters": ...}
-    missing_entities_context = None
+    messages = state.get("messages", []) # Get conversation history
+    missing_entities_context = None # Default to None
 
-    if not resolved_map or not structured_results:
-        logger.debug("[AnalyzeResultsNode-Final] Skipping analysis: Missing resolved map or structured results.")
+    if not resolved_map:
+        logger.debug("[AnalyzeResultsNode-Final] Skipping analysis: Missing resolved_location_map.")
         return {"missing_entities_context": None}
 
-    resolved_id_to_name_map = {v: k for k, v in resolved_map.items()} # Reverse map {id: name_lower}
-    all_expected_ids = set() # All unique resolved IDs used in ANY successful filter
-    found_ids = set() # Resolved IDs for which corresponding data rows were actually found
+    # NEW: If there are resolved entities but no structured results (queries) yet,
+    # it indicates that no data querying has been attempted for them.
+    # In this scenario, we should not generate a 'no data found' context,
+    # as it would mislead the LLM. The LLM should proceed to query for resolved entities.
+    if not structured_results: # Check if structured_results is empty or None
+        logger.info("[AnalyzeResultsNode-Final] Resolved entities may exist, but no structured query results are present yet. "
+                    "Skipping 'no data found' context generation to allow LLM to proceed with querying.")
+        return {"missing_entities_context": None}
 
-    # --- Analyze each structured result --- #
+    logger.debug(f"[AnalyzeResultsNode-Final] Starting analysis with resolved_map: {resolved_map}")
+    logger.debug(f"[AnalyzeResultsNode-Final] Number of structured results to analyze: {len(structured_results)}")
+
+    # Create bidirectional maps for resolved entities
+    resolved_id_to_name_map = {}
+    for name, id_val in resolved_map.items():
+        if id_val in resolved_id_to_name_map:
+            if isinstance(resolved_id_to_name_map[id_val], list):
+                resolved_id_to_name_map[id_val].append(name)
+            else:
+                resolved_id_to_name_map[id_val] = [resolved_id_to_name_map[id_val], name]
+        else:
+            resolved_id_to_name_map[id_val] = name
+
+    # Get unique IDs from resolved map
+    all_expected_ids = set(resolved_map.values())
+    found_ids_with_data = set()
+
+    # Analyze each structured result
     for result in structured_results:
-        filters = result.get("filters", {})
-        table = result.get("table", {})
-        columns = table.get("columns", [])
-        rows = table.get("rows", [])
-        
-        # 1. Find all resolved IDs used in *this* result's filters
-        ids_filtered_in_this_query = set()
-        names_filtered_in_this_query = set() # Keep track for logging/context
-        
-        # --- Logic to find ids_filtered_in_this_query (unchanged) ---
-        for key, value in filters.items():
-            # Check for direct ID matches in filter values
-            if isinstance(value, str) and value in resolved_id_to_name_map:
-                ids_filtered_in_this_query.add(value)
-                names_filtered_in_this_query.add(resolved_id_to_name_map[value])
-            elif isinstance(value, list):
-                for item in value:
-                    if isinstance(item, str) and item in resolved_id_to_name_map:
-                        ids_filtered_in_this_query.add(item)
-                        names_filtered_in_this_query.add(resolved_id_to_name_map[item])
-            elif 'id' in key.lower() or key.startswith('res_id_'): 
-                 potential_ids = [value] if isinstance(value, str) else value if isinstance(value, list) else []
-                 for item in potential_ids:
-                      if isinstance(item, str) and item in resolved_id_to_name_map:
-                           ids_filtered_in_this_query.add(item)
-                           names_filtered_in_this_query.add(resolved_id_to_name_map[item])
-            
-            # Check for branch name matches in filter values
-            elif isinstance(value, str):
-                # Check if this value matches any resolved name (case insensitive)
-                for res_name, res_id in resolved_map.items():
-                    if res_name.lower() in value.lower() or value.lower() in res_name.lower():
-                        ids_filtered_in_this_query.add(res_id)
-                        names_filtered_in_this_query.add(res_name)
-            elif key.lower() in ["branch", "branch_name", "branch1", "branch2", "branch3"]:
-                if isinstance(value, str):
-                    # Check for exact or partial match against resolved names
-                    for res_name, res_id in resolved_map.items():
-                        if res_name.lower() in value.lower() or value.lower() in res_name.lower():
-                            ids_filtered_in_this_query.add(res_id)
-                            names_filtered_in_this_query.add(res_name)
-        # --- End logic to find ids_filtered_in_this_query ---
-                           
-        if not ids_filtered_in_this_query:
-            # This query didn't filter by any specific resolved entities, skip further checks for it
-            logger.debug(f"[AnalyzeResultsNode-Final] Query with filters {filters} did not filter by resolved IDs. Skipping row check.")
+        if not isinstance(result, dict):
+            logger.warning(f"[AnalyzeResultsNode-Final] Invalid result format: {result}")
             continue
 
-        # Add these filtered IDs to the set of all expected IDs across the whole request
-        all_expected_ids.update(ids_filtered_in_this_query)
-        logger.debug(f"[AnalyzeResultsNode-Final] Query filtered by IDs: {ids_filtered_in_this_query} (Names: {names_filtered_in_this_query}) ")
-
-        # 2. Check if rows were returned for this query AND if they contain meaningful data
-        if not rows:
-            logger.debug(f"[AnalyzeResultsNode-Final] Query filtering by {ids_filtered_in_this_query} returned 0 rows. None marked as found.")
-            continue # No rows, so none of these IDs were found in this result
+        # Extract rows and filters
+        rows = result.get("rows", [])
+        filters = result.get("filters", {})
         
-        # Check if rows contain any actual data beyond just IDs or all nulls
-        has_meaningful_data = False
-        # Attempt to identify non-ID columns to check for meaningful data
-        id_column_names = {col_name for col_name in ["id", "hierarchyId", "hierarchy_id", "location_id", "branch_id", "organizationId", "eventSrc"] if col_name in columns}
-        value_column_indices = [i for i, col_name in enumerate(columns) if col_name not in id_column_names]
+        # Get IDs that were filtered for in this query
+        ids_filtered_in_this_query = set()
+        for filter_key, filter_value in filters.items():
+            # Skip 'organization_id' as it's not an entity ID we are tracking for data presence here
+            if filter_key == "organization_id":
+                continue
+            
+            if isinstance(filter_value, str) and filter_value in all_expected_ids:
+                ids_filtered_in_this_query.add(filter_value)
+            elif isinstance(filter_value, list):
+                for item in filter_value:
+                    if isinstance(item, str) and item in all_expected_ids:
+                        ids_filtered_in_this_query.add(item)
 
-        if not value_column_indices: # If all columns are considered ID-like, check all non-None
-            logger.debug(f"[AnalyzeResultsNode-Final] No distinct value columns identified for IDs {ids_filtered_in_this_query}. Checking all cells for non-null data.")
-            for row_idx, row_content in enumerate(rows):
-                if not isinstance(row_content, list):
-                    logger.warning(f"[AnalyzeResultsNode-Final] Row {row_idx} is not a list: {row_content}. Skipping for meaningful data check.")
+        # Check if any rows have meaningful data for the IDs specifically filtered in this query
+        has_meaningful_data_for_filtered_ids = False
+        if rows: # Check if rows list is not empty
+            for row_list in rows: # Iterate through the list of lists
+                if not isinstance(row_list, list): # Each row should be a list
+                    logger.warning(f"[AnalyzeResultsNode-Final] Expected a list for a row, got {type(row_list)}. Skipping row: {row_list}")
                     continue
-                if any(cell is not None for cell in row_content):
-                    has_meaningful_data = True
-                    break
+                # Consider data meaningful if any cell in the row_list has a non-null value.
+                # This is a simplification; a more robust check might involve checking specific columns
+                # based on the original query's intent, but for now, any data is meaningful.
+                for cell_value in row_list:
+                    if cell_value is not None:
+                        has_meaningful_data_for_filtered_ids = True
+                        break # Found meaningful data in this row, no need to check other cells
+                if has_meaningful_data_for_filtered_ids:
+                    break # Found meaningful data in this structured_result, no need to check other rows
+        
+        if has_meaningful_data_for_filtered_ids:
+            # If this query result (which was filtered for specific IDs) has meaningful data,
+            # then those specific IDs are considered to have data.
+            found_ids_with_data.update(ids_filtered_in_this_query)
+            logger.debug(f"[AnalyzeResultsNode-Final] Confirmed meaningful data for IDs: {ids_filtered_in_this_query} in current structured result.")
         else:
-            logger.debug(f"[AnalyzeResultsNode-Final] Checking value columns (indices: {value_column_indices}) for IDs {ids_filtered_in_this_query} for non-null data.")
-            for row_idx, row_content in enumerate(rows):
-                if not isinstance(row_content, list):
-                    logger.warning(f"[AnalyzeResultsNode-Final] Row {row_idx} is not a list: {row_content}. Skipping for meaningful data check.")
-                    continue
-                # Check if any of the identified value columns in this row has a non-None value
-                if any(row_content[col_idx] is not None for col_idx in value_column_indices if len(row_content) > col_idx):
-                    has_meaningful_data = True
-                    break
-        
-        if not has_meaningful_data:
-            logger.info(f"[AnalyzeResultsNode-Final] Query filtering by {ids_filtered_in_this_query} returned rows, but all rows appear to contain only NULL values in metric/value columns or no meaningful data. Marking corresponding IDs as 'data not found'.")
-            continue # Do not add to found_ids if no meaningful data
+            logger.debug(f"[AnalyzeResultsNode-Final] No meaningful data found for IDs: {ids_filtered_in_this_query} in current structured result (or rows were empty).")
 
-        # 3. SIMPLIFIED: If meaningful rows were returned for a query filtering by specific IDs, assume data for ALL those IDs was found.
-        logger.debug(f"[AnalyzeResultsNode-Final] Query filtering by IDs {ids_filtered_in_this_query} returned rows with meaningful data. Marking all as found.")
-        found_ids.update(ids_filtered_in_this_query)
-        # --- REMOVED complex ID/name checking logic within rows --- 
-
-    # --- Generate final context (Unchanged) --- 
-    if not all_expected_ids:
-        logger.debug("[AnalyzeResultsNode-Final] No resolved entity IDs were used in any filters.")
-        return {"missing_entities_context": None}
-
-    logger.debug(f"[AnalyzeResultsNode-Final] Total Expected IDs across all filters: {all_expected_ids}")
-    logger.debug(f"[AnalyzeResultsNode-Final] IDs confirmed present in returned data rows: {found_ids}")
-
-    missing_ids = all_expected_ids - found_ids
+    # Find IDs that were queried but returned no meaningful data
+    # This now means IDs that were in `all_expected_ids` but never made it into `found_ids_with_data`
+    # across all structured_results that might have pertained to them.
+    missing_ids = all_expected_ids - found_ids_with_data
+    logger.debug(f"[AnalyzeResultsNode-Final] All expected IDs: {all_expected_ids}")
+    logger.debug(f"[AnalyzeResultsNode-Final] IDs confirmed with data: {found_ids_with_data}")
+    logger.debug(f"[AnalyzeResultsNode-Final] Deduced missing IDs: {missing_ids}")
     
+    # Generate context about missing data
     if missing_ids:
-        # Map missing IDs back to their original names using resolved_id_to_name_map
-        # Safely get names, use ID as fallback if name somehow missing from reverse map
-        missing_names = [resolved_id_to_name_map.get(mid, f"ID:{mid}") for mid in missing_ids]
-        missing_names_str = ", ".join(sorted(list(set(missing_names))))
-        
-        missing_entities_context = (
-            f"IMPORTANT CONTEXT: The user asked for data related to specific entities (including {missing_names_str}). "
-            f"While queries were executed filtering for these, no meaningful data rows were returned specifically corresponding to {missing_names_str}. "
-            f"You MUST explicitly mention this lack of data for {missing_names_str} in your final response."
-        )
-        logger.info(f"[AnalyzeResultsNode-Final] Generated missing entities context: {missing_entities_context}")
-    else:
-        logger.debug("[AnalyzeResultsNode-Final] No missing entity IDs detected.")
+        # Group missing IDs by their display names
+        missing_names_by_id = {}
+        for missing_id in missing_ids:
+            names = resolved_id_to_name_map.get(missing_id)
+            if names:
+                if isinstance(names, list):
+                    # Use the longest name as the display name
+                    display_name = max(names, key=len)
+                else:
+                    display_name = names
+                missing_names_by_id[missing_id] = display_name
+
+        # Format missing entities in a natural way
+        if missing_names_by_id:
+            missing_names = list(missing_names_by_id.values())
+            # Prepend the ADVISE_LLM_MARKER to the context if it's generated
+            if len(missing_names) == 1:
+                missing_entities_context = f"{ADVISE_LLM_MARKER} No data was found for {missing_names[0]}."
+            elif len(missing_names) == 2:
+                missing_entities_context = f"{ADVISE_LLM_MARKER} No data was found for {missing_names[0]} and {missing_names[1]}."
+            else:
+                names_except_last = ", ".join(missing_names[:-1])
+                missing_entities_context = f"{ADVISE_LLM_MARKER} No data was found for {names_except_last}, and {missing_names[-1]}."
+            
+            logger.info(f"[AnalyzeResultsNode-Final] Generated missing entities context: {missing_entities_context}")
 
     return {"missing_entities_context": missing_entities_context}
-# --- END Analysis Node ---
 
 
 # --- LLM and Tools Initialization ---
@@ -290,10 +289,9 @@ def get_llm():
         openai_api_version=settings.AZURE_OPENAI_API_VERSION,
         deployment_name=settings.AZURE_OPENAI_DEPLOYMENT_NAME, 
         model_name=settings.LLM_MODEL_NAME, 
-        temperature=0.15,
+        temperature=0.1,
         verbose=settings.VERBOSE_LLM,
-        max_retries=settings.LLM_MAX_RETRIES, # Pass retry setting
-        # streaming=False # Ensure streaming is False if not handled downstream
+        max_retries=settings.LLM_MAX_RETRIES
     )
 
 def get_tools(organization_id: str) -> List[Any]:
@@ -361,12 +359,11 @@ def create_llm_with_tools_and_final_response_structure(organization_id: str):
     prompt = prompt.partial(
         tool_descriptions="\n".join(tool_descriptions_list),
         tool_names=", ".join(tool_names_list),
-        db_schema_string=db_schema_string, # Inject the schema string
-        # --- Inject Time Context --- #
+        db_schema_string=db_schema_string, 
         current_date=current_date_str,
         current_day=current_day_name,
         current_year=current_year_int,
-        # --- ADDED: Ensure context is available even if None initially ---
+        # Ensure context is available even if None initially
         missing_entities_context="", 
     )
 
@@ -391,14 +388,24 @@ def _get_sql_call_signature(args: Dict[str, Any]) -> tuple:
 
     # Normalize SQL: lowercase and consolidate whitespace
     # Keep structural elements like LIMIT, OFFSET, ORDER BY
-    normalized_sql = ' '.join(sql.lower().split())
-
+    # More robust normalization using sqlparse:
+    if sql:
+        try:
+            # Strip comments, normalize keyword case, and then standardize whitespace
+            formatted_sql = sqlparse.format(sql, strip_comments=True, keyword_case='lower', identifier_case='lower')
+            normalized_sql = ' '.join(formatted_sql.split())
+        except Exception as e:
+            logger.warning(f"[_get_sql_call_signature] Error during sqlparse formatting, falling back to basic normalization. Error: {e}")
+            normalized_sql = ' '.join(sql.lower().split())
+    else:
+        normalized_sql = ""
+        
     # Create a canonical representation of parameters (sorted tuple of items)
     # Using tuple makes it hashable directly
     params_signature_items = tuple(sorted(params.items()))
 
     # Return a tuple including the tool name for absolute clarity
-    return ("execute_sql", normalized_sql, params_signature_items)
+    return (SQL_EXECUTION_TOOL_NAME, normalized_sql, params_signature_items)
 
 def agent_node(state: AgentState, llm_with_structured_output):
     """Invokes the LLM ONCE to decide the next action or final response structure.
@@ -417,22 +424,24 @@ def agent_node(state: AgentState, llm_with_structured_output):
         "prompt_tokens": 0,
         "completion_tokens": 0,
         "resolved_location_map": state.get("resolved_location_map"),
-        "sql_security_retry_count": state.get("sql_security_retry_count", 0) # Preserve count
+        "sql_security_retry_count": state.get("sql_security_retry_count", 0), # Preserve count
+        "missing_entities_retry_count": state.get("missing_entities_retry_count", 0) # Preserve count
     }
 
     # Parser for the final response structure
     final_response_parser = PydanticToolsParser(tools=[FinalApiResponseStructure])
 
-    # --- START: Re-integrated Adaptive Error Analysis for SQL Security Error ---
+    # --- START: Re-integrated Adaptive Error Analysis for SQL Security Error --- #
     failure_patterns = state.get("failure_patterns", {})
     recovery_guidance = None
-    retry_increment = 0 # Track if we need to increment count
+    sql_retry_increment = 0 # Track if we need to increment SQL count
+    missing_entity_retry_increment = 0 # Track if we need to increment Missing Entity count
 
     # Create a copy for preprocessing
     preprocessed_state = _preprocess_state_for_llm(state)
 
     # Check failure patterns specifically for execute_sql
-    sql_failures = failure_patterns.get("execute_sql", [])
+    sql_failures = failure_patterns.get(SQL_EXECUTION_TOOL_NAME, []) # Use constant
     if sql_failures: # Check only if there are any SQL failures
         last_sql_failure = sql_failures[-1] # Get the most recent one
         is_specific_security_error = (
@@ -457,10 +466,33 @@ def agent_node(state: AgentState, llm_with_structured_output):
                 You MUST add the organization filter correctly to the query for the requested table. Retry the query generation.
                 """
                 logger.info(f"[AgentNode] Adding SQL security recovery guidance for retry #{current_retry_count + 1}")
-                retry_increment = 1 # Set flag to increment the counter in the return dict
+                sql_retry_increment = 1 # Set flag to increment the SQL counter in the return dict
             else:
                  logger.warning(f"[AgentNode] SQL security error detected, but retry limit ({settings.MAX_SQL_SECURITY_RETRIES}) reached. Will not generate recovery guidance.")
                  # No guidance, should_continue will see the error and route to END
+
+    # --- Check if this invocation is due to a missing entity retry --- #
+    # We know this if should_continue routed back here AND missing_entities_context exists AND contains "ADVISE LLM"
+    missing_context_for_retry_check = state.get("missing_entities_context")
+    # Check if the LAST message suggests we came from analyze_results (though should_continue is the primary signal)
+    # last_node_was_analyze = isinstance(state.get("messages", [])[-1], SystemMessage) and "ADVISE LLM" in state.get("messages", [])[-1].content # Heuristic, might need refinement
+
+    if missing_context_for_retry_check and ADVISE_LLM_MARKER in missing_context_for_retry_check: 
+        # This agent invocation is likely happening because should_continue detected an actionable discrepancy.
+        # We need to increment the missing_entities_retry_count for this turn.
+        current_missing_retry_count = state.get("missing_entities_retry_count", 0)
+        
+        # Fallback for MAX_MISSING_ENTITIES_RETRIES if not in settings
+        max_retries = getattr(settings, 'MAX_MISSING_ENTITIES_RETRIES', 1) # Default to 1 retry
+        if not hasattr(settings, 'MAX_MISSING_ENTITIES_RETRIES'):
+            logger.warning(f"[AgentNode] 'MAX_MISSING_ENTITIES_RETRIES' not found in settings. Defaulting to {max_retries}. Please define it in your configuration.")
+
+        if current_missing_retry_count < max_retries: # Ensure we don't increment beyond limit unnecessarily
+             missing_entity_retry_increment = 1
+             logger.info(f"[AgentNode] Incrementing missing_entities_retry_count for retry #{current_missing_retry_count + 1} (Limit: {max_retries})")
+             # Optionally add specific recovery guidance here too, though the context is already injected
+             # recovery_guidance = (recovery_guidance or "") + "\nAttempting to address data discrepancy based on previous results." 
+        # No else needed, should_continue already prevented looping beyond limit
 
     # If recovery guidance was generated, inject it into the system message
     if recovery_guidance:
@@ -473,13 +505,91 @@ def agent_node(state: AgentState, llm_with_structured_output):
                 system_message_found = True
                 break
         if not system_message_found and messages:
-            messages.insert(0, SystemMessage(content=recovery_guidance))
+            # Inject at the beginning if no system message exists, or append to existing
+            # Let's prefer appending to an existing one if found, otherwise prepend.
+            # The loop above already handles appending. If not found, prepend:
+             messages.insert(0, SystemMessage(content=recovery_guidance))
         
         preprocessed_state["messages"] = messages
         return_dict["recovery_guidance"] = recovery_guidance
-        # IMPORTANT: Increment the retry count in the state update for this turn
-        return_dict["sql_security_retry_count"] = state.get("sql_security_retry_count", 0) + retry_increment
-    # --- END: Re-integrated Adaptive Error Analysis ---
+    # IMPORTANT: Increment the relevant retry counts in the state update for this turn
+    return_dict["sql_security_retry_count"] = state.get("sql_security_retry_count", 0) + sql_retry_increment
+    return_dict["missing_entities_retry_count"] = state.get("missing_entities_retry_count", 0) + missing_entity_retry_increment
+
+    # --- START: Add Guidance for Partial Hierarchy Resolution ---
+    # This guidance is added if:
+    # 1. analyze_results_node did not return a "missing_entities_context" (true if no queries run yet OR no data missing for actual queries).
+    # 2. Some entities *were* successfully resolved by hierarchy_name_resolver (state.resolved_location_map is populated).
+    # 3. Some entities *were not* successfully resolved by hierarchy_name_resolver in the most recent tool calls for it.
+    # The goal is to guide the LLM to query for resolved entities before giving up or asking for clarification.
+
+    # `recovery_guidance` might already be populated from the SQL security check. We'll append to it if needed.
+    # `preprocessed_state` is used for the LLM call, `state` is the original state for this turn.
+
+    if not state.get("missing_entities_context") and state.get("resolved_location_map"):
+        _found_resolved_in_last_hr_calls = False
+        _found_unresolved_in_last_hr_calls = False
+
+        # Determine the set of ToolMessages from the last round of hierarchy_name_resolver calls
+        last_ai_message_triggering_tools = None
+        for msg in reversed(state.get("messages", [])): # Check original state messages
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                # Check if this AIMessage called hierarchy_name_resolver
+                if any(tc.get("name") == HIERARCHY_RESOLVER_TOOL_NAME for tc in msg.tool_calls): # Use constant
+                    last_ai_message_triggering_tools = msg
+                    break
+        
+        if last_ai_message_triggering_tools:
+            relevant_hr_tool_call_ids = {
+                tc['id'] for tc in last_ai_message_triggering_tools.tool_calls 
+                if tc.get("name") == HIERARCHY_RESOLVER_TOOL_NAME # Use constant
+            }
+            
+            # Iterate through messages again to find the ToolMessage results
+            # This assumes ToolMessages appear after the AIMessage that called them.
+            temp_relevant_ids_to_find = relevant_hr_tool_call_ids.copy()
+            for msg_idx in range(len(state.get("messages", [])) -1, -1, -1):
+                msg_in_history = state.get("messages")[msg_idx]
+                if not temp_relevant_ids_to_find: # All found
+                    break
+                if msg_in_history == last_ai_message_triggering_tools: # Stop if we go past the caller
+                    break
+
+                if isinstance(msg_in_history, ToolMessage) and msg_in_history.tool_call_id in temp_relevant_ids_to_find:
+                    if msg_in_history.name == HIERARCHY_RESOLVER_TOOL_NAME: # Use constant
+                        try:
+                            content = json.loads(msg_in_history.content)
+                            results = content.get("resolution_results", {})
+                            if not results: continue
+                            
+                            for _, res_data in results.items():
+                                if isinstance(res_data, dict):
+                                    if res_data.get("status") == STATUS_FOUND: # Use constant
+                                        _found_resolved_in_last_hr_calls = True
+                                    elif res_data.get("status") == STATUS_NOT_FOUND: # Use constant
+                                        _found_unresolved_in_last_hr_calls = True
+                        except json.JSONDecodeError:
+                            logger.warning(f"[AgentNode] JSONDecodeError parsing ToolMessage for partial guidance check: {msg_in_history.content[:100]}")
+                    temp_relevant_ids_to_find.remove(msg_in_history.tool_call_id)
+
+        if _found_resolved_in_last_hr_calls and _found_unresolved_in_last_hr_calls:
+            partial_resolution_text = (
+                "CRITICAL INSTRUCTION FOR PARTIAL RESOLUTION:\n"
+                "You previously attempted to resolve some location names. Some were resolved successfully, and others were not.\n"
+                "Your ABSOLUTE NEXT STEP is to use the `execute_sql` tool to query data for ALL successfully resolved location names.\n"
+                "DO NOT ask for clarification about the unresolvable names at this point if other names *were* resolved.\n"
+                "After you have the data for the resolved names, you will then present that data in the form the user asked for and also inform them which names could not be resolved or had no data.\n"
+                "Proceed with querying for resolved names now."
+            )
+            logger.info("[AgentNode] Adding CRITICAL INSTRUCTION FOR PARTIAL RESOLUTION guidance.")
+            
+            if recovery_guidance: # If SQL recovery guidance (or other prior guidance) already exists
+                recovery_guidance = f"{recovery_guidance}\n\n{partial_resolution_text}"
+            else:
+                recovery_guidance = partial_resolution_text
+    # --- END: Add Guidance for Partial Hierarchy Resolution ---
+
+    # --- END: Re-integrated Adaptive Error Analysis --- #
 
     try:
         # --- Inject the missing_entities_context at invocation time --- #
@@ -556,19 +666,32 @@ def agent_node(state: AgentState, llm_with_structured_output):
                             logger.warning(f"[AgentNode] 'include_tables' was not a list ({type(llm_include_tables).__name__}). Defaulting to all False for {num_results} result(s).")
                             valid_args["include_tables"] = [False] * num_results
                         elif len(llm_include_tables) != num_results:
-                            logger.warning(f"[AgentNode] 'include_tables' length mismatch ({len(llm_include_tables)}) vs results count ({num_results}). Defaulting to all False.")
-                            valid_args["include_tables"] = [False] * num_results
+                            try:
+                                logger.warning(f"[AgentNode] 'include_tables' length mismatch (LLM provided: {len(llm_include_tables)}, Actual results: {num_results}). Adjusting to match actual results count.")
+                                if len(llm_include_tables) > num_results:
+                                    # Truncate to match number of results
+                                    valid_args["include_tables"] = llm_include_tables[:num_results]
+                                    logger.info(f"[AgentNode] Truncated 'include_tables' from {len(llm_include_tables)} to first {num_results} flags: {valid_args['include_tables']}")
+                                else:  # len(llm_include_tables) < num_results
+                                    # Pad with False to match number of results
+                                    padding_needed = num_results - len(llm_include_tables)
+                                    valid_args["include_tables"] = llm_include_tables + [False] * padding_needed
+                                    logger.info(f"[AgentNode] Padded 'include_tables' with {padding_needed} False flag(s). Final flags: {valid_args['include_tables']}")
+                            except Exception as e:
+                                logger.error(f"[AgentNode] Error adjusting include_tables: {str(e)}. Defaulting to all False.")
+                                valid_args["include_tables"] = [False] * num_results
                         else:
-                            # Ensure all elements are boolean, default to False if not convertible
+                            # Length matches, ensure all elements are boolean
                             validated_flags = []
                             for i, flag in enumerate(llm_include_tables):
                                 try:
                                     validated_flags.append(bool(flag))
-                                except Exception:
-                                    logger.warning(f"[AgentNode] Could not convert include_tables element at index {i} ('{flag}') to bool. Defaulting to False.")
+                                except (ValueError, TypeError) as e:
+                                    logger.warning(f"[AgentNode] Could not convert include_tables[{i}] value '{flag}' to boolean: {str(e)}. Using False.")
                                     validated_flags.append(False)
                             valid_args["include_tables"] = validated_flags
-                        # --- END REFINED VALIDATION ---
+                            logger.debug(f"[AgentNode] Validated include_tables flags: {validated_flags}")
+                        # --- END VALIDATION ---
 
                         # Ensure chart_specs is a list (already defaulted)
                         if not isinstance(valid_args["chart_specs"], list):
@@ -611,7 +734,7 @@ def agent_node(state: AgentState, llm_with_structured_output):
                         tool_name = tc.get("name")
                         tool_args = tc.get("args", {})
                         signature = None
-                        if tool_name == "execute_sql":
+                        if tool_name == SQL_EXECUTION_TOOL_NAME: # Use constant
                             signature = _get_sql_call_signature(tool_args)
                         else:
                             signature = (tool_name, json.dumps(tool_args, sort_keys=True))
@@ -748,7 +871,7 @@ def agent_node(state: AgentState, llm_with_structured_output):
 
     # If operational calls were identified and a final_structure was NOT set, they remain in return_dict["messages"][0].tool_calls
     logger.debug(f"[AgentNode] Exiting agent node. Final Structure Set: {final_structure is not None}. Proceeding Tool Calls in Message History: {len(return_dict['messages'][0].tool_calls) if return_dict['messages'] and isinstance(return_dict['messages'][0], AIMessage) else 0}")
-    logger.debug(f"[AgentNode] Exiting agent node. Final Structure Set: {final_structure is not None}. Retry Count: {return_dict['sql_security_retry_count']}")
+    logger.debug(f"[AgentNode] Exiting agent node. Final Structure Set: {final_structure is not None}. SQL Retry: {return_dict['sql_security_retry_count']}. Missing Entity Retry: {return_dict['missing_entities_retry_count']}") # Updated log
     return return_dict
 
 
@@ -760,6 +883,51 @@ def _preprocess_state_for_llm(state: AgentState) -> AgentState:
     or invalid message sequences.
     """
     processed_state = {k: v for k, v in state.items()}
+
+    # --- Deduplicate structured results --- #
+    if 'structured_results' in processed_state and processed_state['structured_results']:
+        original_structured_results = processed_state['structured_results']
+        processed_structured_results = []
+        seen_results = set()
+
+        for result in original_structured_results:
+            # Create a hashable representation of the result
+            result_key = None
+            if isinstance(result, dict) and 'table' in result:
+                table = result['table']
+                if isinstance(table, dict) and 'rows' in table and 'columns' in table:
+                    # Create a tuple of (columns, rows) for comparison
+                    # Convert rows to tuples for hashability and sort for consistency
+                    sorted_rows = sorted(tuple(row) for row in table['rows'])
+                    result_key = (
+                        tuple(table['columns']),
+                        tuple(sorted_rows)
+                    )
+
+            if result_key and result_key not in seen_results:
+                seen_results.add(result_key)
+                processed_structured_results.append(result)
+                logger.debug(f"[PreprocessState] Added unique result with {len(result['table']['rows'])} rows")
+            else:
+                logger.debug("[PreprocessState] Skipped duplicate result")
+
+        processed_state['structured_results'] = processed_structured_results
+        logger.debug(f"[PreprocessState] Deduplicated structured results from {len(original_structured_results)} to {len(processed_structured_results)}")
+
+    # --- Process table rows for chart compatibility --- #
+    if 'structured_results' in processed_state and processed_state['structured_results']:
+        for result in processed_state['structured_results']:
+            if isinstance(result, dict) and 'table' in result:
+                table = result['table']
+                if isinstance(table, dict) and 'rows' in table:
+                    # Convert all numeric strings to actual numbers
+                    for row in table['rows']:
+                        for i, value in enumerate(row):
+                            if isinstance(value, str) and value.replace('.', '').isdigit():
+                                row[i] = float(value)
+                                if row[i].is_integer():
+                                    row[i] = int(row[i])
+
     max_messages = settings.MAX_STATE_MESSAGES
 
     if 'messages' in processed_state and len(processed_state['messages']) > max_messages:
@@ -1036,7 +1204,7 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
         raw_tool_args = tool_call.get("args", {})
         
         # --- ADDED: Hierarchy Resolver Cache Check --- #
-        if tool_name == "hierarchy_name_resolver":
+        if tool_name == HIERARCHY_RESOLVER_TOOL_NAME: # Use constant
             name_candidates = raw_tool_args.get("name_candidates", [])
             cached_results = {}
             all_cached = True
@@ -1065,7 +1233,7 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
                 ))
                 # Update location_map_this_turn directly from cache
                 for name, res_data in cached_results.items():
-                    if isinstance(res_data, dict) and res_data.get("status") == "found" and "id" in res_data:
+                    if isinstance(res_data, dict) and res_data.get("status") == STATUS_FOUND and "id" in res_data: # Use constant
                         location_map_this_turn[name.lower()] = res_data["id"]
                 # Add to skipped list and continue to next tool call in operational_tool_calls
                 skipped_tool_calls_due_to_cache.append(tool_id)
@@ -1083,7 +1251,7 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
 
         processed_tool_args = raw_tool_args.copy()
 
-        if tool_name == "execute_sql":
+        if tool_name == SQL_EXECUTION_TOOL_NAME: # Use constant
             trusted_org_id_for_tool = getattr(current_tool_instance, 'organization_id', None)
             if not trusted_org_id_for_tool:
                  logger.error(f"[ToolsNode] CRITICAL: SQLExecutionTool for call {tool_id} missing organization_id. Cannot process securely.")
@@ -1201,22 +1369,24 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
 
             try:
                 tool_content_dict = json.loads(tool_content_str)
-                if tool_name_from_res == "hierarchy_name_resolver":
+                if tool_name_from_res == HIERARCHY_RESOLVER_TOOL_NAME: # Use constant
                     # --- ADDED: Update request cache --- #
                     current_resolved_map_from_tool = tool_content_dict.get("resolution_results", {})
                     for original_name, res_data in current_resolved_map_from_tool.items():
                         if isinstance(res_data, dict):
                             # Store using original name as key in cache for reconstruction
                             # But use lowercase name for lookup consistency
+                            # Ensure cache key is consistent (e.g. always lowercase)
+                            logger.debug(f"[ToolsNode] Caching for HIERARCHY_RESOLVER_TOOL_NAME: Key='{original_name.lower()}', Data Status='{res_data.get('status')}'")
                             request_hierarchy_cache_this_turn[original_name.lower()] = res_data 
                             # Update location map for current turn if found
-                            if res_data.get("status") == "found" and "id" in res_data:
+                            if res_data.get("status") == STATUS_FOUND and "id" in res_data: # Use constant
                                 location_map_this_turn[original_name.lower()] = res_data["id"]
                     if current_resolved_map_from_tool:
                          logger.info(f"[ToolsNode] Updated resolved location map (this turn) with {len(location_map_this_turn)} entries AND updated request_hierarchy_cache from '{tool_name_from_res}'.")
                     # --- END Update request cache --- #
                 
-                elif tool_name_from_res == "execute_sql":
+                elif tool_name_from_res == SQL_EXECUTION_TOOL_NAME: # Use constant
                     # Check if the tool itself returned a structured error (e.g., DB connection, permission)
                     if tool_content_dict.get("error"):
                         logger.warning(f"[ToolsNode] Tool '{tool_name_from_res}' (ID: {tool_call_id_from_res}) executed but returned a structured error: {tool_content_dict.get('error')}")
@@ -1263,7 +1433,7 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
             failure_message = error_info_dict.get("message", tool_content_str) # Fallback to full content if no message
             
             # --- ADDED: Specific recovery guidance for unresolved placeholders --- #
-            if (tool_name_from_res == "execute_sql" and 
+            if (tool_name_from_res == SQL_EXECUTION_TOOL_NAME and  # Use constant
                 failure_type == "PARAMETER_RESOLUTION_ERROR" and 
                 "CRITICAL_UNRESOLVED_PLACEHOLDER" in failure_message):
                 placeholder_guidance = "One or more SQL queries failed because location names were not yet resolved to IDs. Ensure 'hierarchy_name_resolver' is called first for any specific location names before attempting SQL that requires their IDs."
@@ -1278,9 +1448,21 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
 
             # Determine signature for failure pattern tracking
             error_signature_key = tool_name_from_res
-            if tool_name_from_res == "execute_sql":
+            if tool_name_from_res == SQL_EXECUTION_TOOL_NAME: # Use constant
                 # Use a simplified signature for SQL to group similar errors
-                error_signature_key = _get_sql_call_signature(original_args_for_tool) 
+                # Ensure original_args_for_tool is passed to _get_sql_call_signature
+                # It seems original_args_for_tool here is from `result_item.get("original_args", {})`
+                # which should be populated by `execute_with_retry`
+                tool_args_for_sig = result_item.get("original_args", {}) 
+                if not tool_args_for_sig: # Fallback, though should always be present
+                    logger.warning(f"[ToolsNode] 'original_args' missing in result_item for error signature for tool {tool_name_from_res}, ID {tool_call_id_from_res}. Using raw args from state if possible.")
+                    # This fallback is less ideal as it might grab args for a different call if multiple SQL calls happened
+                    # However, `original_args` should be reliable from `execute_with_retry`
+                    # For safety, we could also try to find the original tool_call from operational_tool_calls by ID.
+                    # For now, rely on original_args from result_item.
+                    pass # Relying on original_args_for_tool being populated
+                
+                error_signature_key = _get_sql_call_signature(tool_args_for_sig) 
 
             if error_signature_key not in updated_failure_patterns:
                 updated_failure_patterns[error_signature_key] = []
@@ -1357,20 +1539,42 @@ def should_continue(state: AgentState) -> str:
     """Determines the next step based on the last message and state.
        Routes back to agent for specific, retryable SQL security errors if limit not reached.
        Routes to END for other errors or final structure.
+       Considers missing_entities_context for potential retries.
     """
     request_id = state.get("request_id")
     messages = state.get("messages", [])
     last_message = messages[-1] if messages else None
     final_structure_in_state = state.get("final_response_structure")
-    current_retry_count = state.get("sql_security_retry_count", 0)
+    current_sql_retry_count = state.get("sql_security_retry_count", 0)
+    missing_entities_context = state.get("missing_entities_context") # Get context from analyze_results_node
+    current_missing_entities_retry_count = state.get("missing_entities_retry_count", 0) # Get the new counter
+    # recovery_guidance = state.get("recovery_guidance") # Could also be a factor
 
     # Priority 1: If the final structure is already set, we end.
     if final_structure_in_state:
-        logger.debug("[ShouldContinue] Final response structure found in state. Routing to END.")
+        logger.debug(f"[ShouldContinue] Final response structure found in state. Routing to END. Request ID: {request_id}")
         return END
 
-    # Priority 2: Check the last message for the specific retryable SQL security error
-    if isinstance(last_message, ToolMessage) and last_message.name == "execute_sql":
+    # Priority 2: Check missing_entities_context for actionable discrepancy suggesting a retry
+    # The "ADVISE LLM" string is a strong indicator from analyze_results_node
+    if missing_entities_context and ADVISE_LLM_MARKER in missing_entities_context: # Use constant
+        # Check the retry limit for this specific type of error
+        max_retries = getattr(settings, 'MAX_MISSING_ENTITIES_RETRIES', 1) # Default to 1 retry
+        if not hasattr(settings, 'MAX_MISSING_ENTITIES_RETRIES'):
+            logger.warning(f"[ShouldContinue] 'MAX_MISSING_ENTITIES_RETRIES' not found in settings. Defaulting to {max_retries} for check. Please define it in your configuration.")
+            
+        if current_missing_entities_retry_count < max_retries:
+            logger.info(f"[ShouldContinue] Actionable missing_entities_context found. Retry count {current_missing_entities_retry_count} < limit {max_retries}. Routing back to agent for correction. Request ID: {request_id}")
+            # NOTE: The agent_node needs to return the incremented count in its update dictionary
+            # This decision path only routes; the increment happens if agent_node acts on the context.
+            # We need to modify agent_node slightly to increment this counter if it proceeds based on this context.
+            return "agent" 
+        else:
+            logger.warning(f"[ShouldContinue] Actionable missing_entities_context found, but retry limit ({max_retries}) reached. Routing to END. Request ID: {request_id}")
+            return END # Stop the loop
+
+    # Priority 3: Check the last message for the specific retryable SQL security error
+    if isinstance(last_message, ToolMessage) and last_message.name == SQL_EXECUTION_TOOL_NAME: # Use constant
         is_specific_security_error = False
         try:
             content_data = json.loads(last_message.content)
@@ -1382,66 +1586,63 @@ def should_continue(state: AgentState) -> str:
                     "organization_id" in error_info.get("message", "")):
                     is_specific_security_error = True
         except (json.JSONDecodeError, TypeError):
-            logger.warning(f"[ShouldContinue] Could not parse execute_sql error message content: {last_message.content[:100]}")
+            logger.warning(f"[ShouldContinue] Could not parse execute_sql error message content: {last_message.content[:100]} for Request ID: {request_id}")
 
         if is_specific_security_error:
-            # Check retry limit
-            if current_retry_count < settings.MAX_SQL_SECURITY_RETRIES:
-                logger.info(f"[ShouldContinue] Specific SQL Security error detected. Retry count {current_retry_count} < limit {settings.MAX_SQL_SECURITY_RETRIES}. Routing back to agent for retry.")
-                # The agent_node should have already added guidance and incremented the counter in the state update it returned.
+            if current_sql_retry_count < settings.MAX_SQL_SECURITY_RETRIES:
+                logger.info(f"[ShouldContinue] Specific SQL Security error detected. Retry count {current_sql_retry_count} < limit {settings.MAX_SQL_SECURITY_RETRIES}. Routing back to agent for retry. Request ID: {request_id}")
                 return "agent"
             else:
-                logger.warning(f"[ShouldContinue] Specific SQL Security error detected, but retry limit ({settings.MAX_SQL_SECURITY_RETRIES}) reached. Routing to END.")
-                # Fall through to return END below
+                logger.warning(f"[ShouldContinue] Specific SQL Security error, retry limit ({settings.MAX_SQL_SECURITY_RETRIES}) reached. Routing to END. Request ID: {request_id}")
+                # Fall through to return END below, as this path should lead to termination.
+                # To ensure it goes to END if no other condition matches, we can explicitly return here or let it fall through.
         else:
             # Other execute_sql error OR successful execution
-            # If error (but not the specific one), treat as non-retryable for this logic.
-            # If success, agent needs to process the result.
             is_error = False
             try:
                 content_data = json.loads(last_message.content)
-                if isinstance(content_data, dict) and "error" in content_data:
-                    is_error = True
-            except (json.JSONDecodeError, TypeError):
-                 is_error = True # Treat unparseable as error
+                if isinstance(content_data, dict) and "error" in content_data: is_error = True
+            except (json.JSONDecodeError, TypeError): is_error = True # Treat unparseable as error
 
             if is_error:
-                logger.warning(f"[ShouldContinue] Non-retryable execute_sql error detected. Routing to END.")
+                logger.warning(f"[ShouldContinue] Non-retryable execute_sql error or unparseable content detected in ToolMessage. Routing to END. Request ID: {request_id}")
                 # Fall through to return END below
             else:
-                 logger.debug("[ShouldContinue] Successful execute_sql Tool message found. Routing back to 'agent' to process.")
+                 logger.debug(f"[ShouldContinue] Successful execute_sql ToolMessage. Routing to 'agent' to process. Request ID: {request_id}")
                  return "agent"
 
-    # --- [Optional] Generic recursion check ---
-    # failure_patterns = state.get("failure_patterns", {})
-    # ... (existing recursion check logic can be placed here if needed) ...
-
-    # Priority 3: Analyze the last message from the agent node (AIMessage)
+    # Priority 4: Analyze the last message from the agent node (AIMessage)
     if isinstance(last_message, AIMessage):
-        # ... (existing logic for AIMessage: check tool calls, route to tools or END) ...
          if last_message.tool_calls:
             has_operational_calls = any(
                 tc.get("name") != FinalApiResponseStructure.__name__
                 for tc in last_message.tool_calls
             )
             if has_operational_calls:
-                 logger.debug("[ShouldContinue] Operational tool call(s) found in AIMessage. Routing to 'tools'.")
+                 logger.debug(f"[ShouldContinue] Operational tool call(s) found in AIMessage. Routing to 'tools'. Request ID: {request_id}")
                  return "tools"
             else: # Only FinalApiResponseStructure or empty tool_calls
-                 logger.warning("[ShouldContinue] AIMessage has only FinalApiResponseStructure or empty tool_calls. Routing to END.")
-                 return END # Should normally be caught by final_structure_in_state check
+                 logger.debug(f"[ShouldContinue] AIMessage has only FinalApiResponseStructure or empty tool_calls. Routing to END. Request ID: {request_id}")
+                 # This should ideally be caught by final_structure_in_state if FinalApiResponseStructure was called and parsed.
+                 # If tool_calls is empty and no final_structure, it's also an END case for this logic.
+                 return END 
          else:
-             logger.warning("[ShouldContinue] AIMessage with no tool calls. Routing to END.")
+             # AIMessage with no tool_calls is typically a direct textual response. If final_response_structure is not set yet,
+             # agent_node should have coerced it or will do so. If it was set, Priority 1 catches it.
+             # If it's an intermediate AIMessage that *should* have had tool calls but didn't, it implies an LLM error.
+             # Routing to END is safest if not caught by final_structure_in_state or if agent_node didn't create a fallback final structure.
+             logger.debug(f"[ShouldContinue] AIMessage with no tool calls. Final structure not set implies agent will coerce or has erred. Routing to END for safety. Request ID: {request_id}")
              return END
 
-    # Priority 4: Handle other ToolMessages (non-SQL or non-error SQL)
-    elif isinstance(last_message, ToolMessage): # Already handled sql tool messages above
-        # Any other successful tool message (e.g., hierarchy_resolver) should go back to agent
-        logger.debug(f"[ShouldContinue] Successful Tool message ({last_message.name}) found. Routing back to 'agent'.")
+    # Priority 5: Handle other ToolMessages (non-SQL or non-error SQL handled above)
+    elif isinstance(last_message, ToolMessage): 
+        # This covers successful ToolMessages that are not execute_sql (which are handled above).
+        # e.g., a successful hierarchy_name_resolver call.
+        logger.debug(f"[ShouldContinue] Successful non-SQL ToolMessage ({last_message.name}) found. Routing back to 'agent'. Request ID: {request_id}")
         return "agent"
 
-    # Default/Fallback: If state is unexpected, end.
-    logger.warning(f"[ShouldContinue] Unexpected state or last message type ({type(last_message).__name__}), routing to END.")
+    # Default/Fallback: If state is unexpected (e.g., empty messages, or a HumanMessage as last, though graph shouldn't allow that here)
+    logger.warning(f"[ShouldContinue] Unexpected state or last message type ({type(last_message).__name__ if last_message else 'None'}), routing to END. Request ID: {request_id}")
     return END
 
 # --- Create LangGraph Agent ---
