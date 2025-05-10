@@ -166,11 +166,14 @@ def analyze_results_node(state: AgentState) -> Dict[str, Any]:
             except ValueError:
                 pass # Should not happen if check passes
 
-        # Fallback to standard ID column names
-        id_col_candidates = ["id", "hierarchyId", "hierarchy_id", "location_id", "branch_id"]
+        # Fallback to standard ID column names - ADDED "Hierarchy ID" and ensure case-insensitive check
+        id_col_candidates = ["id", "hierarchyId", "hierarchy_id", "location_id", "branch_id", "Hierarchy ID"]
+        # Prepare a list of lowercase candidates for efficient checking
+        lower_id_col_candidates = [candidate.lower() for candidate in id_col_candidates]
+
         for idx, col_name in enumerate(columns):
-            if col_name in id_col_candidates:
-                logger.debug(f"[AnalyzeResultsNode-Final] Found ID column by candidate name: '{col_name}'")
+            if col_name.lower() in lower_id_col_candidates:
+                logger.debug(f"[AnalyzeResultsNode-Final] Found ID column by candidate name: '{col_name}' (matched via {col_name.lower()})")
                 return idx
 
         # If no standard ID column, check for entity name columns that might contain branch names
@@ -1267,6 +1270,40 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
                 logger.debug(f"[ToolsNode] Final SQL for call {tool_id} (tail): ...{modified_sql[-200:] if modified_sql else '[EMPTY SQL]'}. Final Params: {final_params_after_sql_rewrite}")
             else:
                 logger.debug(f"[ToolsNode] Skipping SQL string literal correction for 'execute_sql' (ID: {tool_id}) (no resolved_map, empty SQL, or already handled). Params remain: {processed_tool_args.get('params')}")
+
+            # --- START: New check for 'hierarchyId' in SELECT clause ---
+            final_sql_for_tool = processed_tool_args.get("sql", "")
+            resolved_map_for_check = state.get("resolved_location_map")
+
+            # Check only if there are resolved entities and the query likely involves the hierarchyCaches table.
+            # Using a simple string check for "hierarchyCaches" as a heuristic.
+            if resolved_map_for_check and "hierarchyCaches" in final_sql_for_tool.lower(): # Case-insensitive check for table name
+                # Regex to find 'AS "hierarchyId"', 'AS \'hierarchyId\'', 'AS hierarchyId',
+                # or ' hierarchyId,' or ' hierarchyId ' or 'SELECT hierarchyId,' or 'SELECT hierarchyId FROM'.
+                # This aims to catch common ways the ID column (aliased or direct) might appear.
+                # It's case-insensitive for "hierarchyId" and "AS".
+                hierarchy_id_pattern = re.compile(
+                    r"""
+                        (\sAS\s+(['"]?)hierarchyId\2) | # AS "hierarchyId", AS 'hierarchyId', AS hierarchyId
+                        (,\s*hierarchyId\s*[,)]) |     # , hierarchyId, or , hierarchyId) -- Matches 'hierarchyId' if it's a column name followed by comma or parenthesis
+                        (\s+hierarchyId\s*[,)]) |      # Space before hierarchyId, then comma or parenthesis
+                        (SELECT\s+(DISTINCT\s+)?(['"]?)hierarchyId\3\s*[,FROM]) # SELECT hierarchyId, or SELECT hierarchyId FROM (also with DISTINCT)
+                    """, 
+                    re.IGNORECASE | re.VERBOSE
+                )
+                
+                # To avoid false positives on very long queries, check a reasonable prefix of the SQL
+                # where the SELECT clause is expected. If SQL is short, check all of it.
+                sql_prefix_to_check = final_sql_for_tool[:500] # Check first 500 chars
+
+                if not hierarchy_id_pattern.search(sql_prefix_to_check):
+                    logger.critical(
+                        f"[ToolsNode] CRITICAL ALERT: LLM may have failed to include 'hierarchyId' in SELECT "
+                        f"for tool_id: {tool_id}. Query involves resolved entities and 'hierarchyCaches'. "
+                        f"Downstream analysis by AnalyzeResultsNode may be impaired. "
+                        f"SQL (approx start): {final_sql_for_tool[:250]}..."
+                    )
+            # --- END: New check for 'hierarchyId' in SELECT clause ---
         # End of execute_sql specific processing
 
         prepared_tool_invocations.append({

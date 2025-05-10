@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     
     # Database settings
     POSTGRES_SERVERS: List[Dict[str, Any]] = []  # Will be populated from DATABASE_URLS
-    DATABASE_URLS: str = ""  # Format: "db1=postgresql://user:pass@host:port/db1,db2=postgresql://user:pass@host:port/db2"
+    DATABASE_URLS: str = ""  
     VALIDATE_SCHEMA_ON_STARTUP: bool = True  # Whether to validate schema definitions against actual DB
     DB_POOL_SIZE: int = 10 # Default pool size for database connections
     DB_MAX_OVERFLOW: int = 20 # Default max overflow connections (Added sensible default)
@@ -28,16 +28,16 @@ class Settings(BaseSettings):
     # Azure OpenAI settings
     AZURE_OPENAI_API_KEY: str = ""
     AZURE_OPENAI_ENDPOINT: str = ""
-    AZURE_OPENAI_API_VERSION: str = "2023-07-01-preview"
+    AZURE_OPENAI_API_VERSION: str = "2024-12-01-preview"
     AZURE_OPENAI_DEPLOYMENT_NAME: str = ""
     
     # LangChain settings
-    LLM_MODEL_NAME: str = "gpt-4o"
+    LLM_MODEL_NAME: str = "gpt-4o-mini"
     VERBOSE_LLM: bool = False
     
     # Agent & Graph settings
     MAX_CONCURRENT_TOOLS: int = Field(default=4, description="Maximum number of tools to execute concurrently.")
-    MAX_STATE_MESSAGES: int = Field(default=6, description="Maximum number of messages to keep in agent state (last 3 pairs).")
+    MAX_STATE_MESSAGES: int = Field(default=16, description="Maximum number of messages to keep in agent state (last 3 pairs).")
     MAX_GRAPH_ITERATIONS: int = Field(default=25, description="Maximum iterations allowed for the LangGraph agent.")
     MAX_TABLE_ROWS_IN_STATE: int = Field(default=100, description="Maximum rows per table to keep in agent state.")
     TOOL_RETRY_DELAY: float = Field(default=1.0, description="Base delay in seconds between tool execution retries.")

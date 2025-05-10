@@ -49,8 +49,23 @@ class SubqueryResult(BaseModel):
     
     @property
     def successful(self) -> bool:
-        """Check if the subquery was successful."""
-        return self.error is None and "table" in self.result and self.result.get("table", {}).get("rows", [])
+        """Check if the subquery was successful in terms of execution, regardless of data found."""
+        if self.error is not None:  # Explicit error string means failure
+            return False
+        
+        if not isinstance(self.result, dict): # Result should be a dictionary
+            logger.warning(f"SubqueryResult for '{self.query}' has a non-dict result: {type(self.result)}")
+            return False
+
+        # Check for SQLExecutionTool's specific error structure within the result
+        table_data = self.result.get("table")
+        if isinstance(table_data, dict) and table_data.get("columns") == ["Error"]:
+            return False
+        
+        # If no explicit error and not an error table structure, consider execution successful.
+        # This means the query ran without database/network errors, even if it returned 0 rows.
+        # The presence of "table" and "columns" indicates a well-formed result from SQLExecutionTool.
+        return "table" in self.result and isinstance(table_data, dict) and "columns" in table_data
 
 class TrendInfo(BaseModel):
     """Information about a detected trend."""
@@ -139,14 +154,15 @@ class SummarySynthesizerTool(BaseTool):
         # Initialize rate limiter based on settings, using the private attribute name
         self._limiter = AsyncLimiter(settings.LLM_SUMMARY_MAX_RATE, settings.LLM_SUMMARY_TIME_PERIOD)
 
+    @staticmethod
     @lru_cache(maxsize=1)
-    def _get_schema_info(self) -> str:
-        """Get database schema information for SQL generation."""
-        logger.debug(f"[Org: {self.organization_id}] [SummaryTool] Fetching schema information")
+    def _get_schema_info_static() -> str:
+        """Get database schema information for SQL generation. Static and cached."""
+        logger.debug(f"[SummaryTool] Fetching global schema information for report_management") # Generic log
         db_name = "report_management"
         
         if db_name not in SCHEMA_DEFINITIONS:
-            logger.warning(f"[Org: {self.organization_id}] [SummaryTool] No schema definition found for database {db_name}")
+            logger.warning(f"[SummaryTool] No schema definition found for database {db_name}")
             return "Schema information not available."
         
         db_info = SCHEMA_DEFINITIONS[db_name]
@@ -174,7 +190,7 @@ class SummarySynthesizerTool(BaseTool):
             
             schema_info.append("")  # Empty line between tables
         
-        logger.debug(f"[Org: {self.organization_id}] [SummaryTool] Successfully retrieved schema information")
+        logger.debug(f"[SummaryTool] Successfully retrieved global schema information") # Generic log
         return "\n".join(schema_info)
     
     def _decompose_query(self, query: str) -> List[Dict[str, Any]]:
@@ -183,7 +199,7 @@ class SummarySynthesizerTool(BaseTool):
         
         try:
             # Get schema information
-            schema_info = self._get_schema_info()
+            schema_info = SummarySynthesizerTool._get_schema_info_static()
             
             llm = AzureChatOpenAI(
                 openai_api_key=settings.AZURE_OPENAI_API_KEY,
@@ -342,16 +358,14 @@ class SummarySynthesizerTool(BaseTool):
     async def _generate_sql_and_params(
         self,
         query_description: str,
-        resolved_location_map: Dict[str, str],
-        schema_info: str
+        resolved_location_map: Dict[str, str]
     ) -> Tuple[str, Dict[str, Any]]:
-        """
-        Generate SQL from a query description with proper parameter bindings.
-        Uses Azure OpenAI API with retry logic for reliability.
-        Returns: (sql, params dictionary with organization_id and location IDs properly set)
-        """
+        """Generate SQL and parameters for a subquery using LLM."""
         log_prefix = f"[Org: {self.organization_id}] [SummaryTool] "
-        logger.debug(f"{log_prefix}Generating SQL for: {query_description}")
+        schema_info = SummarySynthesizerTool._get_schema_info_static() # Obtain schema_info using the static method
+
+        # Determine the database name (assuming one DB for now)
+        db_name = "report_management"
         
         # --- Preprocessing: Map original names to standardized param names and UUIDs ---
         location_param_context = []
@@ -459,8 +473,7 @@ class SummarySynthesizerTool(BaseTool):
     async def _execute_subqueries_concurrently(
         self, 
         subquery_data: List[Dict[str, Any]], 
-        resolved_location_map: Dict[str, str],
-        schema_info: str
+        resolved_location_map: Dict[str, str]
     ) -> List[SubqueryResult]:
         """Execute multiple subqueries concurrently and return their results, with timeouts."""
         log_prefix = f"[Org: {self.organization_id}] [SummaryTool] "
@@ -480,8 +493,7 @@ class SummarySynthesizerTool(BaseTool):
                 asyncio.wait_for(
                     self._generate_and_execute_single(
                         description, 
-                        resolved_location_map,
-                        schema_info
+                        resolved_location_map
                     ),
                     timeout=settings.SUBQUERY_TIMEOUT_SECONDS # Apply timeout
                 )
@@ -534,15 +546,14 @@ class SummarySynthesizerTool(BaseTool):
     async def _generate_and_execute_single(
         self, 
         description: str, 
-        resolved_location_map: Dict[str, str],
-        schema_info: str
+        resolved_location_map: Dict[str, str]
     ) -> Dict[str, Any]:
         """Generate and execute a single SQL query using the injected SQLExecutionTool."""
         log_prefix = f"[Org: {self.organization_id}] [SummaryTool] "
         
         try:
             # Generate SQL query with parameter placeholders
-            sql, params = await self._generate_sql_and_params(description, resolved_location_map, schema_info)
+            sql, params = await self._generate_sql_and_params(description, resolved_location_map)
             
             # Execute SQL using the injected SQLExecutionTool instance
             # Use self._sql_tool instead of the passed parameter
@@ -1278,9 +1289,6 @@ class SummarySynthesizerTool(BaseTool):
             }
         
         try:
-            # Get schema information for SQL generation
-            schema_info = self._get_schema_info()
-            
             # Decompose the query into subqueries
             subqueries = self._decompose_query(query)
             logger.info(f"{log_prefix}Query decomposed into {len(subqueries)} subqueries")
@@ -1306,7 +1314,7 @@ class SummarySynthesizerTool(BaseTool):
                     return {"message": str(e)}
             
             # Execute all subqueries concurrently
-            results = await self._execute_subqueries_concurrently(subqueries, resolved_location_map, schema_info)
+            results = await self._execute_subqueries_concurrently(subqueries, resolved_location_map)
             
             # Log execution results summary
             successful_queries = sum(1 for r in results if r.successful)
