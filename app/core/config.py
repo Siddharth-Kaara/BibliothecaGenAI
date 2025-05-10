@@ -69,18 +69,9 @@ class Settings(BaseSettings):
     REDIS_HOST: str = Field(default="localhost")
     
     # JWT Settings 
-    JWT_PUBLIC_KEY: str = os.getenv("JWT_PUBLIC_KEY", "YOUR_PUBLIC_KEY_NEEDS_TO_BE_SET_IN_ENV") 
-    JWT_ALGORITHM: str =  "RS256" 
+    JWT_SECRET_KEY: str = os.getenv("JWT_SECRET_KEY", "service-management") 
+    JWT_ALGORITHM: str = "HS256" 
 
-    @field_validator("JWT_PUBLIC_KEY")
-    def format_public_key(cls, v: str) -> str:
-        """Replaces literal \n in the public key string with actual newlines."""
-        if v:
-             # Handle potential escaped backslashes from dotenv parsing if needed
-             # Simple replacement first
-            return v.replace("\\n", "\n") 
-        return v # Return original if empty or None
-    
     class Config:
         env_file = ".env"
         case_sensitive = True

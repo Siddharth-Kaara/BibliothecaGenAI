@@ -1879,8 +1879,7 @@ async def process_chat_message(
         success_response["data"] = {
             "request_id": req_id, 
             "text": final_text_str, 
-            "tables": formatted_tables_to_include, 
-            # model_dump() instead of deprecated dict()
+            "tables": formatted_tables_to_include,
             "visualizations": [vis.model_dump() for vis in validated_visualizations] 
         }
 

@@ -15,13 +15,13 @@ logger = logging.getLogger(__name__)
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token") # tokenUrl is not actually used for JWT
 
 class TokenPayload(BaseModel):
-    sub: str # Standard claim for subject (user ID)
-    org_id: Optional[str] = None # Custom claim for organization ID
+    userId: str # Standard claim for subject (user ID) 
+    organizationId: Optional[str] = None # Custom claim for organization ID 
     # Add other expected claims like exp, iss, aud if needed for validation
 
 class CurrentUser(BaseModel):
     user_id: UUID
-    org_id: str # Changed Optional[str]=None to str, assuming org_id is mandatory
+    org_id: str 
 
 async def get_current_user(token: str = Depends(oauth2_scheme)) -> CurrentUser:
     """
@@ -42,17 +42,14 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> CurrentUser:
     try:
         # Prepare decode options - add audience/issuer validation if configured
         options = {
-            # "verify_aud": True, # Uncomment if JWT_AUDIENCE is set
-            # "verify_iss": True, # Uncomment if JWT_ISSUER is set
+
             "verify_exp": True # Always verify expiration
         }
         
         payload = jwt.decode(
             token,
-            settings.JWT_PUBLIC_KEY, # Use PUBLIC key for RS256 verification
-            algorithms=[settings.JWT_ALGORITHM], # Should be ["RS256"]
-            # audience=settings.JWT_AUDIENCE, # Uncomment if needed
-            # issuer=settings.JWT_ISSUER,    # Uncomment if needed
+            settings.JWT_SECRET_KEY, # Use SECRET key for HS256 verification
+            algorithms=[settings.JWT_ALGORITHM], # Should be ["HS256"]
             options=options
         )
         
@@ -60,33 +57,24 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> CurrentUser:
         token_data = TokenPayload(**payload)
         
         # --- User ID Validation ---
-        user_id_str = token_data.sub
+        user_id_str = token_data.userId 
         if not user_id_str:
-            logger.warning("Token validation failed: 'sub' claim missing.")
+            logger.warning("Token validation failed: 'userId' claim missing.") 
             raise invalid_user_exception
         try:
             user_id_uuid = UUID(user_id_str)
         except ValueError:
-            logger.warning(f"Token validation failed: 'sub' claim ('{user_id_str}') is not a valid UUID.")
+            logger.warning(f"Token validation failed: 'userId' claim ('{user_id_str}') is not a valid UUID.") # Changed from 'sub'
             raise invalid_user_exception
-        # --- End User ID Validation ---
 
         # --- Organization ID Validation ---
-        org_id_str = token_data.org_id 
-        if not org_id_str: # Make org_id mandatory
-             logger.warning("Token validation failed: 'org_id' claim missing.")
-             raise credentials_exception # Use generic credentials exception
-
-        # Optional: Validate org_id format if needed (e.g., if it should be UUID)
-        # try:
-        #     org_id_uuid = UUID(org_id_str)
-        # except ValueError:
-        #     logger.warning(f"Token validation failed: 'org_id' claim ('{org_id_str}') is not a valid UUID.")
-        #     raise credentials_exception
-        # --- End Organization ID Validation ---
+        org_id_str = token_data.organizationId
+        if not org_id_str: 
+             logger.warning("Token validation failed: 'organizationId' claim missing.") # Changed from 'org_id'
+             raise credentials_exception 
 
         # Return validated user and organization IDs
-        return CurrentUser(user_id=user_id_uuid, org_id=org_id_str) # Include org_id
+        return CurrentUser(user_id=user_id_uuid, org_id=org_id_str) 
 
     except JWTError as e:
         logger.warning(f"Token validation failed: {e}")
@@ -94,6 +82,6 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> CurrentUser:
     except ValidationError as e:
         logger.warning(f"Token payload validation failed: {e}")
         raise credentials_exception from e
-    except Exception as e: # Catch any other unexpected error during validation
+    except Exception as e: 
         logger.error(f"Unexpected error during token validation: {e}", exc_info=True)
         raise credentials_exception from e 
