@@ -523,10 +523,11 @@ def agent_node(state: AgentState, llm_with_structured_output):
                 
                 You MUST add the organization filter correctly to the query for the requested table. Retry the query generation.
                 """
-                logger.info(f"[AgentNode] Adding SQL security recovery guidance for retry #{current_retry_count + 1}")
+                logger.info(f"[AgentNode] SQL Security Error: Generating recovery guidance for LLM: {recovery_guidance[:150]}...")
                 retry_increment = 1 # Set flag to increment the counter in the return dict
+                logger.info(f"[AgentNode] SQL Security Error: Incrementing SQL security retry count from {current_retry_count} to {current_retry_count + 1}.")
             else:
-                 logger.warning(f"[AgentNode] SQL security error detected, but retry limit ({settings.MAX_SQL_SECURITY_RETRIES}) reached. Will not generate recovery guidance.")
+                 logger.warning(f"[AgentNode] SQL Security Error: Detected, but retry limit ({settings.MAX_SQL_SECURITY_RETRIES}) reached. Will not generate recovery guidance.")
                  # No guidance, should_continue will see the error and route to END
 
     # If recovery guidance was generated, inject it into the system message
@@ -690,7 +691,8 @@ def agent_node(state: AgentState, llm_with_structured_output):
                             discarded_duplicates.append(tc)
                     
                     for discarded_tc in discarded_duplicates:
-                        logger.warning(f"[AgentNode] Discarded functionally duplicate operational tool call (ID: {discarded_tc.get('id')})")
+                        # logger.warning(f"[AgentNode] Discarded functionally duplicate operational tool call (ID: {discarded_tc.get('id')})")
+                        logger.info(f"[AgentNode] Discarding duplicate operational tool call: Name: {discarded_tc.get('name')}, Args: {str(discarded_tc.get('args', {}))[:100]}..., ID: {discarded_tc.get('id')}")
 
                     if unique_operational_calls:
                         # Modify the AIMessage in the return dict to only contain unique calls
@@ -718,7 +720,7 @@ def agent_node(state: AgentState, llm_with_structured_output):
 
             # --- NEW CASE 4: Plain AIMessage response (NO tool_calls list) --- #
             else: 
-                logger.info("[AgentNode] LLM AIMessage has NO tool_calls. Coercing content into FinalApiResponseStructure.")
+                logger.info(f"[AgentNode] LLM AIMessage has NO tool_calls. Coercing content into FinalApiResponseStructure. Content: {llm_response.content[:100]}...")
                 if isinstance(llm_response.content, str) and llm_response.content.strip():
                     # --- RE-ADD Cleanup Logic HERE --- #
                     raw_content = llm_response.content.strip()
@@ -730,7 +732,8 @@ def agent_node(state: AgentState, llm_with_structured_output):
                                 potential_text = raw_content[:split_index].strip()
                                 if potential_text: 
                                     coerced_text = potential_text
-                                    logger.debug(f"[AgentNode] Successfully cleaned AIMessage representation from coerced text.")
+                                    # logger.debug(f"[AgentNode] Successfully cleaned AIMessage representation from coerced text.")
+                                    logger.info(f"[AgentNode] Cleaned AIMessage(...) wrapper from coerced text. Original snippet: {raw_content[:100]}..., New snippet: {coerced_text[:100]}...")
                                 else:
                                      logger.warning(f"[AgentNode] Coerced content cleanup resulted in empty string. Using original content. Raw: {raw_content}")
                     except Exception as cleanup_err: 
@@ -828,10 +831,13 @@ def _preprocess_state_for_llm(state: AgentState) -> AgentState:
     """
     processed_state = {k: v for k, v in state.items()}
     max_messages = settings.MAX_STATE_MESSAGES
+    num_messages_before_pruning = 0 # Initialize
 
     if 'messages' in processed_state and len(processed_state['messages']) > max_messages:
         original_messages = processed_state['messages']
-        logger.debug(f"Starting pruning messages from {len(original_messages)} down to target ~{max_messages}")
+        num_messages_before_pruning = len(original_messages) # Set actual count
+        # logger.debug(f"Starting pruning messages from {len(original_messages)} down to target ~{max_messages}")
+        logger.info(f"[_preprocess_state_for_llm] Starting message pruning. Original count: {num_messages_before_pruning}, Target: ~{max_messages}")
 
         preserved_messages_reversed: List[BaseMessage] = []
         system_message: Optional[SystemMessage] = None
@@ -875,13 +881,15 @@ def _preprocess_state_for_llm(state: AgentState) -> AgentState:
                     else:
                         # This AIMessage expected tool calls, but temp_tool_messages is empty or doesn't match.
                         if temp_tool_messages:
-                            logger.warning(f"Discarding {len(temp_tool_messages)} ToolMessage(s) orphaned before AIMessage(TC) (ID: {msg.id}).")
+                            # logger.warning(f"Discarding {len(temp_tool_messages)} ToolMessage(s) orphaned before AIMessage(TC) (ID: {msg.id}).")
+                            logger.warning(f"[_preprocess_state_for_llm] Discarding {len(temp_tool_messages)} ToolMessage(s) (orphaned before AIMessage with tool_calls ID: {msg.id}). Details: {[ (tm.tool_call_id, str(tm.content)[:50]+'...') for tm in temp_tool_messages ]}")
                             temp_tool_messages = [] # Clear orphans before preserving AIMessage(TC)
                         logger.debug(f"Identified orphaned AIMessage(TC) (ID: {msg.id}) - ToolMessages potentially missing/pruned.")
                 else:
                      # Simple AIMessage, no tool calls. Any temp_tool_messages are orphans.
                      if temp_tool_messages:
-                        logger.warning(f"Discarding {len(temp_tool_messages)} ToolMessage(s) orphaned before simple AIMessage (ID: {msg.id}).")
+                        # logger.warning(f"Discarding {len(temp_tool_messages)} ToolMessage(s) orphaned before simple AIMessage (ID: {msg.id}).")
+                        logger.warning(f"[_preprocess_state_for_llm] Discarding {len(temp_tool_messages)} ToolMessage(s) (orphaned before simple AIMessage ID: {msg.id}). Details: {[ (tm.tool_call_id, str(tm.content)[:50]+'...') for tm in temp_tool_messages ]}")
                         temp_tool_messages = [] # Clear orphans
 
                 # Now, decide whether to preserve this AIMessage and potentially its tools
@@ -902,7 +910,8 @@ def _preprocess_state_for_llm(state: AgentState) -> AgentState:
             elif isinstance(msg, HumanMessage):
                 # Human message encountered. Any temp_tool_messages are orphans.
                 if temp_tool_messages:
-                    logger.warning(f"Discarding {len(temp_tool_messages)} ToolMessage(s) orphaned before HumanMessage.")
+                    # logger.warning(f"Discarding {len(temp_tool_messages)} ToolMessage(s) orphaned before HumanMessage.")
+                    logger.warning(f"[_preprocess_state_for_llm] Discarding {len(temp_tool_messages)} ToolMessage(s) (orphaned before HumanMessage). Details: {[ (tm.tool_call_id, str(tm.content)[:50]+'...') for tm in temp_tool_messages ]}")
                     temp_tool_messages = [] # Clear orphans
 
                 # Preserve the HumanMessage if space allows
@@ -925,7 +934,8 @@ def _preprocess_state_for_llm(state: AgentState) -> AgentState:
         final_preserved_messages.extend(preserved_messages_reversed)
 
         processed_state['messages'] = final_preserved_messages
-        logger.debug(f"Final pruned message count: {len(processed_state['messages'])}. Structure preserved: {[(type(m).__name__ + ('(TC)' if isinstance(m, AIMessage) and m.tool_calls else '')) for m in processed_state['messages']]}")
+        # logger.debug(f"Final pruned message count: {len(processed_state['messages'])}. Structure preserved: {[(type(m).__name__ + ('(TC)' if isinstance(m, AIMessage) and m.tool_calls else '')) for m in processed_state['messages']]}")
+        logger.info(f"[_preprocess_state_for_llm] Message pruning complete. Messages for LLM: {len(processed_state['messages'])} (Original: {num_messages_before_pruning if num_messages_before_pruning > 0 else len(original_messages) if 'original_messages' in locals() else 'N/A'}).")
 
     # --- Existing table truncation logic remains unchanged --- #
     if 'structured_results' in processed_state and processed_state['structured_results']:
@@ -957,6 +967,8 @@ def _preprocess_sql_params(
     log_prefix: str = "[SQL Param Preprocessing]"
 ) -> Dict[str, Any]:
     """Processes SQL parameters to ensure correct organization_id and resolve placeholders for known ID types."""
+    initial_params_copy = params.copy() if params else {} # For logging changes
+
     if params is None:
         # If LLM provides no params, but SQL expects :organization_id, ensure it's added.
         logger.debug(f"{log_prefix} Original params dictionary is None. Initializing with trusted organization_id.")
@@ -1036,7 +1048,11 @@ def _preprocess_sql_params(
         if not substituted_this_iteration and isinstance(value, str) and value.startswith("<") and value.endswith(">"):
              logger.warning(f"{log_prefix} Param '{key}' ('{value}') appears to be an unresolved placeholder and was not substituted by any rule.")
 
-    logger.debug(f"{log_prefix} Final processed params: {processed_params}")
+    # logger.debug(f"{log_prefix} Final processed params: {processed_params}")
+    if processed_params != initial_params_copy:
+        logger.info(f"{log_prefix} SQL params were modified. Before: {initial_params_copy}, After: {processed_params}")
+    else:
+        logger.debug(f"{log_prefix} SQL params unchanged by this function. Final: {processed_params}")
     return processed_params
 
 # --- Helper Function to Apply Resolved IDs to SQL STRING (EXISTING) ---
@@ -1154,10 +1170,14 @@ def _apply_resolved_ids_to_sql_args(sql: str, params: Dict[str, Any], resolved_m
     if modified:
         updated_params.update(new_params_added)
         modified_sql = str(stmt)
-        logger.info(f"[SQL Correction] Applied ID filters to SQL string. Modified SQL tail: ...{modified_sql[-200:]}. Added params: {new_params_added}")
+        # logger.info(f"[SQL Correction] Applied ID filters to SQL string. Modified SQL tail: ...{modified_sql[-200:]}. Added params: {new_params_added}")
+        logger.info(f"[SQL Correction] SQL string was modified by sqlparse. Original (tail): ...{sql[-200:]}, New (tail): ...{modified_sql[-200:]}")
+        if new_params_added: # Log only if params were also changed by this function
+            logger.info(f"[SQL Correction] Params were also modified by sqlparse name-to-ID replacement. Original relevant: (see SQL string), Added/Updated: {new_params_added}")
         return modified_sql, updated_params
     else:
-        logger.debug("[SQL Correction] No name filters found in SQL string matching resolved map keys using sqlparse.")
+        # logger.debug("[SQL Correction] No name filters found in SQL string matching resolved map keys using sqlparse.")
+        logger.debug(f"[SQL Correction] No modifications made to SQL string by sqlparse based on resolved map. SQL (tail): ...{sql[-200:]}")
         return sql, params
 
 # --- Tool Node Handler ---
@@ -1439,7 +1459,8 @@ def should_continue(state: AgentState) -> str:
 
     # Priority 1: If the final structure is already set, we end.
     if final_structure_in_state:
-        logger.debug("[ShouldContinue] Final response structure found in state. Routing to END.")
+        # logger.debug("[ShouldContinue] Final response structure found in state. Routing to END.")
+        logger.info("[ShouldContinue] Routing to END: FinalApiResponseStructure is present in state.")
         return END
 
     # Priority 2: Check the last message for the specific retryable SQL security error
@@ -1460,11 +1481,13 @@ def should_continue(state: AgentState) -> str:
         if is_specific_security_error:
             # Check retry limit
             if current_retry_count < settings.MAX_SQL_SECURITY_RETRIES:
-                logger.info(f"[ShouldContinue] Specific SQL Security error detected. Retry count {current_retry_count} < limit {settings.MAX_SQL_SECURITY_RETRIES}. Routing back to agent for retry.")
+                # logger.info(f"[ShouldContinue] Specific SQL Security error detected. Retry count {current_retry_count} < limit {settings.MAX_SQL_SECURITY_RETRIES}. Routing back to agent for retry.")
+                logger.info(f"[ShouldContinue] Routing to 'agent': Specific SQL Security error detected. Retry count {current_retry_count} < limit {settings.MAX_SQL_SECURITY_RETRIES}.")
                 # The agent_node should have already added guidance and incremented the counter in the state update it returned.
                 return "agent"
             else:
-                logger.warning(f"[ShouldContinue] Specific SQL Security error detected, but retry limit ({settings.MAX_SQL_SECURITY_RETRIES}) reached. Routing to END.")
+                # logger.warning(f"[ShouldContinue] Specific SQL Security error detected, but retry limit ({settings.MAX_SQL_SECURITY_RETRIES}) reached. Routing to END.")
+                logger.warning(f"[ShouldContinue] Routing to END: Specific SQL Security error detected, but retry limit ({settings.MAX_SQL_SECURITY_RETRIES}) reached.")
                 # Fall through to return END below
         else:
             # Other execute_sql error OR successful execution
@@ -1479,10 +1502,12 @@ def should_continue(state: AgentState) -> str:
                  is_error = True # Treat unparseable as error
 
             if is_error:
-                logger.warning(f"[ShouldContinue] Non-retryable execute_sql error detected. Routing to END.")
+                # logger.warning(f"[ShouldContinue] Non-retryable execute_sql error detected. Routing to END.")
+                logger.warning(f"[ShouldContinue] Routing to END: Non-retryable or unhandled execute_sql error detected in ToolMessage: {last_message.content[:100]}...")
                 # Fall through to return END below
             else:
                  logger.debug("[ShouldContinue] Successful execute_sql Tool message found. Routing back to 'agent' to process.")
+                 logger.info("[ShouldContinue] Routing to 'agent': Successful execute_sql ToolMessage found.")
                  return "agent"
 
     # --- [Optional] Generic recursion check ---
@@ -1499,22 +1524,27 @@ def should_continue(state: AgentState) -> str:
             )
             if has_operational_calls:
                  logger.debug("[ShouldContinue] Operational tool call(s) found in AIMessage. Routing to 'tools'.")
+                 logger.info("[ShouldContinue] Routing to 'tools': AIMessage with operational tool calls detected.")
                  return "tools"
             else: # Only FinalApiResponseStructure or empty tool_calls
                  logger.warning("[ShouldContinue] AIMessage has only FinalApiResponseStructure or empty tool_calls. Routing to END.")
+                 logger.info("[ShouldContinue] Routing to END: AIMessage has only FinalApiResponseStructure or empty tool_calls (will be/was processed by agent/tools node).")
                  return END # Should normally be caught by final_structure_in_state check
          else:
              logger.warning("[ShouldContinue] AIMessage with no tool calls. Routing to END.")
+             logger.info("[ShouldContinue] Routing to END: AIMessage with no tool calls (implies final text response).")
              return END
 
     # Priority 4: Handle other ToolMessages (non-SQL or non-error SQL)
     elif isinstance(last_message, ToolMessage): # Already handled sql tool messages above
         # Any other successful tool message (e.g., hierarchy_resolver) should go back to agent
-        logger.debug(f"[ShouldContinue] Successful Tool message ({last_message.name}) found. Routing back to 'agent'.")
+        # logger.debug(f"[ShouldContinue] Successful Tool message ({last_message.name}) found. Routing back to 'agent'.")
+        logger.info(f"[ShouldContinue] Routing to 'agent': ToolMessage for '{last_message.name}' found.")
         return "agent"
 
     # Default/Fallback: If state is unexpected, end.
-    logger.warning(f"[ShouldContinue] Unexpected state or last message type ({type(last_message).__name__}), routing to END.")
+    # logger.warning(f"[ShouldContinue] Unexpected state or last message type ({type(last_message).__name__}), routing to END.")
+    logger.warning(f"[ShouldContinue] Routing to END: Fallback due to unexpected state or last message type ({type(last_message).__name__}).")
     return END
 
 # --- Create LangGraph Agent ---
