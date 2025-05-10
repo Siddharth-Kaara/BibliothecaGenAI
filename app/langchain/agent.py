@@ -495,40 +495,50 @@ def agent_node(state: AgentState, llm_with_structured_output):
     recovery_guidance = None
     retry_increment = 0 # Track if we need to increment count
 
+    # Check for SQL security failures
+    last_sql_security_failure = None
+    current_failure_patterns = state.get("failure_patterns", {})
+    if current_failure_patterns:
+        logger.debug(f"[AgentNode] Inspecting failure_patterns for SQL security errors: {current_failure_patterns}")
+    else:
+        logger.debug("[AgentNode] failure_patterns is empty. No SQL security errors to check from patterns.")
+
+    for key, failures_list in current_failure_patterns.items():
+        if isinstance(key, tuple) and len(key) > 0 and key[0] == "execute_sql":
+            if failures_list:
+                potential_failure = failures_list[-1]
+                error_type = potential_failure.get("error_type")
+                details = potential_failure.get("details", "")
+                
+                if error_type == "VALIDATION_ERROR" and \
+                   "SECURITY CHECK FAILED: Main SQL query MUST include the :organization_id parameter." in details:
+                    logger.info(f"[AgentNode] Matched specific SQL security failure (:organization_id missing). Tool Call ID: {potential_failure.get('tool_call_id')}. Details: {details[:200]}...")
+                    last_sql_security_failure = potential_failure
+                    break
+    
+    if last_sql_security_failure:
+        current_retry_count = state.get("sql_security_retry_count", 0)
+        if current_retry_count < settings.MAX_SQL_SECURITY_RETRIES:
+            recovery_guidance = """
+            CRITICAL SQL CORRECTION INSTRUCTION:
+            
+            Your previous SQL query failed the security check because it was missing the required :organization_id filter.
+            
+            The security system checks EACH SQL component SEPARATELY:
+            1. Every CTE (WITH clause) must include: WHERE "organizationId" = :organization_id (or relevant org column)
+            2. Every subquery must include: WHERE "organizationId" = :organization_id (or relevant org column)
+            3. The main query must include: WHERE "organizationId" = :organization_id (or relevant org column)
+            
+            You MUST add the organization filter correctly to the query for the requested table. Retry the query generation.
+            """
+            logger.info(f"[AgentNode] SQL Security Error: Generating recovery guidance for LLM: {recovery_guidance[:150]}...")
+            retry_increment = 1
+            logger.info(f"[AgentNode] SQL Security Error: Incrementing SQL security retry count from {current_retry_count} to {current_retry_count + 1}.")
+        else:
+            logger.warning(f"[AgentNode] SQL Security Error: Detected, but retry limit ({settings.MAX_SQL_SECURITY_RETRIES}) reached. Will not generate recovery guidance.")
+
     # Create a copy for preprocessing
     preprocessed_state = _preprocess_state_for_llm(state)
-
-    # Check failure patterns specifically for execute_sql
-    sql_failures = failure_patterns.get("execute_sql", [])
-    if sql_failures: # Check only if there are any SQL failures
-        last_sql_failure = sql_failures[-1] # Get the most recent one
-        is_specific_security_error = (
-            "SECURITY CHECK FAILED" in last_sql_failure.get("details", "") and # CORRECTED KEY
-            "organization_id" in last_sql_failure.get("details", "")     # CORRECTED KEY
-        )
-
-        if is_specific_security_error:
-            current_retry_count = state.get("sql_security_retry_count", 0)
-            # Check if retry limit allows another attempt
-            if current_retry_count < settings.MAX_SQL_SECURITY_RETRIES:
-                recovery_guidance = """
-                CRITICAL SQL CORRECTION INSTRUCTION:
-                
-                Your previous SQL query failed the security check because it was missing the required :organization_id filter.
-                
-                The security system checks EACH SQL component SEPARATELY:
-                1. Every CTE (WITH clause) must include: WHERE "organizationId" = :organization_id (or relevant org column)
-                2. Every subquery must include: WHERE "organizationId" = :organization_id (or relevant org column)
-                3. The main query must include: WHERE "organizationId" = :organization_id (or relevant org column)
-                
-                You MUST add the organization filter correctly to the query for the requested table. Retry the query generation.
-                """
-                logger.info(f"[AgentNode] SQL Security Error: Generating recovery guidance for LLM: {recovery_guidance[:150]}...")
-                retry_increment = 1 # Set flag to increment the counter in the return dict
-                logger.info(f"[AgentNode] SQL Security Error: Incrementing SQL security retry count from {current_retry_count} to {current_retry_count + 1}.")
-            else:
-                 logger.warning(f"[AgentNode] SQL Security Error: Detected, but retry limit ({settings.MAX_SQL_SECURITY_RETRIES}) reached. Will not generate recovery guidance.")
-                 # No guidance, should_continue will see the error and route to END
 
     # If recovery guidance was generated, inject it into the system message
     if recovery_guidance:
