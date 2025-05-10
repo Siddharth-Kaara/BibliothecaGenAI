@@ -2102,23 +2102,64 @@ async def execute_with_retry(invocation_detail: Dict[str, Any]) -> Dict[str, Any
             attempt += 1
             
     # If all retries failed or a non-retryable error occurred and broke the loop
-    error_message_detail = f"Tool '{tool_name}' (ID: {tool_call_id}) failed. Last error: {str(last_exception)}"
-    if attempt > retries_left : # exhausted retries
-        error_message_detail = f"Tool '{tool_name}' (ID: {tool_call_id}) failed after {retries_left + 1} attempts. Last error: {str(last_exception)}"
+    # --- Enhanced Error Message Extraction ---
+    detailed_error_content = str(last_exception) # Default message
+    error_type_str = "TOOL_EXECUTION_FAILED"    # Default type
+
+    current_exception_for_details = last_exception
+    # Traverse the cause chain to get the most specific DB-related error message
+    # Limit depth to avoid infinite loops in rare cases, though __cause__ chain should be finite
+    # Based on logs, the direct __cause__ of ValueError from sql_tool is the SQLAlchemy error.
+    potential_cause = getattr(current_exception_for_details, '__cause__', None)
+    if potential_cause:
+        # Attempt to get a string representation of the cause.
+        # SQLAlchemy errors often have good string representations.
+        specific_cause_message = str(potential_cause)
+        detailed_error_content = specific_cause_message # Prioritize cause message
+
+        # Refine error type based on the cause
+        cause_type_name = type(potential_cause).__name__
+        if "UndefinedColumnError" in cause_type_name or \
+           ("column" in detailed_error_content.lower() and "does not exist" in detailed_error_content.lower()):
+            error_type_str = "DATABASE_UNDEFINED_COLUMN_ERROR"
+        elif "ProgrammingError" in cause_type_name: # Catches other SQL programming issues
+            error_type_str = "DATABASE_PROGRAMMING_ERROR"
+        elif "SyntaxError" in cause_type_name or "syntax error" in detailed_error_content.lower():
+             error_type_str = "DATABASE_SYNTAX_ERROR"
+        # Add more specific SQLAlchemy or DB error types as needed
+
+    # If not overridden by a more specific DB error type, check for other common types
+    if error_type_str == "TOOL_EXECUTION_FAILED":
+        if isinstance(last_exception, HTTPException): # from FastAPI, not pydantic.errors
+            error_type_str = "HTTP_EXCEPTION_IN_TOOL"
+        elif isinstance(last_exception, ValidationError): # from Pydantic
+            error_type_str = "VALIDATION_ERROR_IN_TOOL"
+        elif isinstance(last_exception, TimeoutError) or isinstance(last_exception, APITimeoutError):
+            error_type_str = "TIMEOUT_ERROR_IN_TOOL"
+        elif isinstance(last_exception, APIConnectionError):
+            error_type_str = "CONNECTION_ERROR_IN_TOOL"
+        elif isinstance(last_exception, RateLimitError):
+            error_type_str = "RATE_LIMIT_ERROR_IN_TOOL"
+    # --- End Enhanced Error Message Extraction ---
+
+    # Prepare messages for logging and for the LLM
+    final_llm_error_message = f"Tool '{tool_name}' failed. Error details: {detailed_error_content}"
     
-    logger.error(error_message_detail)
+    log_message_summary = f"Tool '{tool_name}' (ID: {tool_call_id}) failed. Type: {error_type_str}."
+    if attempt >= retries_left : # exhausted retries
+        log_message_summary = f"Tool '{tool_name}' (ID: {tool_call_id}) failed after {retries_left + 1} attempts. Type: {error_type_str}."
     
-    error_type = "TOOL_EXECUTION_FAILED"
-    if isinstance(last_exception, HTTPException):
-        error_type = "HTTP_EXCEPTION_IN_TOOL"
-    elif isinstance(last_exception, ValidationError):
-         error_type = "VALIDATION_ERROR_IN_TOOL"
-    # Consider adding more specific error types based on common exceptions from your tools
+    logger.error(f"{log_message_summary} Full Error: {str(last_exception)}", exc_info=True if getattr(settings, 'LOG_LEVEL', 'INFO').upper() == 'DEBUG' else False)
 
     return {
         "id": tool_call_id,
         "name": tool_name,
-        "content_str": json.dumps({"error": {"type": error_type, "message": error_message_detail, "details": str(last_exception)}}),
+        "content_str": json.dumps({
+            "error": {
+                "type": error_type_str,
+                "message": final_llm_error_message, # More detailed message for LLM
+            }
+        }),
         "is_error": True,
         "original_args": original_args_for_logging
     }

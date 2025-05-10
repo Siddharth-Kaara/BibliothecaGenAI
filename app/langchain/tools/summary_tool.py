@@ -49,23 +49,32 @@ class SubqueryResult(BaseModel):
     
     @property
     def successful(self) -> bool:
-        """Check if the subquery was successful in terms of execution, regardless of data found."""
-        if self.error is not None:  # Explicit error string means failure
+        """Check if the subquery's SQL execution was successful and yielded a structured result."""
+        # 1. If an error message was explicitly set during SubqueryResult creation, it's a definite failure.
+        if self.error is not None:
             return False
         
-        if not isinstance(self.result, dict): # Result should be a dictionary
-            logger.warning(f"SubqueryResult for '{self.query}' has a non-dict result: {type(self.result)}")
+        # 2. If no explicit error string (self.error is None), then SQLExecutionTool did not report
+        #    a top-level error. Now, we must validate that self.result (which should directly be
+        #    the table dictionary like {"columns": [...], "rows": [...]}) has the expected structure.
+        if not isinstance(self.result, dict):
+            logger.warning(
+                f"SubqueryResult for '{self.query}': self.result is not a dict (type: {type(self.result)}), "
+                f"but self.error was None. This indicates a malformed success response."
+            )
             return False
 
-        # Check for SQLExecutionTool's specific error structure within the result
-        table_data = self.result.get("table")
-        if isinstance(table_data, dict) and table_data.get("columns") == ["Error"]:
+        # 3. Final structural check for a valid table: 'columns' and 'rows' must exist directly in self.result.
+        if "columns" not in self.result or "rows" not in self.result:
+            logger.warning(
+                f"SubqueryResult for '{self.query}': self.result is missing 'columns' or 'rows' "
+                f"keys, but self.error was None. Malformed success response. Result: {str(self.result)[:200]}"
+            )
             return False
-        
-        # If no explicit error and not an error table structure, consider execution successful.
-        # This means the query ran without database/network errors, even if it returned 0 rows.
-        # The presence of "table" and "columns" indicates a well-formed result from SQLExecutionTool.
-        return "table" in self.result and isinstance(table_data, dict) and "columns" in table_data
+            
+        # If all checks pass (no explicit error, and result structure is a valid table),
+        # then the subquery SQL execution is considered successful.
+        return True
 
 class TrendInfo(BaseModel):
     """Information about a detected trend."""
@@ -505,29 +514,38 @@ class SummarySynthesizerTool(BaseTool):
         for description, task in tasks:
             try:
                 # Await the task (which includes the wait_for)
-                result_dict = await task 
+                result_dict = await task # result_dict is the parsed JSON output of SQLExecutionTool
                 
-                # --- Check if the result dictionary indicates an error from SQLExecutionTool --- 
-                is_error_structure = (
-                    isinstance(result_dict, dict) and 
-                    isinstance(result_dict.get("table"), dict) and
-                    result_dict["table"].get("columns") == ["Error"]
-                )
-                
-                if is_error_structure:
-                    # This indicates _execute_sql caught an error
-                    error_message = result_dict.get("text", "Unknown error from SQL execution")
-                    logger.warning(f"{log_prefix}Subquery '{description}' failed internally: {error_message}")
+                # Check for the new error structure from SQLExecutionTool
+                if isinstance(result_dict, dict) and result_dict.get("error") is not None:
+                    error_obj = result_dict["error"] # error_obj is typically a dict
+                    error_message = "Unknown error from SQL execution tool."
+                    if isinstance(error_obj, dict) and "message" in error_obj:
+                        error_message = error_obj["message"]
+                    elif isinstance(error_obj, str): # Simple error string
+                        error_message = error_obj
+                        
+                    logger.warning(f"{log_prefix}Subquery '{description}' failed (reported by SQL tool): {error_message}")
                     results.append(SubqueryResult(query=description, result={}, error=error_message))
-                elif isinstance(result_dict, dict):
-                    # Assume successful execution, result is the table data
-                    logger.debug(f"{log_prefix}Subquery '{description}' completed successfully.")
-                    # Store the full result which includes the table dict {'table': {'columns': ..., 'rows': ...}}
+                # Check for the legacy error structure as a fallback (less likely with new sql_tool)
+                elif isinstance(result_dict, dict) and isinstance(result_dict.get("table"), dict) and result_dict["table"].get("columns") == ["Error"]:
+                    error_message = result_dict.get("text", "Unknown error from SQL execution tool (legacy format).")
+                    if isinstance(result_dict["table"].get("rows"), list) and len(result_dict["table"]["rows"]) > 0 and isinstance(result_dict["table"]["rows"][0], list) and len(result_dict["table"]["rows"][0]) > 0:
+                        error_message = result_dict["table"]["rows"][0][0] # Get message from legacy error table
+                    logger.warning(f"{log_prefix}Subquery '{description}' failed (legacy SQL tool error format): {error_message}")
+                    results.append(SubqueryResult(query=description, result={}, error=error_message))
+                # Check for a valid success structure (columns and rows directly in result_dict)
+                elif isinstance(result_dict, dict) and \
+                     "columns" in result_dict and \
+                     "rows" in result_dict:
+                    # This is a successful result from SQLExecutionTool.
+                    # The result_dict *is* the table data, e.g., {"columns": [...], "rows": [...]}.
+                    logger.debug(f"{log_prefix}Subquery '{description}' completed successfully. Result keys: {list(result_dict.keys())}")
                     results.append(SubqueryResult(query=description, result=result_dict, error=None))
                 else:
-                    # Unexpected result type
-                    error_message = f"Unexpected result type from subquery execution: {type(result_dict)}"
-                    logger.error(f"{log_prefix}Subquery '{description}': {error_message}")
+                    # If it's none of the above, it's an unexpected/malformed structure
+                    error_message = f"Unexpected or malformed result structure from subquery execution. Type: {type(result_dict)}."
+                    logger.error(f"{log_prefix}Subquery '{description}': {error_message} Result: {str(result_dict)[:200]}")
                     results.append(SubqueryResult(query=description, result={}, error=error_message))
 
             except asyncio.TimeoutError:
@@ -612,11 +630,11 @@ class SummarySynthesizerTool(BaseTool):
         
         # Step 1: Gather all unique IDs from successful results that have a 'hierarchyId' column
         for idx, result in enumerate(subquery_results):
-            if not result.successful or "table" not in result.result:
+            if not result.successful or not isinstance(result.result, dict): # result.result is now the table dict
                 continue
                 
-            columns = result.result["table"].get("columns", [])
-            rows = result.result["table"].get("rows", [])
+            columns = result.result.get("columns", []) # Access columns directly from result.result
+            rows = result.result.get("rows", [])       # Access rows directly from result.result
             
             # Find the index of the 'hierarchyId' column
             hierarchy_id_index = -1
@@ -673,12 +691,12 @@ class SummarySynthesizerTool(BaseTool):
         
         for idx in results_with_id_col:
             original_result = updated_results[idx]
-            if not original_result.successful:
+            if not original_result.successful or not isinstance(original_result.result, dict):
                 continue
                 
-            original_table = original_result.result.get("table", {})
-            original_columns = original_table.get("columns", [])
-            original_rows = original_table.get("rows", [])
+            original_table_data = original_result.result # This is now the table dictionary
+            original_columns = original_table_data.get("columns", [])
+            original_rows = original_table_data.get("rows", [])
             
             # Skip if no rows to process
             if not original_rows:
@@ -733,7 +751,7 @@ class SummarySynthesizerTool(BaseTool):
             # Update the result with the enhanced data
             updated_results[idx] = SubqueryResult(
                 query=original_result.query,
-                result={"table": {"columns": new_columns, "rows": new_rows}},
+                result={"columns": new_columns, "rows": new_rows}, # Store as a table dict
                 error=original_result.error
             )
             
@@ -755,10 +773,10 @@ class SummarySynthesizerTool(BaseTool):
         entity_key_preference = ["Location Name", "hierarchyId"] # Preference for entity grouping
 
         for result in subquery_results:
-            if result.successful and "table" in result.result:
-                table = result.result["table"]
-                columns = table.get("columns", [])
-                rows = table.get("rows", [])
+            if result.successful and isinstance(result.result, dict): # result.result is the table dict
+                table_data = result.result # Access table data directly
+                columns = table_data.get("columns", [])
+                rows = table_data.get("rows", [])
                 if not rows or not columns:
                     continue
 
@@ -853,12 +871,12 @@ class SummarySynthesizerTool(BaseTool):
 
         # First pass: Aggregate data by entity and identify time series
         for result in subquery_results:
-            if not result.successful or "table" not in result.result:
+            if not result.successful or not isinstance(result.result, dict): # result.result is the table dict
                 continue
                 
-            table = result.result["table"]
-            columns = table.get("columns", [])
-            rows = table.get("rows", [])
+            table_data = result.result # Access table data directly
+            columns = table_data.get("columns", [])
+            rows = table_data.get("rows", [])
             
             if not rows or not columns:
                 continue
@@ -1154,11 +1172,14 @@ class SummarySynthesizerTool(BaseTool):
                 if subquery_result.error:
                      results_str += f"Result: Error - {subquery_result.error}\n\n"
                      continue 
-                table_data = subquery_result.result.get("table", {})
-                if not isinstance(table_data, dict):
-                     results_str += f"Result: Invalid table data format received.\n\n"
+                # subquery_result.result should directly be the table data dict {"columns": ..., "rows": ...}
+                if not isinstance(subquery_result.result, dict) or \
+                   "columns" not in subquery_result.result or \
+                   "rows" not in subquery_result.result:
+                     results_str += f"Result: Invalid table data format received in subquery_result.result.\n\n"
                      continue
                 
+                table_data = subquery_result.result # This is the table dict
                 limited_rows = table_data.get("rows", [])[:5]
                 columns = table_data.get("columns", [])
                 json_output = json.dumps({"columns": columns, "rows": limited_rows}, indent=2)
@@ -1291,7 +1312,6 @@ class SummarySynthesizerTool(BaseTool):
         try:
             # Decompose the query into subqueries
             subqueries = self._decompose_query(query)
-            logger.info(f"{log_prefix}Query decomposed into {len(subqueries)} subqueries")
             
             # Check if any subquery contains potential hierarchy ID placeholders
             contains_hierarchy_references = any(

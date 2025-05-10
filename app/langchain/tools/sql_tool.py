@@ -316,20 +316,39 @@ class SQLExecutionTool(BaseTool):
         except asyncio.TimeoutError as te:
             # Specific handling for asyncio timeouts
             error_msg = f"Database query exceeded the timeout limit ({settings.SQL_EXECUTION_TIMEOUT_SECONDS} seconds)."
-            logger.error(f"{log_prefix}{error_msg} SQL: {sql[:200]}...", exc_info=False)
-            # Raise a generic ValueError
-            raise ValueError("The database query took too long to complete.") from te
+            logger.error(f"{log_prefix}{error_msg} SQL: {sql[:200]}...", exc_info=False) # exc_info=False for cleaner log for timeout
+            # Add original error to the message for _arun to potentially parse
+            raise ValueError(f"{error_msg} Original error: {str(te)}") from te
+
         except SQLAlchemyError as e:
             # Log the full error internally
             logger.error(f"[SQLExecutionTool] SQL execution error for org {self.organization_id}. Error: {str(e)}", exc_info=True)
             logger.debug(f"{log_prefix}Failed SQL: {sql[:500]}... | Params: {parameters}")
-            # Raise a generic error message
-            raise ValueError("An error occurred while executing the database query.") from e
-        except Exception as e:
+            
+            # Attempt to get a more specific message from the original exception if available
+            specific_detail = ""
+            if hasattr(e, 'orig') and e.orig is not None and hasattr(e.orig, 'pgerror') and e.orig.pgerror: # For asyncpg specific errors
+                specific_detail = str(e.orig.pgerror).strip()
+            elif hasattr(e, 'orig') and e.orig is not None: # General original error
+                 specific_detail = str(e.orig).strip()
+            elif e.__cause__: # Fallback to cause
+                specific_detail = str(e.__cause__).strip()
+            else: # Fallback to the error itself
+                specific_detail = str(e).strip()
+            
+            # Clean up common prefixes from SQLAlchemy/DB driver messages for clarity
+            specific_detail = re.sub(r"^\(<class '[^']*'>\)\\s*", "", specific_detail) # Removes "(<class 'package.module.ErrorName'>) "
+            specific_detail = re.sub(r"^[A-Za-z_]*Error:\\s*", "", specific_detail)    # Removes "ErrorName: "
+            specific_detail = specific_detail.replace('\\n', ' ').replace('\n', ' ') # Replace newlines for a cleaner single line message
+
+            final_error_message = f"An error occurred while executing the database query. Details: {specific_detail}"
+            raise ValueError(final_error_message) from e
+
+        except Exception as e: # Generic catch-all for other unexpected errors
             # Log the full error internally
             logger.error(f"[SQLExecutionTool] Unexpected error during SQL execution for org {self.organization_id}: {e}", exc_info=True)
-            # Raise a generic error message
-            raise ValueError("An unexpected error occurred during query execution.") from e
+            # Raise a generic error message, including details from the original exception
+            raise ValueError(f"An unexpected error occurred during query execution. Details: {str(e)}") from e
     
     async def _arun(
         self, sql: str, params: Dict[str, Any], db_name: str = "report_management", run_manager=None
@@ -369,14 +388,81 @@ class SQLExecutionTool(BaseTool):
             return json.dumps(final_result_package, default=json_default)
 
         except ValueError as ve:
-            logger.error(f"{log_prefix}ValueError during SQL execution: {ve}", exc_info=True)
-            return json.dumps({"error": {"type": "VALIDATION_ERROR", "message": str(ve)}, "table": None, "text": f"Error validating SQL: {str(ve)}"}, default=json_default)
-        except SQLAlchemyError as db_err:
+            logger.error(f"{log_prefix}ValueError during SQL execution: {ve}", exc_info=True) # exc_info=True to see the full chain
+            error_message = str(ve)
+            error_type = "VALIDATION_ERROR" # Default, can be overridden by more specific checks
+
+            lower_error_message = error_message.lower()
+            if "column" in lower_error_message and "does not exist" in lower_error_message:
+                error_type = "DATABASE_UNDEFINED_COLUMN_ERROR"
+            elif "syntax error" in lower_error_message or ("near" in lower_error_message and any(kw in lower_error_message for kw in ["select", "from", "where", "group by", "order by"])):
+                error_type = "DATABASE_SYNTAX_ERROR"
+            elif "timeout" in lower_error_message and "exceeded" in lower_error_message:
+                error_type = "QUERY_TIMEOUT_ERROR"
+            elif "unique constraint" in lower_error_message or "duplicate key" in lower_error_message:
+                 error_type = "DATABASE_INTEGRITY_ERROR"
+            elif "division by zero" in lower_error_message:
+                 error_type = "DATABASE_NUMERIC_ERROR"
+            elif "invalid input" in lower_error_message and ("type" in lower_error_message or "syntax for type" in lower_error_message or "value too long for type" in lower_error_message):
+                 error_type = "DATABASE_TYPE_CONVERSION_ERROR"
+            elif "an error occurred while executing the database query" in lower_error_message: # Generic DB execution error
+                error_type = "DATABASE_EXECUTION_ERROR"
+            # If "permission denied" or "access denied"
+            elif "permission denied" in lower_error_message or "access denied" in lower_error_message:
+                error_type = "DATABASE_PERMISSION_ERROR"
+            # If "deadlock"
+            elif "deadlock" in lower_error_message:
+                error_type = "DATABASE_DEADLOCK_ERROR"
+            # If "connection" error (but not timeout, which is handled above)
+            elif "connection" in lower_error_message and not ("timeout" in lower_error_message):
+                error_type = "DATABASE_CONNECTION_ERROR"
+
+            return json.dumps({"error": {"type": error_type, "message": error_message}, "table": None, "text": f"Error during SQL operation: {error_message}"}, default=json_default)
+        
+        except SQLAlchemyError as db_err: # This might be hit if _execute_sql directly re-raises an SQLAlchemyError not wrapped in ValueError
             logger.error(f"{log_prefix}Database error during SQL execution: {db_err}", exc_info=True)
-            return json.dumps({"error": {"type": "DATABASE_ERROR", "message": f"Database execution error: {str(db_err)}"}, "table": None, "text": f"Error executing SQL due to database issue: {str(db_err)}"}, default=json_default)
+            
+            specific_detail = ""
+            if hasattr(db_err, 'orig') and db_err.orig is not None and hasattr(db_err.orig, 'pgerror') and db_err.orig.pgerror:
+                specific_detail = str(db_err.orig.pgerror).strip()
+            elif hasattr(db_err, 'orig') and db_err.orig is not None:
+                 specific_detail = str(db_err.orig).strip()
+            elif db_err.__cause__:
+                specific_detail = str(db_err.__cause__).strip()
+            else:
+                specific_detail = str(db_err).strip()
+            
+            specific_detail = re.sub(r"^\(<class '[^']*'>\)\\s*", "", specific_detail)
+            specific_detail = re.sub(r"^[A-Za-z_]*Error:\\s*", "", specific_detail)
+            specific_detail = specific_detail.replace('\\n', ' ').replace('\n', ' ')
+
+            error_message = f"Database execution error. Details: {specific_detail}"
+            error_type = "DATABASE_ERROR" 
+
+            lower_specific_detail = specific_detail.lower()
+            if "column" in lower_specific_detail and "does not exist" in lower_specific_detail:
+                error_type = "DATABASE_UNDEFINED_COLUMN_ERROR"
+            elif "syntax error" in lower_specific_detail:
+                error_type = "DATABASE_SYNTAX_ERROR"
+            elif "unique constraint" in lower_specific_detail or "duplicate key" in lower_specific_detail:
+                 error_type = "DATABASE_INTEGRITY_ERROR"
+            elif "division by zero" in lower_specific_detail:
+                 error_type = "DATABASE_NUMERIC_ERROR"
+            elif "invalid input" in lower_specific_detail and ("type" in lower_specific_detail or "syntax for type" in lower_specific_detail or "value too long for type" in lower_specific_detail):
+                 error_type = "DATABASE_TYPE_CONVERSION_ERROR"
+            elif "permission denied" in lower_specific_detail or "access denied" in lower_specific_detail:
+                error_type = "DATABASE_PERMISSION_ERROR"
+            elif "deadlock" in lower_specific_detail:
+                error_type = "DATABASE_DEADLOCK_ERROR"
+            elif "connection" in lower_specific_detail and not ("timeout" in lower_specific_detail): # Check not timeout
+                error_type = "DATABASE_CONNECTION_ERROR"
+                
+            return json.dumps({"error": {"type": error_type, "message": error_message}, "table": None, "text": f"Error executing SQL: {error_message}"}, default=json_default)
+        
         except Exception as e:
             logger.error(f"{log_prefix}Unexpected error in _arun: {e}", exc_info=True)
-            return json.dumps({"error": {"type": "TOOL_ERROR", "message": f"An unexpected error occurred in the SQL tool: {str(e)}"}, "table": None, "text": f"Unexpected tool error: {str(e)}"}, default=json_default)
+            error_message = f"An unexpected error occurred in the SQL tool: {str(e)}"
+            return json.dumps({"error": {"type": "TOOL_INTERNAL_ERROR", "message": error_message}, "table": None, "text": f"Unexpected tool error: {error_message}"}, default=json_default)
 
     # Synchronous _run for completeness, if BaseTool doesn't auto-generate from _arun
     # or if some other part of the system might try to call it synchronously.
