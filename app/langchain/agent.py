@@ -36,16 +36,11 @@ from app.langchain.tools.summary_tool import SummarySynthesizerTool
 from app.langchain.tools.hierarchy_resolver_tool import HierarchyNameResolverTool
 from app.schemas.chat import ChatData, ApiChartSpecification, TableData
 from app.langchain.charting import ChartSpecFinalInstruction, process_and_validate_chart_specs
-from app.prompts import AGENT_SYSTEM_PROMPT # Import from prompts
+from app.prompts import AGENT_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 usage_logger = logging.getLogger("usage") 
 
-
-# --- Helper Function to Get Schema String --- #
-def _format_column_description(col: Dict[str, Any]) -> str:
-    # ... (rest of _format_column_description - unchanged)
-    pass
 
 @functools.lru_cache(maxsize=4) # Add LRU cache decorator
 def _get_schema_string(db_name: str = "report_management") -> str:
@@ -106,7 +101,7 @@ class FinalApiResponseStructure(BaseModel):
     )
 
     # chart_specs list containing full specifications
-    chart_specs: List[ChartSpecFinalInstruction] = Field( # Uses imported ChartSpecFinalInstruction
+    chart_specs: List[ChartSpecFinalInstruction] = Field(
         default_factory=list,
         description="List of chart specifications to be included in the final API response. The LLM generates these directly when calling this tool."
     )
@@ -2145,7 +2140,7 @@ async def execute_with_retry(invocation_detail: Dict[str, Any]) -> Dict[str, Any
     final_llm_error_message = f"Tool '{tool_name}' failed. Error details: {detailed_error_content}"
     
     log_message_summary = f"Tool '{tool_name}' (ID: {tool_call_id}) failed. Type: {error_type_str}."
-    if attempt >= retries_left : # exhausted retries
+    if attempt >= retries_left : # Exhausted retries
         log_message_summary = f"Tool '{tool_name}' (ID: {tool_call_id}) failed after {retries_left + 1} attempts. Type: {error_type_str}."
     
     logger.error(f"{log_message_summary} Full Error: {str(last_exception)}", exc_info=True if getattr(settings, 'LOG_LEVEL', 'INFO').upper() == 'DEBUG' else False)
