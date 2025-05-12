@@ -263,17 +263,46 @@ def process_and_validate_chart_specs(
         is_pie_transformed = False
         is_summary_transformed = False
         
-        # --- START: MODIFIED LOGIC FOR SOURCE TABLE DETERMINATION ---
+        # --- MODIFIED LOGIC FOR SOURCE TABLE DETERMINATION ---
         source_table_for_processing: Optional[Dict[str, Any]] = None
         columns_from_source_table: List[str] = []
         rows_from_source_table: List[List[Any]] = []
 
         type_hint = getattr(spec, "type_hint", "bar").lower()
         llm_specified_y_cols = getattr(spec, 'y_columns', [])
+        source_table_idx_from_llm = getattr(spec, "source_table_index", None)
 
-        # Attempt to combine data for bar chart summary from multiple single-row tables
-        if type_hint == 'bar' and llm_specified_y_cols:
-            logger.debug(f"Chart '{spec_title}' (bar type with y_columns: {llm_specified_y_cols}): Checking for multi-table single-row summary pattern.")
+        # Step 1: Prioritize LLM's specified source_table_index if provided and valid
+        if source_table_idx_from_llm is not None:
+            logger.debug(f"Chart '{spec_title}': LLM specified source_table_index: {source_table_idx_from_llm}.")
+            if not (0 <= source_table_idx_from_llm < len(tables_from_state)):
+                failure_reason = f"Invalid source table index ({source_table_idx_from_llm}). LLM specified index out of bounds for {len(tables_from_state)} available tables."
+                valid_chart = False
+                logger.warning(f"Chart '{spec_title}': {failure_reason}")
+            else:
+                original_source_table = tables_from_state[source_table_idx_from_llm]
+                if not isinstance(original_source_table, dict) or "columns" not in original_source_table or "rows" not in original_source_table:
+                    failure_reason = f"Source table at LLM-specified index {source_table_idx_from_llm} has invalid format."
+                    valid_chart = False
+                    logger.warning(f"Chart '{spec_title}': {failure_reason}")
+                else:
+                    source_table_for_processing = original_source_table
+                    columns_from_source_table = source_table_for_processing.get("columns", [])
+                    rows_from_source_table = source_table_for_processing.get("rows", [])
+                    if not columns_from_source_table:
+                        failure_reason = f"Source table {source_table_idx_from_llm} (from LLM index) has no columns."
+                        valid_chart = False
+                        logger.warning(f"Chart '{spec_title}': {failure_reason}")
+                    else:
+                        logger.info(f"Chart '{spec_title}': Successfully using source table from LLM-specified index {source_table_idx_from_llm}.")
+        else:
+            logger.debug(f"Chart '{spec_title}': LLM did not specify source_table_index.")
+
+        # Step 2: Fallback for bar chart summary from multiple single-row tables
+        # This runs if source_table_for_processing is still None (LLM didn't provide a valid index)
+        # AND it's a bar chart with y_columns specified.
+        if valid_chart and source_table_for_processing is None and type_hint == 'bar' and llm_specified_y_cols:
+            logger.debug(f"Chart '{spec_title}' (bar type with y_columns: {llm_specified_y_cols}): LLM source_table_index not used or invalid. Attempting multi-table single-row summary combination as fallback.")
             combined_row_data: Dict[str, Any] = {}
             found_any_y_col_metric = False
 
@@ -291,60 +320,43 @@ def process_and_validate_chart_specs(
                             metric_idx = cols_of_this_table.index(y_col_name)
                             metric_value = row_of_this_table[metric_idx]
 
-                            # Ensure the metric value is numeric for a summary bar chart
                             if isinstance(metric_value, numbers.Number):
                                 combined_row_data[y_col_name] = metric_value
                                 found_this_metric = True
                                 found_any_y_col_metric = True
-                                logger.debug(f"Chart '{spec_title}': Found y_column '{y_col_name}' in table {table_idx} with value {metric_value}.")
-                                break # Found this y_col_name, move to the next one
+                                logger.debug(f"Chart '{spec_title}': Found y_column '{y_col_name}' in table {table_idx} (single-row summary) with value {metric_value}.")
+                                break 
                             else:
-                                logger.debug(f"Chart '{spec_title}': y_column '{y_col_name}' in table {table_idx} is not numeric ('{metric_value}'). Skipping.")
+                                logger.debug(f"Chart '{spec_title}': y_column '{y_col_name}' in table {table_idx} (single-row summary) is not numeric ('{metric_value}'). Skipping.")
                         except (ValueError, IndexError):
-                            # Should not happen if y_col_name is in columns, but defensive
-                            logger.warning(f"Error accessing y_column '{y_col_name}' from table {table_idx} despite checks.")
+                            logger.warning(f"Error accessing y_column '{y_col_name}' from table {table_idx} (single-row summary) despite checks.")
                             continue 
                 if not found_this_metric:
-                    logger.warning(f"Chart '{spec_title}': Specified y_column '{y_col_name}' not found or not numeric in any single-row table.")
+                    logger.warning(f"Chart '{spec_title}': Specified y_column '{y_col_name}' for multi-table summary not found or not numeric in any single-row table.")
 
             if found_any_y_col_metric and combined_row_data:
-                # Successfully combined metrics from potentially multiple tables
                 source_table_for_processing = {
                     "columns": list(combined_row_data.keys()),
                     "rows": [list(combined_row_data.values())],
-                    "metadata": {"source": "combined_single_row_summary"}
+                    "metadata": {"source": "combined_single_row_summary_fallback"}
                 }
                 columns_from_source_table = source_table_for_processing["columns"]
                 rows_from_source_table = source_table_for_processing["rows"]
-                logger.info(f"Chart '{spec_title}': Successfully created a combined single-row source table for summary bar chart with columns {columns_from_source_table}.")
+                logger.info(f"Chart '{spec_title}': Successfully created a combined single-row source table for summary bar chart (fallback). Columns: {columns_from_source_table}.")
             else:
-                logger.debug(f"Chart '{spec_title}': Did not combine metrics for summary bar. Will use specified source_table_index if valid.")
-
-        # Fallback or default: use the specified source_table_index if combination didn't happen or isn't applicable
-        if source_table_for_processing is None:
-            source_table_idx = getattr(spec, "source_table_index", None)
-            if source_table_idx is None:
-                failure_reason = "Missing source table index and could not combine summary data."
-                valid_chart = False
-            elif not (0 <= source_table_idx < len(tables_from_state)):
-                failure_reason = f"Invalid source table index ({source_table_idx})."
-                valid_chart = False
-            else:
-                original_source_table = tables_from_state[source_table_idx]
-                if not isinstance(original_source_table, dict) or "columns" not in original_source_table or "rows" not in original_source_table:
-                    failure_reason = f"Source table {source_table_idx} has invalid format."
-                    valid_chart = False
-                else:
-                    source_table_for_processing = original_source_table
-                    columns_from_source_table = source_table_for_processing.get("columns", [])
-                    rows_from_source_table = source_table_for_processing.get("rows", [])
-                    if not columns_from_source_table:
-                        failure_reason = f"Source table {source_table_idx} (from index) has no columns."
-                        valid_chart = False
+                logger.debug(f"Chart '{spec_title}': Fallback to combine metrics for summary bar chart failed or yielded no numeric data.")
+                # If still no source_table_for_processing, and valid_chart is true, this means LLM didn't provide an index
+                # and the fallback also failed. This will be caught by the next check.
+                if valid_chart and source_table_for_processing is None: # Check again as valid_chart might have been flipped if LLM index was initially invalid
+                    failure_reason = "Missing valid source_table_index and multi-table summary combination fallback also failed."
+                    valid_chart = False # Mark as invalid if no table could be determined/created
+                    logger.warning(f"Chart '{spec_title}': {failure_reason}")
         
-        if not valid_chart or source_table_for_processing is None:
-            logger.warning(f"Chart spec '{spec_title}' failed basic validation or source table setup: {failure_reason}")
-            filtered_out_info.append({"title": spec_title, "reason": failure_reason or "Source table could not be determined."})
+        # Final check: if no source table could be determined by now, the chart cannot proceed.
+        if not valid_chart or source_table_for_processing is None: # valid_chart might be False from LLM index check
+            final_reason = failure_reason if failure_reason else "Source table could not be determined or was invalid."
+            logger.warning(f"Chart spec '{spec_title}' failed: {final_reason} Cannot proceed with this chart.")
+            filtered_out_info.append({"title": spec_title, "reason": final_reason})
             continue
         # --- END: MODIFIED LOGIC FOR SOURCE TABLE DETERMINATION ---
 
@@ -390,34 +402,10 @@ def process_and_validate_chart_specs(
                  else:
                      logger.warning(f"Pie chart '{spec_title}' transformation from wide summary failed. Chart may be invalid.")
             
-            elif not is_summary_transformed and not is_pie_transformed and type_hint in ['bar', 'line'] and llm_specified_color_col and len(llm_specified_y_cols) > 1:
-                log_prefix = f"Multi-series '{spec_title}' (Inferred from {len(llm_specified_y_cols)} y_columns with explicit color_column)"
-                logger.info(f"{log_prefix}: Applying wide-to-long transformation. Y-columns: {llm_specified_y_cols}")
-
-                if not llm_specified_x_col or llm_specified_x_col not in columns_from_source_table:
-                    failure_reason = f"{log_prefix} failed: x_column '{llm_specified_x_col}' (specified by LLM) not found in original source table columns {columns_from_source_table}."
-                    valid_chart = False
-                else:
-                    for y_col_check in llm_specified_y_cols:
-                        if y_col_check not in columns_from_source_table:
-                            failure_reason = f"{log_prefix} failed: y_column '{y_col_check}' (specified by LLM) not found in original source table columns {columns_from_source_table}."
-                            valid_chart = False
-                            break
-                    if not valid_chart: # If any y_column was invalid
-                        pass # Failure reason already set
-                    else:
-                        transformed_data = _transform_wide_to_long(source_table_for_processing, llm_specified_x_col, llm_specified_y_cols)
-                        if transformed_data.get("metadata", {}).get("transformed_from_wide_multi_y"):
-                            data_for_chart = transformed_data
-                            columns_to_validate = transformed_data["columns"]
-                            is_multi_metric = True # Mark as multi-metric
-                            logger.debug(f"{log_prefix}: Transformation successful. New columns for validation: {columns_to_validate}")
-                        else:
-                            failure_reason = f"{log_prefix}: Data transformation using _transform_wide_to_long failed. Original columns: {columns_from_source_table}, ID col: {llm_specified_x_col}, Y-cols: {llm_specified_y_cols}."
-                            valid_chart = False
-            
-            elif not is_summary_transformed and not is_pie_transformed and not is_multi_metric and type_hint in ['bar', 'line'] and len(llm_specified_y_cols) > 1:
-                log_prefix = f"Multi-series '{spec_title}' (Multiple y_columns: {len(llm_specified_y_cols)} without explicit color_column)"
+            elif not is_summary_transformed and not is_pie_transformed and type_hint in ['bar', 'line'] and len(llm_specified_y_cols) > 1:
+                # This is the primary path for multi-series charts from multiple y_columns.
+                # Assumes LLM omitted color_column as per prompt guidance.
+                log_prefix = f"Multi-series '{spec_title}' (Multiple y_columns: {len(llm_specified_y_cols)})"
                 logger.info(f"{log_prefix}: Applying standard multi-series transformation. Y-columns: {llm_specified_y_cols}")
                 
                 if not llm_specified_x_col or llm_specified_x_col not in columns_from_source_table:

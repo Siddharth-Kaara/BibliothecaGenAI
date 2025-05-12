@@ -403,7 +403,6 @@ class SummarySynthesizerTool(BaseTool):
         )
         # --- End System Message Update ---
         
-        logger.debug(f"{log_prefix}LLM System Message for SQL Generation:\n{system_message}") # Log updated message
         logger.debug(f"{log_prefix}LLM Human Message (Query Description): {query_description}")
         
         try:
@@ -573,8 +572,13 @@ class SummarySynthesizerTool(BaseTool):
             # Generate SQL query with parameter placeholders
             sql, params = await self._generate_sql_and_params(description, resolved_location_map)
             
+            # Basic SQL syntax validation to catch common errors
+            validated_sql = self._validate_sql_syntax(sql, description)
+            if validated_sql != sql:
+                logger.info(f"{log_prefix}SQL syntax automatically corrected for query: '{description}'")
+                sql = validated_sql
+            
             # Execute SQL using the injected SQLExecutionTool instance
-            # Use self._sql_tool instead of the passed parameter
             result_json_str = await self._sql_tool.ainvoke({
                 "sql": sql,
                 "params": params
@@ -615,15 +619,62 @@ class SummarySynthesizerTool(BaseTool):
             # Catch unexpected errors during the process
             logger.error(f"{log_prefix}Unexpected error in '{description}': {e}", exc_info=True)
             raise ValueError(f"Unexpected Error: {e.__class__.__name__}: {str(e)}")
-    
+            
+    def _validate_sql_syntax(self, sql: str, description: str) -> str:
+        """
+        Validate and attempt to fix common SQL syntax errors.
+        
+        Args:
+            sql: The SQL query string to validate
+            description: Description of the query for logging context
+            
+        Returns:
+            Corrected SQL query string
+        """
+        log_prefix = f"[Org: {self.organization_id}] [SummaryTool] "
+        corrected_sql = sql
+        
+        # Check for unbalanced parentheses
+        open_count = sql.count('(')
+        close_count = sql.count(')')
+        
+        if open_count > close_count:
+            # Missing closing parentheses
+            corrected_sql += ')' * (open_count - close_count)
+            logger.warning(f"{log_prefix}Fixed {open_count - close_count} missing closing parentheses in query: '{description}'")
+        elif close_count > open_count:
+            # This is trickier to fix automatically and might require more context
+            # For now, just log the issue
+            logger.warning(f"{log_prefix}Possible syntax error: More closing than opening parentheses in query: '{description}'")
+        
+        # Check for common SQL syntax issues with WHERE clauses followed immediately by LIMIT
+        if " WHERE " in corrected_sql.upper():
+            # Find the position of WHERE
+            where_pos = corrected_sql.upper().find(" WHERE ")
+            
+            # Check for unclosed WHERE conditions before LIMIT
+            if " LIMIT " in corrected_sql.upper():
+                limit_pos = corrected_sql.upper().find(" LIMIT ")
+                
+                # If LIMIT comes after WHERE, examine the text in between
+                if limit_pos > where_pos:
+                    where_to_limit = corrected_sql[where_pos:limit_pos]
+                    
+                    # Check if WHERE condition is properly terminated
+                    if "(" in where_to_limit and ")" not in where_to_limit:
+                        # Add missing closing parenthesis before LIMIT
+                        corrected_sql = corrected_sql[:limit_pos] + ")" + corrected_sql[limit_pos:]
+                        logger.warning(f"{log_prefix}Added missing parenthesis before LIMIT in query: '{description}'")
+        
+        return corrected_sql
     
     async def _resolve_and_inject_names(self, subquery_results: List[SubqueryResult]) -> List[SubqueryResult]:
         """
-        Resolves hierarchy IDs found in successful subquery results to names using HierarchyNameResolverTool.
-        Efficiently injects location names into results for better readability.
+        Resolves hierarchy IDs found in successful subquery results to names by querying the database directly.
+        Efficiently injects location names and parent names into results for better readability.
         """
         log_prefix = f"[Org: {self.organization_id}] [SummaryTool] "
-        logger.debug(f"{log_prefix}Resolving hierarchy IDs to names.")
+        logger.debug(f"{log_prefix}Resolving hierarchy IDs to names via direct DB query.")
         
         ids_to_resolve = set()
         results_with_id_col = [] # Store indices of results containing 'hierarchyId'
@@ -633,57 +684,71 @@ class SummarySynthesizerTool(BaseTool):
             if not result.successful or not isinstance(result.result, dict): # result.result is now the table dict
                 continue
                 
-            columns = result.result.get("columns", []) # Access columns directly from result.result
-            rows = result.result.get("rows", [])       # Access rows directly from result.result
+            columns = result.result.get("columns", [])
+            rows = result.result.get("rows", [])
             
-            # Find the index of the 'hierarchyId' column
             hierarchy_id_index = -1
             if "hierarchyId" in columns:
                 hierarchy_id_index = columns.index("hierarchyId")
             
-            # Only process if the column exists and we have rows
             if hierarchy_id_index != -1 and rows:
                 results_with_id_col.append(idx)
                 for row in rows:
                     if hierarchy_id_index < len(row): # Check index bounds
                         hierarchy_id = row[hierarchy_id_index] # Access by index
-                        if hierarchy_id:
-                            ids_to_resolve.add(str(hierarchy_id))
+                        if hierarchy_id: # Ensure hierarchy_id is not None or empty
+                            ids_to_resolve.add(str(hierarchy_id)) # Convert to string for consistency
         
-        # If no IDs to resolve, return the original results unchanged
         if not ids_to_resolve:
             logger.debug(f"{log_prefix}No hierarchy IDs found to resolve.")
             return subquery_results
             
-        logger.debug(f"{log_prefix}Found {len(ids_to_resolve)} unique hierarchy IDs to resolve.")
+        logger.debug(f"{log_prefix}Found {len(ids_to_resolve)} unique hierarchy IDs to resolve: {list(ids_to_resolve)[:10]}...") # Log a sample
         
-        # Step 2: Resolve IDs to names in a single batch call
-        # Use the injected hierarchy resolver instance
-        # resolver = HierarchyNameResolverTool(organization_id=self.organization_id) # REMOVED
         id_name_map = {}
-        
+        # Step 2: Resolve IDs to names and parent names by querying the database
         try:
-            resolution_result = await self._hierarchy_resolver.ainvoke({"name_candidates": list(ids_to_resolve)})
-            resolution_data = resolution_result.get("resolution_results", {})
-            
-            # Build lookup map of ID → Name information
-            for hierarchy_id, result_info in resolution_data.items():
-                if result_info.get("status") == "found":
-                    id_name_map[hierarchy_id] = {
-                        "displayName": result_info.get("name"),
-                        "parentName": result_info.get("parent_name")
+            db_to_use = "report_management" 
+
+            async with get_async_db_connection(db_to_use) as conn:
+                # Use Postgres idiom for array parameterization with asyncpg: = ANY(:param)
+                sql_query_str = """
+                    SELECT 
+                        hc.id AS "hierarchy_id", 
+                        hc.name AS "hierarchy_name",
+                        parent_hc.name AS "parent_name"
+                    FROM "hierarchyCaches" hc
+                    LEFT JOIN "hierarchyCaches" parent_hc 
+                        ON hc."parentId" = parent_hc.id 
+                        AND parent_hc."deletedAt" IS NULL
+                    WHERE hc.id = ANY(:ids_to_resolve_list)
+                      AND hc."deletedAt" IS NULL
+                """
+                sql_query = text(sql_query_str)
+                # Pass a list, not a tuple, for ANY() in Postgres/asyncpg
+                params = {
+                    "ids_to_resolve_list": list(ids_to_resolve)
+                }
+                
+                db_result = await conn.execute(sql_query, params)
+                mappings = db_result.mappings().all()
+
+                for row_mapping in mappings:
+                    hierarchy_id_str = str(row_mapping["hierarchy_id"])
+                    id_name_map[hierarchy_id_str] = {
+                        "displayName": row_mapping["hierarchy_name"],
+                        "parentName": row_mapping["parent_name"] 
                     }
+                logger.info(f"{log_prefix}Successfully resolved {len(id_name_map)} IDs out of {len(ids_to_resolve)} requested from DB.")
+
         except Exception as e:
-            logger.warning(f"{log_prefix}Error resolving hierarchy IDs: {e}", exc_info=False)
-            # Continue with what we have (might be empty)
+            logger.error(f"{log_prefix}Error during direct DB resolution of hierarchy IDs: {e}", exc_info=True)
         
-        # If no names were resolved, return original results
-        if not id_name_map:
-            logger.debug(f"{log_prefix}No names could be resolved for the hierarchy IDs.")
-            return subquery_results
-            
+        if not id_name_map and ids_to_resolve: 
+            logger.warning(f"{log_prefix}No names could be resolved for the {len(ids_to_resolve)} hierarchy IDs via direct DB query. Location names might be missing in the summary.")
+        
         # Step 3: Inject resolved names into result tables
-        updated_results = list(subquery_results) # Create a copy
+        updated_results = list(subquery_results)
         
         # Column names for location info
         name_col = "Location Name"

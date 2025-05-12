@@ -15,6 +15,7 @@ import copy
 import sqlparse 
 from sqlalchemy import inspect, MetaData, text
 from fastapi import HTTPException
+import time 
 
 from app.db.connection import get_async_db_engine
 from app.db.schema_definitions import SCHEMA_DEFINITIONS
@@ -136,6 +137,7 @@ def analyze_results_node(state: AgentState) -> Dict[str, Any]:
        Determines missing entities by checking if queries filtering by specific IDs returned rows *containing* those IDs.
        Generates context for the LLM about missing data.
     """
+    start_time = time.perf_counter() # Start timer
     request_id = state.get("request_id")
     logger.debug(f"[AnalyzeResultsNode-Final] Entering node...")
     
@@ -317,6 +319,9 @@ def analyze_results_node(state: AgentState) -> Dict[str, Any]:
     # --- Generate final context --- # 
     if not all_expected_ids:
         logger.debug("[AnalyzeResultsNode-Final] No resolved entity IDs were used in any filters.")
+        # --- Add timing log before return ---
+        duration = time.perf_counter() - start_time
+        logger.info(f"[AnalyzeResultsNode-Final] Node execution time: {duration:.4f} seconds")
         return {"missing_entities_context": None}
 
     logger.debug(f"[AnalyzeResultsNode-Final] Total Expected IDs across all filters: {all_expected_ids}")
@@ -340,6 +345,9 @@ def analyze_results_node(state: AgentState) -> Dict[str, Any]:
     else:
         logger.debug("[AnalyzeResultsNode-Final] No missing entity IDs detected.")
 
+    # --- Add timing log before return ---
+    duration = time.perf_counter() - start_time
+    logger.info(f"[AnalyzeResultsNode-Final] Node execution time: {duration:.4f} seconds")
     return {"missing_entities_context": missing_entities_context}
 # --- END Analysis Node ---
 
@@ -469,6 +477,7 @@ def agent_node(state: AgentState, llm_with_structured_output):
     """Invokes the LLM ONCE to decide the next action or final response structure.
        If the LLM returns a plain AIMessage, it coerces it into FinalApiResponseStructure.
     """
+    start_time = time.perf_counter() # Start timer
     request_id = state.get("request_id")
     logger.debug(f"[AgentNode] Entering agent node (single invocation logic)...")
 
@@ -627,15 +636,22 @@ def agent_node(state: AgentState, llm_with_structured_output):
                         num_results = len(state.get('structured_results', []))
                         llm_include_tables = valid_args["include_tables"]
                         
-                        # --- START VALIDATION ---
+                        # --- START VALIDATION (Revised for stricter handling) ---
                         if not isinstance(llm_include_tables, list):
-                            logger.warning(f"[AgentNode] 'include_tables' was not a list ({type(llm_include_tables).__name__}). Defaulting to all False for {num_results} result(s).")
+                            logger.warning(f"[AgentNode] 'include_tables' was not a list (type: {type(llm_include_tables).__name__}). Defaulting to all False for {num_results} result(s).")
                             valid_args["include_tables"] = [False] * num_results
                         elif len(llm_include_tables) != num_results:
-                            logger.warning(f"[AgentNode] 'include_tables' length mismatch ({len(llm_include_tables)}) vs results count ({num_results}). Defaulting to all False.")
+                            # ANY length mismatch (and it is a list) defaults to all False for safety.
+                            logger.warning(f"[AgentNode] 'include_tables' length mismatch. LLM provided {len(llm_include_tables)} flags, but {num_results} structured results exist. Defaulting to all False to ensure no unintended tables are shown.")
                             valid_args["include_tables"] = [False] * num_results
-                        else:
-                            # Ensure all elements are boolean, default to False if not convertible
+                        elif num_results == 0: # Correctly handles the case where there are no results, include_tables should be empty
+                            # This condition implies len(llm_include_tables) == 0 was also true to reach here due to the preceding elif.
+                            logger.debug(f"[AgentNode] No structured results exist (num_results is 0) and LLM provided empty list for 'include_tables'. Setting to an empty list.")
+                            valid_args["include_tables"] = []
+                        else: 
+                            # This means: isinstance is list, length matches num_results, AND num_results > 0.
+                            # This is the ONLY case where we proceed to use the LLM's flags.
+                            logger.debug(f"[AgentNode] 'include_tables' is a list of correct length ({num_results}). Proceeding with flag validation.")
                             validated_flags = []
                             for i, flag in enumerate(llm_include_tables):
                                 try:
@@ -827,6 +843,9 @@ def agent_node(state: AgentState, llm_with_structured_output):
     # If operational calls were identified and a final_structure was NOT set, they remain in return_dict["messages"][0].tool_calls
     logger.debug(f"[AgentNode] Exiting agent node. Final Structure Set: {final_structure is not None}. Proceeding Tool Calls in Message History: {len(return_dict['messages'][0].tool_calls) if return_dict['messages'] and isinstance(return_dict['messages'][0], AIMessage) else 0}")
     logger.debug(f"[AgentNode] Exiting agent node. Final Structure Set: {final_structure is not None}. Retry Count: {return_dict['sql_security_retry_count']}")
+    # --- Add timing log before return ---
+    duration = time.perf_counter() - start_time
+    logger.info(f"[AgentNode] Node execution time: {duration:.4f} seconds")
     return return_dict
 
 
@@ -1190,6 +1209,7 @@ def _apply_resolved_ids_to_sql_args(sql: str, params: Dict[str, Any], resolved_m
 
 # --- Tool Node Handler ---
 async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[str, Any]:
+    start_time = time.perf_counter() # Start timer
     request_id = state.get("request_id")
     logger.debug(f"[ToolsNode] Entering tool handler.")
     last_message = state["messages"][-1] if state["messages"] else None
@@ -1461,7 +1481,7 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
     # Prepare the dictionary for updating the state
     update_dict = {
         "messages": tool_execution_results, # These are ToolMessage objects for LangGraph
-        "structured_results": state.get("structured_results", []) + temp_structured_results, # Append new structured results
+        "structured_results": temp_structured_results, # Report only new structured results from this node's execution
         "failure_patterns": updated_failure_patterns,
         "recovery_guidance": current_recovery_guidance # Will be None if no new guidance
     }
@@ -1470,21 +1490,68 @@ async def async_tools_node_handler(state: AgentState, tools: List[Any]) -> Dict[
         update_dict["resolved_location_map"] = final_resolved_map
 
     logger.info(f"[ToolsNode] Final update_dict keys before returning: {list(update_dict.keys())}")
+    # --- Add timing log before return ---
+    duration = time.perf_counter() - start_time
+    logger.info(f"[ToolsNode] Node execution time: {duration:.4f} seconds")
     return update_dict
 
 def _is_retryable_error(error: Exception) -> bool:
-    """Determine if an error should be retried."""
+    """Determine if an error should be retried.
+       Excludes common non-transient SQL errors.
+    """
     error_str = str(error).lower()
-    if any(term in error_str for term in [
-        "timeout", "connection", "network", "temporarily",
-        "unavailable", "service", "busy", "rate limit",
-        "too many requests", "429", "503", "504"
-    ]):
+
+    # --- START: Explicitly NON-retryable SQL/DB error patterns ---
+    non_retryable_db_patterns = [
+        "syntax error",                     # General SQL syntax errors
+        "undefined column",                 # Column does not exist
+        "relation aint not exist",             # Table or view does not exist (PostgreSQL)
+        "no such table",                    # Table does not exist (SQLite, MySQL)
+        "invalid column name",              # SQL Server, Oracle
+        "object name .* not found",         # General object not found
+        "ambiguous column name",            # Ambiguous column reference
+        "permission denied for table",      # Permissions issue (non-transient)
+        "permission denied for schema",     # Permissions issue (non-transient)
+        "permission denied for sequence",   # Permissions issue (non-transient)
+        "authentication failed for user",   # DB Auth issues (config error, not transient)
+        "cannot connect to server",         # Often persistent if config is wrong, but could be transient (handled by general connection error below)
+        "violates not-null constraint",     # Data integrity issue
+        "violates unique constraint",       # Data integrity issue
+        "violates foreign key constraint",  # Data integrity issue
+        "division by zero"                  # SQL execution error (logical, not transient)
+    ]
+    if any(term in error_str for term in non_retryable_db_patterns):
+        # Check if the error is from a known DB exception type to be more specific
+        # This requires knowing the exception types your DB driver raises, e.g., for psycopg2:
+        # from psycopg2 import errors
+        # if isinstance(error, (errors.SyntaxError, errors.UndefinedColumn, errors.UndefinedTable, errors.InsufficientPrivilege)):
+        #     return False
+        # For now, string matching is used as a general approach.
+        logger.debug(f"[_is_retryable_error] Detected non-retryable DB error pattern: {error_str[:100]}...")
+        return False
+    # --- END: Explicitly NON-retryable SQL/DB error patterns ---
+
+    # --- START: General retryable error patterns (network, timeouts, rate limits) ---
+    retryable_patterns = [
+        "timeout", "connection refused", "connection reset by peer", 
+        "network is unreachable", "host is down", "service unavailable",
+        "temporarily unavailable", "service is busy", "rate limit",
+        "too many requests", "429", "502", "503", "504"
+        # "connection error" # too generic, might catch persistent config issues if not careful
+    ]
+    if any(term in error_str for term in retryable_patterns):
+        logger.debug(f"[_is_retryable_error] Detected retryable pattern: {error_str[:100]}...")
         return True
-    if isinstance(error, (TimeoutError, ConnectionError)): # Add specific types if needed
+    # --- END: General retryable error patterns ---
+
+    # --- START: Specific Exception Types that are often retryable ---
+    if isinstance(error, (TimeoutError, ConnectionError, APITimeoutError, APIConnectionError, RateLimitError)):
+        logger.debug(f"[_is_retryable_error] Detected retryable exception type: {type(error).__name__}")
         return True
-    # Add specific API error codes from Azure OpenAI if known
-    # e.g., if "408" in error_str or isinstance(error, SpecificAzureError)
+    # --- END: Specific Exception Types ---
+
+    # Default: If not explicitly non-retryable or retryable by pattern/type, assume not retryable for safety.
+    logger.debug(f"[_is_retryable_error] Error did not match any specific retryable/non-retryable patterns/types. Defaulting to non-retryable. Error: {error_str[:100]}...")
     return False
 
 # --- Conditional Edge Logic --- #
@@ -2105,25 +2172,39 @@ async def execute_with_retry(invocation_detail: Dict[str, Any]) -> Dict[str, Any
     # Limit depth to avoid infinite loops in rare cases, though __cause__ chain should be finite
     # Based on logs, the direct __cause__ of ValueError from sql_tool is the SQLAlchemy error.
     potential_cause = getattr(current_exception_for_details, '__cause__', None)
+    specific_cause_message = None
     if potential_cause:
         # Attempt to get a string representation of the cause.
         # SQLAlchemy errors often have good string representations.
         specific_cause_message = str(potential_cause)
-        detailed_error_content = specific_cause_message # Prioritize cause message
+        # If the specific_cause_message is too generic (e.g. just "ProgrammingError"), 
+        # prefer the original exception's message if it's more descriptive.
+        if specific_cause_message and not (len(str(last_exception)) > len(specific_cause_message) + 20 and error_type_str != type(potential_cause).__name__ ) :
+            detailed_error_content = specific_cause_message # Prioritize cause message if it seems more specific or is the main error string
+        else:
+            detailed_error_content = str(last_exception) # Fallback to original if cause is too generic or less informative
 
         # Refine error type based on the cause
         cause_type_name = type(potential_cause).__name__
-        if "UndefinedColumnError" in cause_type_name or \
+        # Check for common SQLAlchemy or DB driver error attributes like 'pgcode' for PostgreSQL
+        # pgcode = getattr(potential_cause, 'pgcode', None)
+        # if pgcode: # Example for PostgreSQL error codes
+        #     # from psycopg2 import errors
+        #     # if pgcode == errors.UNDEFINED_COLUMN.pgcode: error_type_str = "DATABASE_UNDEFINED_COLUMN_ERROR"
+        #     pass # Add more specific pgcode mappings if needed
+
+        if "UndefinedColumn" in cause_type_name or \
            ("column" in detailed_error_content.lower() and "does not exist" in detailed_error_content.lower()):
             error_type_str = "DATABASE_UNDEFINED_COLUMN_ERROR"
         elif "ProgrammingError" in cause_type_name: # Catches other SQL programming issues
-            error_type_str = "DATABASE_PROGRAMMING_ERROR"
+            # Ensure it's not a more specific type we've already caught
+            if error_type_str == "TOOL_EXECUTION_FAILED": error_type_str = "DATABASE_PROGRAMMING_ERROR"
         elif "SyntaxError" in cause_type_name or "syntax error" in detailed_error_content.lower():
              error_type_str = "DATABASE_SYNTAX_ERROR"
+        elif "IntegrityError" in cause_type_name: # e.g. unique constraint, foreign key
+             error_type_str = "DATABASE_INTEGRITY_ERROR"
         # Add more specific SQLAlchemy or DB error types as needed
-
-    # If not overridden by a more specific DB error type, check for other common types
-    if error_type_str == "TOOL_EXECUTION_FAILED":
+    else: # No __cause__, use the original exception directly for type checking
         if isinstance(last_exception, HTTPException): # from FastAPI, not pydantic.errors
             error_type_str = "HTTP_EXCEPTION_IN_TOOL"
         elif isinstance(last_exception, ValidationError): # from Pydantic
@@ -2134,6 +2215,13 @@ async def execute_with_retry(invocation_detail: Dict[str, Any]) -> Dict[str, Any
             error_type_str = "CONNECTION_ERROR_IN_TOOL"
         elif isinstance(last_exception, RateLimitError):
             error_type_str = "RATE_LIMIT_ERROR_IN_TOOL"
+
+    # If error_type_str is still the default, and we haven't refined it from a cause,
+    # make one last check on the original exception type for common non-DB issues.
+    if error_type_str == "TOOL_EXECUTION_FAILED" and not potential_cause:
+        if isinstance(last_exception, HTTPException): error_type_str = "HTTP_EXCEPTION_IN_TOOL"
+        elif isinstance(last_exception, ValidationError): error_type_str = "VALIDATION_ERROR_IN_TOOL"
+        # ... (repeat other common non-DB exception type checks if necessary)
     # --- End Enhanced Error Message Extraction ---
 
     # Prepare messages for logging and for the LLM
