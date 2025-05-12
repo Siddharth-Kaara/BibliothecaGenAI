@@ -22,7 +22,7 @@ COPY ./app /app/app
 # Removed static copy
 
 # Stage 2: Final Stage - Copies application code and dependencies from builder
-FROM python:3.12.9-slim-bookworm
+FROM builder
 
 # Set working directory
 WORKDIR /app
@@ -64,7 +64,7 @@ RUN chown -R appuser:appgroup /app /home/appuser/.local # Give ownership to app 
 USER appuser
 
 # Expose the port the application runs on internally
-EXPOSE 80
+EXPOSE 8080
 
 # Command to run the application using the startup script
 CMD ["/app/startup.sh"] 

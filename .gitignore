@@ -8,3 +8,8 @@ README.md
 __pycache__/
 cost_calculator.html
 .vscode
+docker.sh
+nginx.conf
+.env
+.env.*
+docker-compose.yaml

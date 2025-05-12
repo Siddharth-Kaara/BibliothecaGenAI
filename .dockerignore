@@ -13,7 +13,7 @@ venv/
 .venv/
 
 # Environment files
-.env*
+# .env.*
 
 # IDE files
 .vscode/
@@ -38,4 +38,4 @@ Thumbs.db
 # Local tools/files
 cost_calculator.html
 /logs/
-/docs/ 
+/docs/

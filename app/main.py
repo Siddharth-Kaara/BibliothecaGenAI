@@ -31,6 +31,7 @@ origins = [
     "http://localhost:8000",  # Allow the API origin itself (for Swagger UI etc.)
     "http://127.0.0.1:8080", # Explicit IP addresses can also be needed sometimes
     "http://127.0.0.1:8000",
+    "*"
 ]
 # ------------------------
 
@@ -77,18 +78,18 @@ app.add_middleware(
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # Include routers
-app.include_router(chat.router, prefix="/api/v1", tags=["chat"])
-app.include_router(health.router, prefix="/api/v1", tags=["health"])
+app.include_router(chat.router, prefix="/genai/v1", tags=["chat"])
+app.include_router(health.router, prefix="/genai/v1", tags=["health"])
 
 logger.info("FastAPI app created and configured.")
 
 if __name__ == "__main__":
     # Ensure logging is setup before uvicorn potentially takes over
-    logger.info(f"Starting Uvicorn server. Host=0.0.0.0, Port=8000, Reload={settings.DEBUG}")
+    logger.info(f"Starting Uvicorn server. Host=0.0.0.0, Port=8080, Reload={settings.DEBUG}")
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
-        port=8000,
+        port=8080,
         reload=settings.DEBUG,
         log_level=settings.LOG_LEVEL.lower(), # Use level from settings
         # Use default Uvicorn log config unless specified otherwise

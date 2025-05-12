@@ -10,7 +10,7 @@ load_dotenv()
 class Settings(BaseSettings):
     # API settings
     PROJECT_NAME: str = "Bibliotheca Chatbot API"
-    API_V1_STR: str = "/api/v1"
+    API_V1_STR: str = "/genai/v1"
     DEBUG: bool = False
     
     # CORS
