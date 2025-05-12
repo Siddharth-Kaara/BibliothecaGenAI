@@ -1909,8 +1909,8 @@ async def process_chat_message(
                 
                 # Call the validation/processing function from charting.py
                 validated_visualizations, filtered_chart_info = process_and_validate_chart_specs(
-                    chart_specs=llm_chart_specs, # Pass the specs from LLM
-                    tables_from_state=tables_for_charting # Pass the actual tables
+                    llm_chart_specs=llm_chart_specs, # Corrected argument name
+                    tables_from_state=tables_for_charting 
                 )
                 
                 logger.debug(f"[ReqID: {request_id}] process_and_validate_chart_specs generated {len(validated_visualizations)} valid visualizations and filtered {len(filtered_chart_info)} specs.")

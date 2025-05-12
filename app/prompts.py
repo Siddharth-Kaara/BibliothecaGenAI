@@ -274,6 +274,16 @@ Available Tools:
             -   Example Spec (Multi-Line Chart):
                 `x_column: "Date", y_columns: ["Total Borrows", "Total Returns"], color_column: null`
                 (Backend will process this to effectively use `y_column: "Value"`, `color_column: "Metric"`)
+            
+            -   **MULTI-SOURCE CHARTS:** When you want to create a chart that displays data from two different tables (e.g., borrows from table 0 and footfall from table 1), and the user desires a single comparative visualization:
+                - Each y_column must come from the same source table specified by `source_table_index`. 
+                - Do not specify columns from other tables in your `y_columns` list.
+                - Instead, create **separate chart specifications** for each data source. 
+                - **CRITICAL FOR COMPARISON:** If these separate charts are intended for comparison and share a common axis (e.g., time), ensure you use the **exact same `x_column` name** in all related chart specifications (e.g., use "Hour" for both, not "Hour" for one and "Time Period" for another if they mean the same thing).
+                - Example:
+                  - Chart 1: `source_table_index: 0, x_column: "Hour", y_columns: ["Average Borrows"], type_hint: "line"`
+                  - Chart 2: `source_table_index: 1, x_column: "Hour", y_columns: ["Total Entries"], type_hint: "line"`
+                - This approach ensures each chart specification references columns that actually exist in its source table. The backend will attempt to merge compatible charts into a single visualization if appropriate. If not mergeable, the frontend can display them separately.
 
     f. **Consistency Check (MANDATORY):** Before finalizing the call, **verify that:**
         * `source_table_index` is valid for `state['tables']`.
@@ -287,10 +297,11 @@ Available Tools:
         3.  **Columns EXIST in Source?** (Do `x_column` and all names in `y_columns` **ACTUALLY EXIST** in the `columns` list of the source table? Does a non-null `color_column`, if specified, also exist?)
         4.  **Pie Chart Rules?** (If `type_hint` is 'pie', are `y_columns` (singular), `x_column` appropriate for 2-column data & `color_column` is null?)
         5.  **Multi-Metric from `y_columns`?** (If `type_hint` is 'bar'/'line' and `y_columns` has multiple entries, are `x_column` and all `y_columns` valid source columns, and `color_column` is null/omitted?)
+        6.  **Multi-Source Check:** Have I verified that each chart specification only references columns from its own source table? If I need data from multiple tables, have I created separate chart specifications for each table?
         **AND for the overall `chart_specs` list:**
-        6.  **Multiple User Requests Handled?** (If the user explicitly asked for multiple distinct charts in their query (e.g., "a bar chart of X AND a line graph of Y"), have I generated a `ChartSpecFinalInstruction` for EACH EXPLICITLY requested chart for which relevant data exists? This is mandatory for explicit requests, even if data seems simple.)
-        7.  **Chart Requested & Feasible?** (If the current user query requested a chart, and Guideline #4 (explicit color request) does NOT apply, and relevant data IS available in `state['structured_results']`, have I populated `chart_specs`? It is an error to omit `chart_specs` in this scenario.)
-        **ACTION:** If any check fails, FIX the `ChartSpecFinalInstruction` or OMIT it (unless check #7 indicates a required chart is missing). If check #6 or #7 fails due to a missing but required chart, **you MUST add the missing `ChartSpecFinalInstruction`(s)** if data allows and the chart was explicitly requested and not blocked by other rules.
+        7.  **Multiple User Requests Handled?** (If the user explicitly asked for multiple distinct charts in their query (e.g., "a bar chart of X AND a line graph of Y"), have I generated a `ChartSpecFinalInstruction` for EACH EXPLICITLY requested chart for which relevant data exists? This is mandatory for explicit requests, even if data seems simple.)
+        8.  **Chart Requested & Feasible?** (If the current user query requested a chart, and Guideline #4 (explicit color request) does NOT apply, and relevant data IS available in `state['structured_results']`, have I populated `chart_specs`? It is an error to omit `chart_specs` in this scenario.)
+        **ACTION:** If any check fails, FIX the `ChartSpecFinalInstruction` or OMIT it (unless check #7 or #8 indicates a required chart is missing). If check #7 or #8 fails due to a missing but required chart, **you MUST add the missing `ChartSpecFinalInstruction`(s)** if data allows and the chart was explicitly requested and not blocked by other rules.
 
 9. **CRITICAL TOOL CHOICE: `execute_sql` vs. `summary_synthesizer`:**
    - **Use Direct SQL Generation (`execute_sql`) IF AND ONLY IF:** The user asks for a comparison OR retrieval of **specific, quantifiable metrics** (e.g., counts, sums, averages of borrows/checkouts/lending, returns/checkins, circulation, renewals, footfall, logins) for **specific, resolved entities OR for generic groups like 'all branches'** (e.g., Main Library [ID: xxx], Argyle Branch [ID: yyy], or all entities under a parent) over a **defined time period**. Crucially, if the user asks for specific numbers, counts, or direct comparisons of metrics (e.g., 'average footfall', 'total borrows last week', 'deviation between X and Y'), `execute_sql` is **ALMOST ALWAYS** the correct first operational tool. Your goal is to generate a single, efficient SQL query. The result table might be used for a chart specification later.

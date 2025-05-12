@@ -9,6 +9,22 @@ from app.schemas.chat import ApiChartSpecification, TableData
 
 logger = logging.getLogger(__name__)
 
+# --- Helper function to check if a column name is time-related ---
+def _is_time_column(column_name: Optional[str]) -> bool:
+    """Check if column name is likely a time dimension for joining"""
+    if not column_name: return False
+    time_indicators = ["time", "date", "hour", "day", "month", "year", "timestamp", "period"]
+    column_name_lower = column_name.lower()
+    return any(indicator in column_name_lower for indicator in time_indicators)
+
+# --- Helper function to find a suitable time column from a list ---
+def _find_time_column(columns: List[str]) -> Optional[str]:
+    """Find the most likely time column from a list of columns"""
+    for col in columns:
+        if _is_time_column(col):
+            return col
+    return None
+
 # --- Instruction Structure included directly in FinalApiResponseStructure ---
 class ChartSpecFinalInstruction(BaseModel):
     """Defines the specification for a chart to be rendered by the frontend.
@@ -22,6 +38,219 @@ class ChartSpecFinalInstruction(BaseModel):
     color_column: Optional[str] = Field(default=None, description="Optional: The name of the column to use for grouping data by color/hue. For multi-series from y_columns, this will be set to 'Metric'.")
     x_label: Optional[str] = Field(default=None, description="Optional: A descriptive label for the X-axis. Defaults to x_column if not provided.")
     y_label: Optional[str] = Field(default=None, description="Optional: A descriptive label for the Y-axis. Defaults to y_column (or 'Value' for multi-series) if not provided.")
+
+
+# --- Helper function to split a spec into single-source parts (fallback) ---
+def _split_spec_into_single_source_parts(
+    original_spec: ChartSpecFinalInstruction,
+    all_tables: List[Dict[str, Any]],
+    filtered_out_info: List[Dict[str, str]]
+) -> List[ChartSpecFinalInstruction]:
+    """
+    Fallback: Takes an original spec and splits it into multiple, simpler specs,
+    each valid for a single source table and typically a single y-column.
+    Tries to use the original x-column where possible, or a fallback time column.
+    """
+    split_specs = []
+    original_title = original_spec.title
+    x_col_from_original = original_spec.x_column
+    original_y_cols = original_spec.y_columns
+
+    if not original_y_cols:
+        logger.warning(f"Chart '{original_title}': No y_columns in spec to split.")
+        filtered_out_info.append({"title": original_title, "reason": "No y_columns to process for splitting."})
+        return []
+
+    for y_col_candidate in original_y_cols:
+        found_source_for_this_y_col = False
+        
+        # Try primary table first if x_col is there, and y_col is there
+        primary_table_idx = original_spec.source_table_index
+        if 0 <= primary_table_idx < len(all_tables):
+            primary_table = all_tables[primary_table_idx]
+            primary_cols = primary_table.get("columns", [])
+            if x_col_from_original in primary_cols and y_col_candidate in primary_cols:
+                new_spec = copy.deepcopy(original_spec) # Start with a copy of original
+                new_spec.source_table_index = primary_table_idx # Ensure correct index
+                new_spec.x_column = x_col_from_original # Ensure correct x_column
+                new_spec.y_columns = [y_col_candidate] # Single y_column
+                # Modify title only if original had multiple y_columns, to differentiate
+                new_spec.title = f"{original_title} - {y_col_candidate}" if len(original_y_cols) > 1 else original_title
+                split_specs.append(new_spec)
+                logger.info(f"Chart '{original_title}': Split off part for y_column '{y_col_candidate}' from its original primary table {primary_table_idx}.")
+                found_source_for_this_y_col = True
+                # Continue to the next y_col_candidate in the original_spec.y_columns list
+                continue 
+        
+        # If not found in primary (or x_col was not in primary, or y_col not in primary for that x_col)
+        # search other tables for this y_col_candidate
+        if not found_source_for_this_y_col:
+            for other_table_idx, other_table_data in enumerate(all_tables):
+                # No need to explicitly skip primary_table_idx again, as the `continue` above handles successful finds in primary.
+                # If we are here, it means it wasn't found in primary with the original x_col.
+                
+                other_table_cols = other_table_data.get("columns", [])
+                
+                # Attempt 1: Use original x-column if present in this other table
+                if x_col_from_original in other_table_cols and y_col_candidate in other_table_cols:
+                    new_spec = copy.deepcopy(original_spec)
+                    new_spec.source_table_index = other_table_idx
+                    new_spec.x_column = x_col_from_original
+                    new_spec.y_columns = [y_col_candidate]
+                    new_spec.title = f"{original_title} - {y_col_candidate} (from table {other_table_idx})"
+                    split_specs.append(new_spec)
+                    logger.info(f"Chart '{original_title}': Split off part for y_column '{y_col_candidate}' from other table {other_table_idx} using original x_column '{x_col_from_original}'.")
+                    found_source_for_this_y_col = True
+                    break # Found source for this y_col_candidate, move to next y_col_candidate
+                else: 
+                    # Attempt 2: If original x-col not found, try a fallback time column in this other table
+                    fallback_x_col = _find_time_column(other_table_cols)
+                    if fallback_x_col and y_col_candidate in other_table_cols:
+                        new_spec = copy.deepcopy(original_spec)
+                        new_spec.source_table_index = other_table_idx
+                        new_spec.x_column = fallback_x_col # Use the identified fallback x_column
+                        new_spec.y_columns = [y_col_candidate]
+                        new_spec.title = f"{original_title} - {y_col_candidate} (from table {other_table_idx}, x-axis: {fallback_x_col})"
+                        split_specs.append(new_spec)
+                        logger.info(f"Chart '{original_title}': Split off part for y_column '{y_col_candidate}' from table {other_table_idx} using fallback x_column '{fallback_x_col}'.")
+                        found_source_for_this_y_col = True
+                        break # Found source for this y_col_candidate, move to next y_col_candidate
+        
+        if not found_source_for_this_y_col:
+            logger.warning(f"Chart '{original_title}': Could not find a valid source or x_column for y_column '{y_col_candidate}' during splitting. This metric will be omitted from split results.")
+            # Optionally, add to filtered_out_info here if desired for per-y-column failure reasons
+            # For now, the overall spec failure will be logged by the calling function if no parts are salvaged.
+
+    if not split_specs and original_y_cols: # If the original spec had y_columns but none could be salvaged
+        logger.warning(f"Chart '{original_title}': Original spec with y_columns {original_y_cols} could not be split into any valid parts.")
+        # The calling function (`process_and_validate_chart_specs`) will handle adding to filtered_out_info
+        # if the original spec ultimately yields no processable parts.
+
+    return split_specs
+
+# --- Helper function to attempt intelligent data merge for a chart spec ---
+def _attempt_intelligent_data_merge(
+    spec_to_merge: ChartSpecFinalInstruction,
+    all_tables: List[Dict[str, Any]],
+    original_spec_title: str # For logging continuity
+) -> Tuple[Optional[Dict[str, Any]], Optional[List[str]], Optional[str]]:
+    """
+    Attempts to merge data for a single chart spec that might reference multiple tables,
+    if they share a common x_column.
+    
+    Returns:
+        - merged_table_data (Optional[Dict[str, Any]]): The new wide table if merge successful.
+        - merged_y_columns (Optional[List[str]]): List of all y-columns in the merged table.
+        - failure_reason (Optional[str]): Reason if merge failed.
+    """
+    primary_table_idx = spec_to_merge.source_table_index
+    # Ensure primary_table_idx is valid before accessing all_tables
+    if not (0 <= primary_table_idx < len(all_tables)):
+        return None, None, f"Primary table index {primary_table_idx} is out of bounds."
+        
+    primary_table = all_tables[primary_table_idx]
+    primary_cols = primary_table.get("columns", [])
+    x_col_for_merge = spec_to_merge.x_column
+
+    if not x_col_for_merge or x_col_for_merge not in primary_cols:
+        return None, None, f"x_column '{x_col_for_merge}' not in primary source table {primary_table_idx} columns {primary_cols}."
+
+    y_cols_in_primary_source = [yc for yc in spec_to_merge.y_columns if yc in primary_cols]
+    y_cols_needing_other_sources = [yc for yc in spec_to_merge.y_columns if yc not in primary_cols]
+
+    if not y_cols_needing_other_sources: # All y_columns are in the primary source, no merge action needed
+        # This case should ideally be handled before calling this function if the goal is strictly merging *external* columns.
+        # However, returning this indicates no merge was performed for external columns.
+        return None, None, "All y_columns already in primary source, no merge action taken by _attempt_intelligent_data_merge."
+
+    logger.info(f"Chart '{original_spec_title}': Attempting merge for x_column '{x_col_for_merge}'. Primary y_cols: {y_cols_in_primary_source}. Missing y_cols: {y_cols_needing_other_sources}.")
+
+    # Structure to hold data: {y_column_name: (table_index_found_in, {x_value: y_value})}
+    y_col_data_map: Dict[str, Tuple[int, Dict[Any, Any]]] = {}
+    
+    # Add y_cols from primary source
+    for yc in y_cols_in_primary_source:
+        x_to_y_map = {}
+        try:
+            x_idx = primary_cols.index(x_col_for_merge)
+            y_idx = primary_cols.index(yc)
+            for row in primary_table.get("rows", []):
+                if len(row) > max(x_idx, y_idx):
+                    x_to_y_map[row[x_idx]] = row[y_idx]
+            y_col_data_map[yc] = (primary_table_idx, x_to_y_map)
+        except (ValueError, IndexError) as e:
+            # This indicates an internal inconsistency if yc was deemed in primary_cols but index fails
+            return None, None, f"Error processing primary source for y-col '{yc}': {e}"
+
+    all_y_columns_successfully_mapped = list(y_cols_in_primary_source) # Start with y_cols we know are in primary
+
+    for missing_yc in y_cols_needing_other_sources:
+        found_this_yc_elsewhere = False
+        for other_table_idx, other_table_data in enumerate(all_tables):
+            if other_table_idx == primary_table_idx: # Already processed primary source y_cols
+                continue
+            
+            other_table_cols = other_table_data.get("columns", [])
+            # CRITICAL: The other table MUST also contain the SAME x_column_for_merge
+            if x_col_for_merge in other_table_cols and missing_yc in other_table_cols:
+                x_to_y_map = {}
+                try:
+                    x_idx = other_table_cols.index(x_col_for_merge)
+                    y_idx = other_table_cols.index(missing_yc)
+                    for row in other_table_data.get("rows", []):
+                         if len(row) > max(x_idx, y_idx):
+                            x_to_y_map[row[x_idx]] = row[y_idx]
+                    y_col_data_map[missing_yc] = (other_table_idx, x_to_y_map)
+                    all_y_columns_successfully_mapped.append(missing_yc)
+                    found_this_yc_elsewhere = True
+                    logger.info(f"Chart '{original_spec_title}': Found missing y_column '{missing_yc}' in table {other_table_idx} with common x_column '{x_col_for_merge}'.")
+                    break # Found this missing_yc, move to the next missing_yc
+                except (ValueError, IndexError) as e:
+                    # Should be rare if columns were checked, but good for robustness
+                    logger.warning(f"Chart '{original_spec_title}': Error indexing data in table {other_table_idx} for y-col '{missing_yc}': {e}")
+                    # Continue to check other tables for this missing_yc, as this one might be malformed
+        
+        if not found_this_yc_elsewhere:
+            # If any single missing_yc cannot be found with a compatible x_column, the merge for *this spec* fails
+            return None, None, f"Could not find a source for y_column '{missing_yc}' with compatible x_column '{x_col_for_merge}'."
+
+    # Consolidate all unique x_values from all y_columns successfully mapped
+    all_x_values = set()
+    for yc_mapped in all_y_columns_successfully_mapped:
+        if yc_mapped in y_col_data_map:
+            _, x_to_y_map_for_col = y_col_data_map[yc_mapped]
+            all_x_values.update(x_to_y_map_for_col.keys())
+    
+    if not all_x_values: # No data points to merge
+        return None, None, "No common x_values found across mapped y_columns or no data to merge."
+
+    # Sort x_values: basic sort, can be enhanced if specific type knowledge (e.g. datetime) is available
+    try:
+        # Attempt to convert to datetime if possible for sorting, otherwise use original type
+        # For now, a basic sort that handles mixed types somewhat gracefully (numbers before strings)
+        sorted_x_values = sorted(list(all_x_values), key=lambda x: (isinstance(x, (str, type(None))), x))
+    except TypeError: # Handle unorderable types if mixed in a way Python's default sort can't handle
+        sorted_x_values = list(all_x_values) # Fallback to unsorted (or original order of discovery)
+        logger.warning(f"Chart '{original_spec_title}': Could not sort x-values due to heterogeneous/unorderable types. Proceeding with potentially unsorted x-values.")
+
+    merged_rows = []
+    for x_val in sorted_x_values:
+        row = [x_val] # First element is the x_value
+        for yc in all_y_columns_successfully_mapped: # Iterate in the order they were confirmed
+            # yc should be in y_col_data_map if it's in all_y_columns_successfully_mapped
+            _, x_to_y_map_for_this_col = y_col_data_map[yc]
+            row.append(x_to_y_map_for_this_col.get(x_val)) # Appends None if x_val not present for this y_col
+        merged_rows.append(row)
+
+    final_merged_columns = [x_col_for_merge] + all_y_columns_successfully_mapped
+    merged_table_data = {
+        "columns": final_merged_columns,
+        "rows": merged_rows,
+        "metadata": {"merged_from_multi_source": True, "original_spec_title": original_spec_title}
+    }
+    logger.info(f"Chart '{original_spec_title}': Successfully merged data for {len(all_y_columns_successfully_mapped)} y-columns. New table columns: {final_merged_columns}. Rows: {len(merged_rows)}.")
+    return merged_table_data, all_y_columns_successfully_mapped, None
+
 
 # --- Helper function to transform wide summary data for Pie charts ---
 def _transform_wide_summary_to_pie_data(
@@ -79,7 +308,7 @@ def _transform_wide_summary_to_pie_data(
         logger.warning(f"Failed to transform wide summary data for pie chart: {e}. Original cols: {columns}", exc_info=True)
         return None # Transformation failed
 
-# --- NEW: Helper function to transform wide summary data for Bar charts ---
+# --- Helper function to transform wide summary data for Bar charts ---
 def _transform_wide_summary_to_bar_data(
     source_table: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
@@ -143,6 +372,7 @@ def _transform_wide_summary_to_bar_data(
         logger.warning(f"Failed to transform wide summary data for bar chart: {e}. Original cols: {columns}", exc_info=True)
         return None # Transformation failed
 
+
 # --- Validation Functions for Specific Chart Types ---
 
 def _validate_pie_chart_spec(api_chart: ApiChartSpecification, columns: List[str], rows: List[List[Any]]) -> Tuple[bool, Optional[str]]:
@@ -194,23 +424,24 @@ def _validate_bar_chart_spec(api_chart: ApiChartSpecification, columns: List[str
     Returns:
         (is_valid: bool, failure_reason: Optional[str])
     """
-    # Basic check: x and y columns must exist (already handled in main function)
-    # Advanced check (Example): If color_column is present, ensure y_column is 'Value'
-    # This relates to the multi-metric transformation rule in the prompt
-    if api_chart.color_column:
-         # This check assumes the transformation mentioned in agent prompt guideline #7e
-         # might eventually happen upstream or needs to be handled by frontend if data is wide.
-         # For now, we just ensure the specified columns exist, which is done in the main func.
-         pass # Placeholder for more complex bar chart logic if needed
-
-    # Basic validation: ensure y column seems numeric
     if rows and api_chart.y_column in columns:
-         y_col_index = columns.index(api_chart.y_column)
-         first_row_y_val = rows[0][y_col_index]
-         if not isinstance(first_row_y_val, numbers.Number):
-             logger.warning(f"Bar chart spec '{api_chart.title}': y_column '{api_chart.y_column}' data ('{first_row_y_val}') does not appear numeric. Invalid.")
-             return False, f"Bar chart requires numeric data for the value column ('{api_chart.y_column}')."
-
+        try:
+            y_idx = columns.index(api_chart.y_column)
+            found_numeric_value = False
+            for i in range(min(len(rows), 5)): # Check a few rows
+                if len(rows[i]) > y_idx and isinstance(rows[i][y_idx], numbers.Number):
+                    found_numeric_value = True
+                    break
+            if not found_numeric_value:
+                first_val_for_log = rows[0][y_idx] if rows and len(rows[0]) > y_idx else "N/A"
+                logger.warning(f"Bar chart spec '{api_chart.title}': y_column '{api_chart.y_column}' data (e.g., '{first_val_for_log}') does not appear to contain sufficient numeric values. Invalid.")
+                return False, f"Bar chart requires numeric data for the value column ('{api_chart.y_column}')."
+        except (ValueError, IndexError):
+            logger.warning(f"Bar chart spec '{api_chart.title}': Error accessing y_column '{api_chart.y_column}' for numeric check.")
+            return False, "Error accessing y_column for numeric check."
+    elif not rows and api_chart.y_column in columns: # Columns exist but no data rows
+        logger.warning(f"Bar chart spec '{api_chart.title}': y_column '{api_chart.y_column}' exists, but there are no data rows to plot.")
+        return False, f"No data available to plot for y_column '{api_chart.y_column}'."
     return True, None
 
 def _validate_line_chart_spec(api_chart: ApiChartSpecification, columns: List[str], rows: List[List[Any]]) -> Tuple[bool, Optional[str]]:
@@ -219,299 +450,237 @@ def _validate_line_chart_spec(api_chart: ApiChartSpecification, columns: List[st
     Returns:
         (is_valid: bool, failure_reason: Optional[str])
     """
-    # Basic check: x and y columns must exist (already handled in main function)
-    # Advanced check: Ensure x column is date/time or numeric?
-
-    # Basic validation: ensure y column seems numeric
     if rows and api_chart.y_column in columns:
-         y_col_index = columns.index(api_chart.y_column)
-         first_row_y_val = rows[0][y_col_index]
-         if not isinstance(first_row_y_val, numbers.Number):
-             logger.warning(f"Line chart spec '{api_chart.title}': y_column '{api_chart.y_column}' data ('{first_row_y_val}') does not appear numeric. Invalid.")
-             return False, f"Line chart requires numeric data for the value column ('{api_chart.y_column}')."
-             
+        try:
+            y_idx = columns.index(api_chart.y_column)
+            found_numeric_value = False
+            for i in range(min(len(rows), 5)): # Check a few rows
+                if len(rows[i]) > y_idx and isinstance(rows[i][y_idx], numbers.Number):
+                    found_numeric_value = True
+                    break
+            if not found_numeric_value:
+                first_val_for_log = rows[0][y_idx] if rows and len(rows[0]) > y_idx else "N/A"
+                logger.warning(f"Line chart spec '{api_chart.title}': y_column '{api_chart.y_column}' data (e.g., '{first_val_for_log}') does not appear to contain sufficient numeric values. Invalid.")
+                return False, f"Line chart requires numeric data for the value column ('{api_chart.y_column}')."
+        except (ValueError, IndexError):
+            logger.warning(f"Line chart spec '{api_chart.title}': Error accessing y_column '{api_chart.y_column}' for numeric check.")
+            return False, "Error accessing y_column for numeric check."
+    elif not rows and api_chart.y_column in columns: # Columns exist but no data rows
+        logger.warning(f"Line chart spec '{api_chart.title}': y_column '{api_chart.y_column}' exists, but there are no data rows to plot.")
+        return False, f"No data available to plot for y_column '{api_chart.y_column}'."
     return True, None
 
-# --- Main Processing Function ---
+
+# --- Main Processing Function (Refactored) ---
 def process_and_validate_chart_specs(
-    chart_specs: List[ChartSpecFinalInstruction],
-    tables_from_state: List[Dict[str, Any]] # Expects list of dicts like {'columns': [], 'rows': []}
-) -> Tuple[List[ApiChartSpecification], List[Dict[str, str]]]: # Return valid charts AND info on filtered ones
-    """Processes chart specifications from LLM, validates against tables, and creates API specs.
-    Handles data transformation for multi-metric charts and single-row summary tables.
-
-    Args:
-        chart_specs: List of chart specifications generated by the LLM.
-        tables_from_state: List of tables (as dictionaries) retrieved during agent execution.
-
-    Returns:
-        A tuple containing:
-        - List of validated ApiChartSpecification objects ready for the API response.
-        - List of dictionaries detailing charts that were filtered out (e.g., {'title': '...', 'reason': '...'}).
-    """
+    llm_chart_specs: List[ChartSpecFinalInstruction], # Renamed for clarity
+    tables_from_state: List[Dict[str, Any]]
+) -> Tuple[List[ApiChartSpecification], List[Dict[str, str]]]:
     visualizations = []
     filtered_out_info = [] 
-    if not chart_specs or not tables_from_state:
+    
+    if not llm_chart_specs or not tables_from_state:
         return [], []
 
-    for llm_chart_spec in chart_specs:
-        spec = copy.deepcopy(llm_chart_spec) 
+    specs_to_process_queue: List[ChartSpecFinalInstruction] = list(llm_chart_specs)
+    current_tables_in_state = copy.deepcopy(tables_from_state) # To store original + merged tables
+
+    while specs_to_process_queue:
+        current_llm_spec = specs_to_process_queue.pop(0)
+        spec = copy.deepcopy(current_llm_spec) 
         spec_title = getattr(spec, "title", "Untitled Chart")
         failure_reason = None
-        valid_chart = True
-        is_multi_metric = False
-        is_pie_transformed = False
-        is_summary_transformed = False
         
-        # --- MODIFIED LOGIC FOR SOURCE TABLE DETERMINATION ---
-        source_table_for_processing: Optional[Dict[str, Any]] = None
-        columns_from_source_table: List[str] = []
-        rows_from_source_table: List[List[Any]] = []
-
-        type_hint = getattr(spec, "type_hint", "bar").lower()
-        llm_specified_y_cols = getattr(spec, 'y_columns', [])
-        source_table_idx_from_llm = getattr(spec, "source_table_index", None)
-
-        # Step 1: Prioritize LLM's specified source_table_index if provided and valid
-        if source_table_idx_from_llm is not None:
-            logger.debug(f"Chart '{spec_title}': LLM specified source_table_index: {source_table_idx_from_llm}.")
-            if not (0 <= source_table_idx_from_llm < len(tables_from_state)):
-                failure_reason = f"Invalid source table index ({source_table_idx_from_llm}). LLM specified index out of bounds for {len(tables_from_state)} available tables."
-                valid_chart = False
-                logger.warning(f"Chart '{spec_title}': {failure_reason}")
-            else:
-                original_source_table = tables_from_state[source_table_idx_from_llm]
-                if not isinstance(original_source_table, dict) or "columns" not in original_source_table or "rows" not in original_source_table:
-                    failure_reason = f"Source table at LLM-specified index {source_table_idx_from_llm} has invalid format."
-                    valid_chart = False
-                    logger.warning(f"Chart '{spec_title}': {failure_reason}")
-                else:
-                    source_table_for_processing = original_source_table
-                    columns_from_source_table = source_table_for_processing.get("columns", [])
-                    rows_from_source_table = source_table_for_processing.get("rows", [])
-                    if not columns_from_source_table:
-                        failure_reason = f"Source table {source_table_idx_from_llm} (from LLM index) has no columns."
-                        valid_chart = False
-                        logger.warning(f"Chart '{spec_title}': {failure_reason}")
-                    else:
-                        logger.info(f"Chart '{spec_title}': Successfully using source table from LLM-specified index {source_table_idx_from_llm}.")
-        else:
-            logger.debug(f"Chart '{spec_title}': LLM did not specify source_table_index.")
-
-        # Step 2: Fallback for bar chart summary from multiple single-row tables
-        # This runs if source_table_for_processing is still None (LLM didn't provide a valid index)
-        # AND it's a bar chart with y_columns specified.
-        if valid_chart and source_table_for_processing is None and type_hint == 'bar' and llm_specified_y_cols:
-            logger.debug(f"Chart '{spec_title}' (bar type with y_columns: {llm_specified_y_cols}): LLM source_table_index not used or invalid. Attempting multi-table single-row summary combination as fallback.")
-            combined_row_data: Dict[str, Any] = {}
-            found_any_y_col_metric = False
-
-            for y_col_name in llm_specified_y_cols:
-                found_this_metric = False
-                for table_idx, table_in_state in enumerate(tables_from_state):
-                    if isinstance(table_in_state, dict) and \
-                       len(table_in_state.get("rows", [])) == 1 and \
-                       y_col_name in table_in_state.get("columns", []):
-                        
-                        cols_of_this_table = table_in_state["columns"]
-                        row_of_this_table = table_in_state["rows"][0]
-                        
-                        try:
-                            metric_idx = cols_of_this_table.index(y_col_name)
-                            metric_value = row_of_this_table[metric_idx]
-
-                            if isinstance(metric_value, numbers.Number):
-                                combined_row_data[y_col_name] = metric_value
-                                found_this_metric = True
-                                found_any_y_col_metric = True
-                                logger.debug(f"Chart '{spec_title}': Found y_column '{y_col_name}' in table {table_idx} (single-row summary) with value {metric_value}.")
-                                break 
-                            else:
-                                logger.debug(f"Chart '{spec_title}': y_column '{y_col_name}' in table {table_idx} (single-row summary) is not numeric ('{metric_value}'). Skipping.")
-                        except (ValueError, IndexError):
-                            logger.warning(f"Error accessing y_column '{y_col_name}' from table {table_idx} (single-row summary) despite checks.")
-                            continue 
-                if not found_this_metric:
-                    logger.warning(f"Chart '{spec_title}': Specified y_column '{y_col_name}' for multi-table summary not found or not numeric in any single-row table.")
-
-            if found_any_y_col_metric and combined_row_data:
-                source_table_for_processing = {
-                    "columns": list(combined_row_data.keys()),
-                    "rows": [list(combined_row_data.values())],
-                    "metadata": {"source": "combined_single_row_summary_fallback"}
-                }
-                columns_from_source_table = source_table_for_processing["columns"]
-                rows_from_source_table = source_table_for_processing["rows"]
-                logger.info(f"Chart '{spec_title}': Successfully created a combined single-row source table for summary bar chart (fallback). Columns: {columns_from_source_table}.")
-            else:
-                logger.debug(f"Chart '{spec_title}': Fallback to combine metrics for summary bar chart failed or yielded no numeric data.")
-                # If still no source_table_for_processing, and valid_chart is true, this means LLM didn't provide an index
-                # and the fallback also failed. This will be caught by the next check.
-                if valid_chart and source_table_for_processing is None: # Check again as valid_chart might have been flipped if LLM index was initially invalid
-                    failure_reason = "Missing valid source_table_index and multi-table summary combination fallback also failed."
-                    valid_chart = False # Mark as invalid if no table could be determined/created
-                    logger.warning(f"Chart '{spec_title}': {failure_reason}")
+        # Basic spec structure validation
+        if not (0 <= spec.source_table_index < len(current_tables_in_state)):
+            failure_reason = f"Invalid source_table_index {spec.source_table_index} for {len(current_tables_in_state)} available tables."
+        elif not spec.x_column or not spec.y_columns:
+            failure_reason = "Missing x_column or y_columns."
         
-        # Final check: if no source table could be determined by now, the chart cannot proceed.
-        if not valid_chart or source_table_for_processing is None: # valid_chart might be False from LLM index check
-            final_reason = failure_reason if failure_reason else "Source table could not be determined or was invalid."
-            logger.warning(f"Chart spec '{spec_title}' failed: {final_reason} Cannot proceed with this chart.")
-            filtered_out_info.append({"title": spec_title, "reason": final_reason})
+        if failure_reason:
+            logger.warning(f"Chart '{spec_title}': Pre-check failed: {failure_reason}")
+            filtered_out_info.append({"title": spec_title, "reason": failure_reason})
             continue
-        # --- END: MODIFIED LOGIC FOR SOURCE TABLE DETERMINATION ---
+
+        primary_table_data_for_spec = current_tables_in_state[spec.source_table_index]
+        primary_cols_for_spec = primary_table_data_for_spec.get("columns", [])
+        
+        if not primary_cols_for_spec:
+            failure_reason = f"Primary source table {spec.source_table_index} (for spec '{spec_title}') has no columns."
+            logger.warning(f"Chart '{spec_title}': {failure_reason}")
+            filtered_out_info.append({"title": spec_title, "reason": failure_reason})
+            continue
+
+        y_cols_in_primary = [yc for yc in spec.y_columns if yc in primary_cols_for_spec]
+        y_cols_not_in_primary = [yc for yc in spec.y_columns if yc not in primary_cols_for_spec]
+        x_col_in_primary = spec.x_column in primary_cols_for_spec
+
+        final_spec_to_process_downstream = spec 
+        source_table_for_downstream_processing = primary_table_data_for_spec
+        ready_for_standard_processing = False
+
+        if x_col_in_primary and not y_cols_not_in_primary:
+            logger.info(f"Chart '{spec_title}': Valid single-source spec or all y_cols in primary. source_idx: {spec.source_table_index}")
+            ready_for_standard_processing = True
+        elif x_col_in_primary and y_cols_not_in_primary:
+            logger.info(f"Chart '{spec_title}': x_col '{spec.x_column}' in primary table {spec.source_table_index}, but missing y_cols: {y_cols_not_in_primary}. Attempting merge.")
+            merged_table_data, merged_y_cols, merge_fail_reason = _attempt_intelligent_data_merge(spec, current_tables_in_state, spec_title)
+            if merged_table_data and merged_y_cols:
+                current_tables_in_state.append(merged_table_data)
+                final_spec_to_process_downstream = copy.deepcopy(spec) 
+                final_spec_to_process_downstream.source_table_index = len(current_tables_in_state) - 1
+                final_spec_to_process_downstream.y_columns = merged_y_cols 
+                source_table_for_downstream_processing = merged_table_data
+                logger.info(f"Chart '{spec_title}': Merge successful. Updated spec to use new table at index {final_spec_to_process_downstream.source_table_index}.")
+                ready_for_standard_processing = True
+            else:
+                logger.warning(f"Chart '{spec_title}': Merge failed (Reason: {merge_fail_reason}). Splitting spec.")
+                split_specs = _split_spec_into_single_source_parts(spec, current_tables_in_state, filtered_out_info)
+                if split_specs:
+                    specs_to_process_queue.extend(split_specs) 
+                    logger.info(f"Chart '{spec_title}': Added {len(split_specs)} split parts to processing queue.")
+                else:
+                    # If splitting also failed to produce anything, the original spec is truly unprocessable.
+                    # _split_spec_into_single_source_parts might add to filtered_out_info if it completely fails for all y_cols.
+                    if not any(f_info['title'] == spec_title and "split" in f_info['reason'] for f_info in filtered_out_info):
+                         filtered_out_info.append({"title": spec_title, "reason": merge_fail_reason or "Merge failed and spec could not be split."})
+                continue 
+        elif not x_col_in_primary:
+            logger.warning(f"Chart '{spec_title}': x_column '{spec.x_column}' not found in primary table {spec.source_table_index}. Splitting spec.")
+            split_specs = _split_spec_into_single_source_parts(spec, current_tables_in_state, filtered_out_info)
+            if split_specs:
+                specs_to_process_queue.extend(split_specs)
+                logger.info(f"Chart '{spec_title}': Added {len(split_specs)} split parts to processing queue due to missing x_col in primary.")
+            else:
+                 if not any(f_info['title'] == spec_title and "split" in f_info['reason'] for f_info in filtered_out_info):
+                    filtered_out_info.append({"title": spec_title, "reason": f"x_column '{spec.x_column}' not in primary table and spec could not be split."})
+            continue
+        else: 
+            logger.error(f"Chart '{spec_title}': Unhandled spec condition during merge/split logic. Filtering out.")
+            filtered_out_info.append({"title": spec_title, "reason": "Unhandled internal chart processing condition."})
+            continue
+            
+        if not ready_for_standard_processing:
+            if not any(f_info['title'] == spec_title for f_info in filtered_out_info):
+                 filtered_out_info.append({"title": spec_title, "reason": "Spec was not suitable for direct processing, merge, or split after initial analysis."})
+            continue
 
         try:
-            # The rest of the processing uses source_table_for_processing, columns_from_source_table, rows_from_source_table
-
-            allowed_types = ['bar', 'pie', 'line'] # type_hint already lowercased
-            if type_hint not in allowed_types:
-                failure_reason = f"Unsupported chart type '{type_hint}'. Allowed types: {allowed_types}"
-                valid_chart = False
-                logger.warning(f"Chart spec '{spec_title}' has unsupported type_hint '{type_hint}'. Skipping.")
-                filtered_out_info.append({"title": spec_title, "reason": failure_reason})
-                continue
-
-            data_for_chart = source_table_for_processing 
-            columns_to_validate = columns_from_source_table
+            current_spec_instance = final_spec_to_process_downstream
+            data_for_chart_obj = source_table_for_downstream_processing 
             
-            llm_specified_x_col = getattr(spec, 'x_column', "")
-            # llm_specified_y_cols already fetched
-            llm_specified_color_col = getattr(spec, 'color_column', None)
+            spec_title_for_api = current_spec_instance.title
+            type_hint = getattr(current_spec_instance, "type_hint", "bar").lower()
+            current_x_col = current_spec_instance.x_column
+            current_y_cols = current_spec_instance.y_columns 
+            
+            cols_in_data_for_chart_obj = data_for_chart_obj.get("columns", [])
+            rows_in_data_for_chart_obj = data_for_chart_obj.get("rows", [])
 
-            if type_hint == 'bar' and len(rows_from_source_table) == 1 and len(columns_from_source_table) >= 1:
-                # This transformation is attempted even if data was combined above,
-                # _transform_wide_summary_to_bar_data handles the already combined single-row data.
-                logger.info(f"Bar chart '{spec_title}' (source cols: {columns_from_source_table}) detected single-row summary pattern. Attempting transformation.")
-                transformed_summary_data = _transform_wide_summary_to_bar_data(source_table_for_processing)
-                if transformed_summary_data:
-                    data_for_chart = transformed_summary_data
-                    columns_to_validate = transformed_summary_data["columns"]
+            if current_x_col not in cols_in_data_for_chart_obj:
+                failure_reason = f"Internal Error: x_column '{current_x_col}' for spec '{spec_title_for_api}' not in its designated source table columns {cols_in_data_for_chart_obj}."
+                logger.error(failure_reason)
+                filtered_out_info.append({"title": spec_title_for_api, "reason": failure_reason})
+                continue
+            
+            valid_y_cols_for_transform = [yc for yc in current_y_cols if yc in cols_in_data_for_chart_obj]
+            if not valid_y_cols_for_transform:
+                failure_reason = f"Internal Error: No y_columns from spec '{spec_title_for_api}' ({current_y_cols}) found in its designated source table columns {cols_in_data_for_chart_obj}."
+                logger.error(failure_reason)
+                filtered_out_info.append({"title": spec_title_for_api, "reason": failure_reason})
+                continue
+            current_y_cols = valid_y_cols_for_transform # Use only the confirmed valid y_columns
+
+            is_multi_metric_transformed = False 
+            is_pie_transformed = False
+            is_summary_transformed = False
+            post_transform_failure_reason = None
+
+            if type_hint == 'bar' and len(rows_in_data_for_chart_obj) == 1 and len(cols_in_data_for_chart_obj) >= 1:
+                transformed_s_bar = _transform_wide_summary_to_bar_data(data_for_chart_obj)
+                if transformed_s_bar: 
+                    data_for_chart_obj = transformed_s_bar
+                    cols_in_data_for_chart_obj = data_for_chart_obj.get("columns", []) 
                     is_summary_transformed = True
-                    logger.debug(f"Bar chart summary transformation successful for '{spec_title}'. New columns: {columns_to_validate}")
+            elif type_hint == 'pie' and len(rows_in_data_for_chart_obj) == 1 and len(cols_in_data_for_chart_obj) >= 2:
+                transformed_s_pie = _transform_wide_summary_to_pie_data(data_for_chart_obj)
+                if transformed_s_pie: 
+                    data_for_chart_obj = transformed_s_pie
+                    cols_in_data_for_chart_obj = data_for_chart_obj.get("columns", []) 
+                    is_pie_transformed = True
+            elif type_hint in ['bar', 'line'] and len(current_y_cols) > 1:
+                # This must use current_y_cols which are confirmed to be in cols_in_data_for_chart_obj
+                transformed_long = _transform_wide_to_long(data_for_chart_obj, current_x_col, current_y_cols)
+                if transformed_long.get("metadata", {}).get("transformed_from_wide_multi_y"):
+                    data_for_chart_obj = transformed_long
+                    cols_in_data_for_chart_obj = data_for_chart_obj.get("columns", []) 
+                    is_multi_metric_transformed = True
                 else:
-                    logger.warning(f"Bar chart '{spec_title}' summary transformation failed. Chart may be invalid.")
+                    post_transform_failure_reason = transformed_long.get("metadata",{}).get("transform_error", "Melt transform failed")
 
-            elif type_hint == 'pie' and len(rows_from_source_table) == 1 and len(columns_from_source_table) >= 2:
-                 logger.info(f"Pie chart '{spec_title}' detected wide summary data pattern. Attempting deterministic transformation.")
-                 transformed_pie_data = _transform_wide_summary_to_pie_data(source_table_for_processing)
-                 if transformed_pie_data:
-                     data_for_chart = transformed_pie_data
-                     columns_to_validate = transformed_pie_data["columns"]
-                     is_pie_transformed = True 
-                     logger.debug(f"Pie chart transformation successful for '{spec_title}'. New columns: {columns_to_validate}")
-                 else:
-                     logger.warning(f"Pie chart '{spec_title}' transformation from wide summary failed. Chart may be invalid.")
-            
-            elif not is_summary_transformed and not is_pie_transformed and type_hint in ['bar', 'line'] and len(llm_specified_y_cols) > 1:
-                # This is the primary path for multi-series charts from multiple y_columns.
-                # Assumes LLM omitted color_column as per prompt guidance.
-                log_prefix = f"Multi-series '{spec_title}' (Multiple y_columns: {len(llm_specified_y_cols)})"
-                logger.info(f"{log_prefix}: Applying standard multi-series transformation. Y-columns: {llm_specified_y_cols}")
-                
-                if not llm_specified_x_col or llm_specified_x_col not in columns_from_source_table:
-                    failure_reason = f"{log_prefix} failed: x_column '{llm_specified_x_col}' (specified by LLM) not found in original source table columns {columns_from_source_table}."
-                    valid_chart = False
-                else:
-                    for y_col_check in llm_specified_y_cols:
-                        if y_col_check not in columns_from_source_table:
-                            failure_reason = f"{log_prefix} failed: y_column '{y_col_check}' (specified by LLM) not found in original source table columns {columns_from_source_table}."
-                            valid_chart = False
-                            break
-                    if not valid_chart: # If any y_column was invalid
-                        pass # Failure reason already set
-                    else:
-                        transformed_data = _transform_wide_to_long(source_table_for_processing, llm_specified_x_col, llm_specified_y_cols)
-                        if transformed_data.get("metadata", {}).get("transformed_from_wide_multi_y"):
-                            data_for_chart = transformed_data
-                            columns_to_validate = transformed_data["columns"]
-                            is_multi_metric = True # Mark as multi-metric
-                            logger.debug(f"{log_prefix}: Transformation successful. New columns for validation: {columns_to_validate}")
-                        else:
-                            failure_reason = f"{log_prefix}: Data transformation using _transform_wide_to_long failed. Original columns: {columns_from_source_table}, ID col: {llm_specified_x_col}, Y-cols: {llm_specified_y_cols}."
-                            valid_chart = False
-            
-            elif not is_summary_transformed and not is_pie_transformed and not is_multi_metric and \
-                 type_hint in ['bar', 'line'] and llm_specified_color_col and llm_specified_y_cols and len(llm_specified_y_cols) == 1:
-                log_prefix = f"Potential Grouped Chart '{spec_title}' (color_column '{llm_specified_color_col}' with single y_column '{llm_specified_y_cols[0]}')"
-                logger.info(f"{log_prefix}: This might be a standard grouped chart if data is long, or an attempt at multi-metric if data is wide and color_column is 'Metric'. The multi-y_column path is preferred for multi-metric.")
-                # Current _transform_wide_to_long not called here. This path assumes data might be suitable for grouping or requires a different transform.
-                # For now, we proceed without specific transformation for this case, relying on column validation.
-
-            if not valid_chart: 
-                logger.warning(f"Chart spec '{spec_title}' failed during/after transformation stage: {failure_reason}")
-                filtered_out_info.append({"title": spec_title, "reason": failure_reason})
+            if post_transform_failure_reason:
+                logger.warning(f"Chart '{spec_title_for_api}' failed data transformation: {post_transform_failure_reason}")
+                filtered_out_info.append({"title": spec_title_for_api, "reason": post_transform_failure_reason})
                 continue
+            
+            final_y_col_name_for_api = "Value" if is_multi_metric_transformed else (current_y_cols[0] if current_y_cols else "")
+            final_color_col_name_for_api = "Metric" if is_multi_metric_transformed else getattr(current_spec_instance, 'color_column', None)
 
-            api_y_column = "Value" if is_multi_metric else (llm_specified_y_cols[0] if llm_specified_y_cols else "")
-            api_color_column = "Metric" if is_multi_metric else llm_specified_color_col
-
-            api_chart = ApiChartSpecification(
-                type_hint=type_hint, title=spec_title,
-                x_column=llm_specified_x_col,
-                y_column=api_y_column, 
-                color_column=api_color_column,
-                x_label=getattr(spec, "x_label", None), 
-                y_label=getattr(spec, "y_label", None),
-                data=TableData(**copy.deepcopy(data_for_chart))
+            api_chart_obj = ApiChartSpecification(
+                type_hint=type_hint, title=spec_title_for_api,
+                x_column=current_x_col,
+                y_column=final_y_col_name_for_api,
+                color_column=final_color_col_name_for_api,
+                x_label=getattr(current_spec_instance, "x_label", None),
+                y_label=getattr(current_spec_instance, "y_label", None),
+                data=TableData(**copy.deepcopy(data_for_chart_obj))
             )
 
-            if is_summary_transformed:
-                api_chart.x_column = "Metric"
-                api_chart.y_column = "Value"
-                api_chart.color_column = None
-                if not api_chart.y_label: api_chart.y_label = "Value"
-                logger.debug(f"Enforced x='Metric', y='Value', color=None for transformed summary bar '{spec_title}'.")
-            elif is_pie_transformed:
-                 api_chart.x_column = "Category"; api_chart.y_column = "Value"; api_chart.color_column = None
-                 if not api_chart.y_label: api_chart.y_label = "Value"
-                 logger.debug(f"Enforced x='Category', y='Value', color=null for transformed pie '{spec_title}'.")
-            elif is_multi_metric:
-                api_chart.x_column = llm_specified_x_col # Keep the original x-column specified by LLM
-                api_chart.y_column = "Value"
-                api_chart.color_column = "Metric"
-                if not api_chart.y_label: api_chart.y_label = "Value" # Set specific y_label
-                logger.debug(f"Enforced y='Value', color='Metric', y_label='Value' for multi-metric chart '{spec_title}'. Original x-column '{llm_specified_x_col}' maintained.")
-            elif type_hint == 'pie':
-                 api_chart.color_column = None
-                 logger.debug(f"Enforced color=null for non-transformed pie '{spec_title}'.")
+            if is_summary_transformed: 
+                api_chart_obj.x_column, api_chart_obj.y_column, api_chart_obj.color_column = "Metric", "Value", None
+                if not api_chart_obj.y_label: api_chart_obj.y_label = "Value"
+            elif is_pie_transformed: 
+                api_chart_obj.x_column, api_chart_obj.y_column, api_chart_obj.color_column = "Category", "Value", None
+                if not api_chart_obj.y_label: api_chart_obj.y_label = "Value"
+            elif is_multi_metric_transformed:
+                if not api_chart_obj.y_label: api_chart_obj.y_label = "Value"
+            elif type_hint == 'pie': 
+                api_chart_obj.color_column = None
 
-            final_x_col = api_chart.x_column
-            final_y_col = api_chart.y_column
-            final_color_col = api_chart.color_column
+            cols_in_api_chart_data = api_chart_obj.data.columns 
+            rows_in_api_chart_data = api_chart_obj.data.rows
+            final_validation_passed, final_validation_reason = True, ""
 
-            if not final_x_col or final_x_col not in columns_to_validate: failure_reason = f"Final x_column '{final_x_col}' not found in data columns {columns_to_validate}."; valid_chart = False
-            if valid_chart and (not final_y_col or final_y_col not in columns_to_validate): failure_reason = f"Final y_column '{final_y_col}' not found in data columns {columns_to_validate}."; valid_chart = False
-            if valid_chart and final_color_col and final_color_col not in columns_to_validate: failure_reason = f"Final color_column '{final_color_col}' not found in data columns {columns_to_validate}."; valid_chart = False
+            if not api_chart_obj.x_column or api_chart_obj.x_column not in cols_in_api_chart_data:
+                final_validation_passed, final_validation_reason = False, f"Final x_column '{api_chart_obj.x_column}' invalid."
+            if final_validation_passed and (not api_chart_obj.y_column or api_chart_obj.y_column not in cols_in_api_chart_data):
+                final_validation_passed, final_validation_reason = False, f"Final y_column '{api_chart_obj.y_column}' invalid."
+            if final_validation_passed and api_chart_obj.color_column and api_chart_obj.color_column not in cols_in_api_chart_data:
+                final_validation_passed, final_validation_reason = False, f"Final color_column '{api_chart_obj.color_column}' invalid."
 
-            if valid_chart:
-                if not api_chart.x_label: api_chart.x_label = api_chart.x_column
-                if not api_chart.y_label: api_chart.y_label = api_chart.y_column # Default if not set by transformations
+            if final_validation_passed:
+                if not api_chart_obj.x_label: api_chart_obj.x_label = api_chart_obj.x_column
+                if not api_chart_obj.y_label: api_chart_obj.y_label = api_chart_obj.y_column
+                
+                type_specific_valid, type_specific_reason = True, None
+                if type_hint == 'pie': type_specific_valid, type_specific_reason = _validate_pie_chart_spec(api_chart_obj, cols_in_api_chart_data, rows_in_api_chart_data)
+                elif type_hint == 'bar': type_specific_valid, type_specific_reason = _validate_bar_chart_spec(api_chart_obj, cols_in_api_chart_data, rows_in_api_chart_data)
+                elif type_hint == 'line': type_specific_valid, type_specific_reason = _validate_line_chart_spec(api_chart_obj, cols_in_api_chart_data, rows_in_api_chart_data)
+                
+                if not type_specific_valid:
+                    final_validation_passed, final_validation_reason = False, type_specific_reason or "Type-specific validation failed."
             
-            if not valid_chart: 
-                logger.warning(f"Chart spec '{spec_title}' failed generic column validation after transformations/enforcements: {failure_reason}")
-                filtered_out_info.append({"title": spec_title, "reason": failure_reason})
-                continue
-
-            type_specific_valid = True; type_specific_reason = None
-            current_rows_for_validation = api_chart.data.rows
-            current_columns_for_validation = api_chart.data.columns 
-
-            if type_hint == 'pie': type_specific_valid, type_specific_reason = _validate_pie_chart_spec(api_chart, current_columns_for_validation, current_rows_for_validation)
-            elif type_hint == 'bar': type_specific_valid, type_specific_reason = _validate_bar_chart_spec(api_chart, current_columns_for_validation, current_rows_for_validation)
-            elif type_hint == 'line': type_specific_valid, type_specific_reason = _validate_line_chart_spec(api_chart, current_columns_for_validation, current_rows_for_validation)
-
-            if not type_specific_valid: valid_chart = False; failure_reason = type_specific_reason or "Type-specific validation failed."
-
-            if valid_chart: visualizations.append(api_chart)
-            else: 
-                logger.warning(f"Skipping chart spec '{spec_title}' due to validation errors: {failure_reason}") # Removed source_table_idx as it might be misleading now
-                filtered_out_info.append({"title": spec_title, "reason": failure_reason or "Unknown validation error"})
-
-        except Exception as e: 
-            logger.error(f"Error processing chart spec: {spec}. Error: {e}", exc_info=True)
-            filtered_out_info.append({"title": getattr(spec, 'title', 'Untitled Chart'), "reason": f"Internal processing error: {e}"}) # Use getattr for title
-            continue
-
+            if final_validation_passed:
+                visualizations.append(api_chart_obj)
+                logger.info(f"Successfully processed and validated chart: '{api_chart_obj.title}'")
+            else:
+                logger.warning(f"Chart '{api_chart_obj.title}' failed final validation: {final_validation_reason}")
+                filtered_out_info.append({"title": api_chart_obj.title, "reason": final_validation_reason})
+        
+        except Exception as e:
+            logger.error(f"Unhandled error processing chart spec '{spec_title}' (original LLM spec: {current_llm_spec}): {e}", exc_info=True)
+            filtered_out_info.append({"title": spec_title, "reason": f"Internal error during final processing: {str(e)}"})
+            
     return visualizations, filtered_out_info
 
 # --- Helper function for Data Transformation (Wide to Long for Multi-Series) --- 
@@ -530,7 +699,7 @@ def _transform_wide_to_long(
     Returns:
         A new table dictionary in long format, or the original if transformation fails.
     """
-    logger.debug(f"[_transform_wide_to_long] Starting multi-y transformation. ID col: {id_column_name}, Y-cols to melt: {value_columns_to_melt}")
+    logger.debug(f"[_transform_wide_to_long] ID col: {id_column_name}, Y-cols to melt: {value_columns_to_melt} from table cols: {wide_table.get('columns')}")
     metric_col_name = "Metric" 
     value_col_name = "Value"   
 
@@ -540,51 +709,61 @@ def _transform_wide_to_long(
     long_rows = []
 
     if not original_rows or not original_columns:
-        logger.warning("[_transform_wide_to_long] Input table has no rows or columns. Returning empty.")
-        return {"columns": [id_column_name, metric_col_name, value_col_name], "rows": [], "metadata": {**original_metadata, "transformed_from_wide_multi_y": False, "transform_error": "No rows/columns"}}
+        logger.warning("[_transform_wide_to_long] Input table has no rows or columns. Cannot transform.")
+        return {"columns": [id_column_name, metric_col_name, value_col_name], "rows": [], "metadata": {**original_metadata, "transformed_from_wide_multi_y": False, "transform_error": "No rows or columns in input table"}}
 
     try:
         id_col_index = original_columns.index(id_column_name)
     except ValueError:
         logger.error(f"[_transform_wide_to_long] ID column '{id_column_name}' not found in wide table columns: {original_columns}.")
-        return {"columns": original_columns, "rows": original_rows, "metadata": {**original_metadata, "transformed_from_wide_multi_y": False, "transform_error": f"ID col {id_column_name} not found"}}
+        return {"columns": original_columns, "rows": original_rows, "metadata": {**original_metadata, "transformed_from_wide_multi_y": False, "transform_error": f"ID column '{id_column_name}' not found in source columns {original_columns}"}}
 
-    value_col_indices_map = {}
+    actual_value_cols_for_melt_map = {} # Stores {y_col_name: index_in_original_columns}
     for y_col_name in value_columns_to_melt:
         try:
-            value_col_indices_map[y_col_name] = original_columns.index(y_col_name)
+            actual_value_cols_for_melt_map[y_col_name] = original_columns.index(y_col_name)
         except ValueError:
-            logger.error(f"[_transform_wide_to_long] Value column '{y_col_name}' (from y_columns spec) not found in wide table columns: {original_columns}.")
-            return {"columns": original_columns, "rows": original_rows, "metadata": {**original_metadata, "transformed_from_wide_multi_y": False, "transform_error": f"Y-col {y_col_name} not found"}}
+            # This y_col_name might not be in original_columns if the table was already a result of a merge 
+            # that failed to find this specific y_col, or if LLM spec was wrong.
+            logger.warning(f"[_transform_wide_to_long] Y-column '{y_col_name}' (specified for melt) not found in current wide table columns: {original_columns}. It will be skipped for this melt operation.")
+            # Continue, as other y_columns in value_columns_to_melt might still be valid and present.
     
-    if not value_col_indices_map:
-         logger.warning(f"[_transform_wide_to_long] No valid value columns found to melt for ID column '{id_column_name}'.")
-         return {"columns": original_columns, "rows": original_rows, "metadata": {**original_metadata, "transformed_from_wide_multi_y": False, "transform_error": "No valid Y-cols to melt"}}
+    if not actual_value_cols_for_melt_map: # If NO y_columns specified for melt were actually found in the table
+         logger.error(f"[_transform_wide_to_long] No valid y-columns from the requested list ({value_columns_to_melt}) were found in the provided table columns ({original_columns}) to perform melt for ID column '{id_column_name}'.")
+         # Return a structure indicating failure but with clear metadata
+         return {"columns": original_columns, "rows": original_rows, "metadata": {**original_metadata, "transformed_from_wide_multi_y": False, "transform_error": f"No valid Y-columns from {value_columns_to_melt} found in {original_columns} to melt."}}
 
     for wide_row in original_rows:
-        if len(wide_row) != len(original_columns):
-            logger.warning(f"[_transform_wide_to_long] Skipping row with mismatching column count: {wide_row}")
+        if len(wide_row) != len(original_columns): 
+            logger.warning(f"[_transform_wide_to_long] Skipping row with mismatching column count ({len(wide_row)}) vs expected ({len(original_columns)}): {str(wide_row)[:100]}...")
             continue
             
         id_value = wide_row[id_col_index]
-        for metric_name, val_col_idx in value_col_indices_map.items():
+        for metric_name, val_col_idx in actual_value_cols_for_melt_map.items(): # Only iterate over y_columns that ARE in this table
             value = wide_row[val_col_idx]
-            numeric_value = None
-            try:
-                if value is not None: numeric_value = float(value)
-            except (ValueError, TypeError):
-                 logger.warning(f"[_transform_wide_to_long] Could not convert value '{value}' for metric '{metric_name}' to float. Appending as None.")
+            numeric_value = None # Default to None if conversion fails or value is None
+            if value is not None:
+                if isinstance(value, numbers.Number):
+                    numeric_value = value
+                elif isinstance(value, str):
+                    try:
+                        numeric_value = float(value)
+                    except (ValueError, TypeError):
+                        logger.debug(f"[_transform_wide_to_long] Could not convert string value '{value}' for metric '{metric_name}' to float. Using None.")
+                else: # Other non-numeric, non-string types
+                    logger.debug(f"[_transform_wide_to_long] Value '{value}' (type: {type(value)}) for metric '{metric_name}' is not numeric or string representable as float. Using None.")
             
             long_rows.append([id_value, metric_name, numeric_value])
 
+
     long_columns = [id_column_name, metric_col_name, value_col_name]
-    logger.info(f"[_transform_wide_to_long] Multi-y transformation complete. Produced {len(long_rows)} long format rows.")
+    logger.info(f"[_transform_wide_to_long] Transformation complete. Produced {len(long_rows)} long format rows. Melted y_cols: {list(actual_value_cols_for_melt_map.keys())}")
     
-    new_metadata = original_metadata.copy() if original_metadata else {}
-    new_metadata["transformed_from_wide_multi_y"] = True # New metadata key
-    new_metadata["original_columns"] = original_columns
-    # Remove old key if present to avoid confusion
-    if "transformed_from_wide" in new_metadata: del new_metadata["transformed_from_wide"]
+    new_metadata = {**original_metadata, 
+                    "transformed_from_wide_multi_y": True, 
+                    "original_columns_before_melt": list(original_columns), # Record columns of the table fed into this melt
+                    "melted_y_columns": list(actual_value_cols_for_melt_map.keys())}
+    if "transformed_from_wide" in new_metadata: del new_metadata["transformed_from_wide"] # Cleanup old key if present for clarity
 
     return {"columns": long_columns, "rows": long_rows, "metadata": new_metadata}
 
