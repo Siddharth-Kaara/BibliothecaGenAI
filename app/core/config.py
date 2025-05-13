@@ -69,7 +69,7 @@ class Settings(BaseSettings):
     REDIS_HOST: str = Field(default="localhost")
     
     # JWT Settings 
-    JWT_SECRET_KEY: str = os.getenv("JWT_SECRET_KEY", "service-management") 
+    JWT_SECRET_KEY: str = os.getenv("JWT_SECRET_KEY", "user-management") 
     JWT_ALGORITHM: str = "HS256" 
 
     class Config:
