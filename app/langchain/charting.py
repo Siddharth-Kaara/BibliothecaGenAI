@@ -31,7 +31,7 @@ class ChartSpecFinalInstruction(BaseModel):
        This structure is generated directly by the LLM within the FinalApiResponseStructure.
     """
     source_table_index: int = Field(description="The 0-based index of the table in the agent's 'tables' state that contains the data for this chart.")
-    type_hint: str = Field(description="The suggested chart type for the frontend (e.g., 'bar', 'pie', 'line', 'scatter').")
+    type_hint: str = Field(description="The suggested chart type for the frontend. MUST be one of: 'bar', 'pie', 'line'.")
     title: str = Field(description="The title for the chart.")
     x_column: str = Field(description="The name of the column from the source table to use for the X-axis or labels.")
     y_columns: List[str] = Field(default_factory=list, description="The name(s) of the column(s) from the source table to use for the Y-axis or values. Multiple for multi-series charts.")
@@ -596,27 +596,59 @@ def process_and_validate_chart_specs(
             is_summary_transformed = False
             post_transform_failure_reason = None
 
-            if type_hint == 'bar' and len(rows_in_data_for_chart_obj) == 1 and len(cols_in_data_for_chart_obj) >= 1:
-                transformed_s_bar = _transform_wide_summary_to_bar_data(data_for_chart_obj)
-                if transformed_s_bar: 
-                    data_for_chart_obj = transformed_s_bar
-                    cols_in_data_for_chart_obj = data_for_chart_obj.get("columns", []) 
-                    is_summary_transformed = True
-            elif type_hint == 'pie' and len(rows_in_data_for_chart_obj) == 1 and len(cols_in_data_for_chart_obj) >= 2:
-                transformed_s_pie = _transform_wide_summary_to_pie_data(data_for_chart_obj)
-                if transformed_s_pie: 
-                    data_for_chart_obj = transformed_s_pie
-                    cols_in_data_for_chart_obj = data_for_chart_obj.get("columns", []) 
-                    is_pie_transformed = True
-            elif type_hint in ['bar', 'line'] and len(current_y_cols) > 1:
-                # This must use current_y_cols which are confirmed to be in cols_in_data_for_chart_obj
+            # Priority for multi-y-column bar/line charts, including single-row data if x_col is a suitable grouper.
+            if type_hint in ['bar', 'line'] and len(current_y_cols) > 1 and \
+               current_x_col in cols_in_data_for_chart_obj and \
+               all(yc in cols_in_data_for_chart_obj for yc in current_y_cols) and \
+               current_x_col not in current_y_cols: # Heuristic: x_col is a separate grouper
+
+                logger.debug(f"Chart '{spec_title_for_api}': Attempting _transform_wide_to_long due to multi-y ({current_y_cols}) and distinct x_col ('{current_x_col}').")
                 transformed_long = _transform_wide_to_long(data_for_chart_obj, current_x_col, current_y_cols)
                 if transformed_long.get("metadata", {}).get("transformed_from_wide_multi_y"):
                     data_for_chart_obj = transformed_long
                     cols_in_data_for_chart_obj = data_for_chart_obj.get("columns", []) 
                     is_multi_metric_transformed = True
+                    logger.info(f"Chart '{spec_title_for_api}': Successfully applied _transform_wide_to_long.")
                 else:
-                    post_transform_failure_reason = transformed_long.get("metadata",{}).get("transform_error", "Melt transform failed")
+                    post_transform_failure_reason = transformed_long.get("metadata",{}).get("transform_error", "Melt transform for multi-y failed")
+            
+            # Then, specific 1-row summary transformations if the multi-metric transform didn't apply or wasn't suitable.
+            # (Bar summary)
+            if type_hint == 'bar' and not is_multi_metric_transformed and \
+               len(rows_in_data_for_chart_obj) == 1 and len(cols_in_data_for_chart_obj) >= 1:
+                logger.debug(f"Chart '{spec_title_for_api}': Attempting _transform_wide_summary_to_bar_data for 1-row bar chart.")
+                transformed_s_bar = _transform_wide_summary_to_bar_data(data_for_chart_obj)
+                if transformed_s_bar: 
+                    data_for_chart_obj = transformed_s_bar
+                    cols_in_data_for_chart_obj = data_for_chart_obj.get("columns", []) 
+                    is_summary_transformed = True
+                    logger.info(f"Chart '{spec_title_for_api}': Successfully applied _transform_wide_summary_to_bar_data.")
+            # (Pie summary - can also apply if multi-metric for bar/line didn't fit)
+            elif type_hint == 'pie' and not is_multi_metric_transformed and \
+                 len(rows_in_data_for_chart_obj) == 1 and len(cols_in_data_for_chart_obj) >= 2:
+                logger.debug(f"Chart '{spec_title_for_api}': Attempting _transform_wide_summary_to_pie_data for 1-row pie chart.")
+                transformed_s_pie = _transform_wide_summary_to_pie_data(data_for_chart_obj)
+                if transformed_s_pie: 
+                    data_for_chart_obj = transformed_s_pie
+                    cols_in_data_for_chart_obj = data_for_chart_obj.get("columns", []) 
+                    is_pie_transformed = True
+                    logger.info(f"Chart '{spec_title_for_api}': Successfully applied _transform_wide_summary_to_pie_data.")
+            
+            # Fallback for single y-column bar/line if no other transform applied.
+            # Or if multi-y was specified but the transform didn't actually change the structure (e.g., y_cols was already just one).
+            # This also handles initial len(current_y_cols) == 1.
+            elif type_hint in ['bar', 'line'] and not is_multi_metric_transformed and \
+                 not is_summary_transformed and not is_pie_transformed: # Added not is_pie_transformed
+                 if len(current_y_cols) == 1:
+                    logger.debug(f"Chart '{spec_title_for_api}': Processing as a single y-column bar/line chart ('{current_y_cols[0]}'). No structural data transformation needed beyond ensuring y-col exists.")
+                 elif len(current_y_cols) > 1: # This case implies _transform_wide_to_long was attempted but failed to be 'multi_metric'
+                    logger.warning(f"Chart '{spec_title_for_api}': Had multiple y-columns {current_y_cols} but did not result in a multi-metric transform. Check logic or data. Defaulting to first y-column if valid.")
+                    # If we are here and current_y_cols > 1, it implies _transform_wide_to_long didn't set is_multi_metric_transformed
+                    # which is unexpected if it ran for multiple y_cols. This path should be rare for multi-y.
+                    # We might effectively be using only the first y-column, which will be handled by final_y_col_name_for_api logic.
+                 # No specific transformation call here, the subsequent logic for ApiChartSpecification creation will use current_y_cols[0] if applicable.
+                 pass
+
 
             if post_transform_failure_reason:
                 logger.warning(f"Chart '{spec_title_for_api}' failed data transformation: {post_transform_failure_reason}")

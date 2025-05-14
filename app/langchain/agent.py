@@ -1823,7 +1823,7 @@ async def process_chat_message(
             final_text = final_structure.text
             llm_chart_specs = final_structure.chart_specs # Use validated specs from the structure
 
-        # --- START: Local Helper for Number Formatting --- #
+        # --- Local Helper for Number Formatting --- #
         def _format_table_numbers(table_data: Dict[str, Any]) -> Dict[str, Any]:
             """Formats whole number floats (e.g., 234.0) to ints (234) in table rows."""
             # Check if input is a valid dict with 'rows'
@@ -1847,6 +1847,75 @@ async def process_chat_message(
             formatted_table['rows'] = new_rows
             return formatted_table
         # --- END: Local Helper for Number Formatting --- #
+
+        # --- Local Helper for Date Formatting --- #
+        def _format_table_dates(table_data: Dict[str, Any], target_format: str = "%d-%b-%Y") -> Dict[str, Any]:
+            """Formats datetime objects or parsable date strings in table rows to the target_format."""
+            if not isinstance(table_data, dict) or 'rows' not in table_data or not isinstance(table_data['rows'], list):
+                logger.warning(f"[ReqID: {request_id}] Invalid input to _format_table_dates: {type(table_data)}. Returning as is.")
+                return table_data
+
+            formatted_table = copy.deepcopy(table_data)
+            new_rows = []
+            for row_idx, row_content in enumerate(formatted_table['rows']):
+                if not isinstance(row_content, list):
+                    new_rows.append(row_content) # Keep non-list rows as is
+                    continue
+                
+                new_row_cells = []
+                for cell_idx, cell_value in enumerate(row_content):
+                    if isinstance(cell_value, (datetime.datetime, datetime.date)):
+                        try:
+                            # Format month abbreviation and then capitalize it e.g. Oct, Apr
+                            formatted_date_str = cell_value.strftime(target_format)
+                            parts = formatted_date_str.split('-')
+                            if len(parts) == 3 and len(parts[1]) > 0: # Expecting DD-Mon-YYYY
+                                parts[1] = parts[1].title() # Capitalize month e.g. oct -> Oct
+                                new_row_cells.append('-'.join(parts))
+                            else:
+                                new_row_cells.append(formatted_date_str) # Fallback if format is unexpected
+                        except Exception as e:
+                            logger.warning(f"[ReqID: {request_id}] Error formatting date object {cell_value} at row {row_idx}, col {cell_idx}: {e}. Keeping original.")
+                            new_row_cells.append(cell_value) # Fallback to original object
+                    elif isinstance(cell_value, str):
+                        # Try to parse common ISO-like formats and then reformat
+                        try:
+                            cell_to_parse = cell_value.replace("Z", "+00:00")
+                            dt_obj = None
+                            # Try direct ISO format parsing first
+                            try: dt_obj = datetime.datetime.fromisoformat(cell_to_parse)
+                            except ValueError:
+                                # Try common date string formats if ISO fails
+                                common_formats = ["%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z", 
+                                                  "%Y-%m-%d %H:%M:%S.%f%z", "%Y-%m-%d %H:%M:%S%z",
+                                                  "%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y"]
+                                for fmt in common_formats:
+                                    try:
+                                        dt_obj = datetime.datetime.strptime(cell_to_parse, fmt)
+                                        break
+                                    except ValueError:
+                                        continue
+                                if not dt_obj: raise ValueError("String not a recognized date format")
+                            
+                            formatted_date_str = dt_obj.strftime(target_format)
+                            parts = formatted_date_str.split('-')
+                            if len(parts) == 3 and len(parts[1]) > 0:
+                                parts[1] = parts[1].title()
+                                new_row_cells.append('-'.join(parts))
+                            else:
+                                new_row_cells.append(formatted_date_str)
+
+                        except ValueError:
+                            new_row_cells.append(cell_value) # Not a parsable date string, keep as is
+                        except Exception as e: # Catch any other unexpected error during string parsing/formatting
+                            logger.warning(f"[ReqID: {request_id}] Error processing potential date string '{cell_value}' at row {row_idx}, col {cell_idx}: {e}. Keeping original.")
+                            new_row_cells.append(cell_value)
+                    else:
+                        new_row_cells.append(cell_value) # Not a date or string, keep as is
+                new_rows.append(new_row_cells)
+            formatted_table['rows'] = new_rows
+            return formatted_table
+        # --- END: Local Helper for Date Formatting --- #
 
         # --- Process Tables for Inclusion --- #
         formatted_tables_to_include = []
@@ -1890,8 +1959,10 @@ async def process_chat_message(
                                 cleaned_table = table_to_process # Fallback on error
 
                         # Format numbers on the (potentially) cleaned table
-                        formatted_table = _format_table_numbers(cleaned_table)
-                        formatted_tables_to_include.append(formatted_table)
+                        table_with_formatted_numbers = _format_table_numbers(cleaned_table)
+                        # Format dates on the (potentially) number-formatted table
+                        final_formatted_table = _format_table_dates(table_with_formatted_numbers, "%d-%b-%Y")
+                        formatted_tables_to_include.append(final_formatted_table)
             else: # Handle flag mismatch or invalid flags
                 logger.warning(f"[ReqID: {request_id}] Skipping table inclusion/formatting. Mismatch or invalid include_tables flags ({type(include_tables_flags).__name__}, length {len(include_tables_flags) if isinstance(include_tables_flags, list) else 'N/A'}) vs structured_results ({len(structured_results)}).")
         else: # No structured results in state
