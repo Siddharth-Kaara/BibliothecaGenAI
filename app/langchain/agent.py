@@ -530,14 +530,20 @@ def agent_node(state: AgentState, llm_with_structured_output):
             recovery_guidance = """
             CRITICAL SQL CORRECTION INSTRUCTION:
             
-            Your previous SQL query failed the security check because it was missing the required :organization_id filter.
+            Your previous SQL query failed the security check because it was missing the required :organization_id filter. This filter MUST be applied to the correct column for the table(s) involved in EACH part of your query.
             
             The security system checks EACH SQL component SEPARATELY:
-            1. Every CTE (WITH clause) must include: WHERE "organizationId" = :organization_id (or relevant org column)
-            2. Every subquery must include: WHERE "organizationId" = :organization_id (or relevant org column)
-            3. The main query must include: WHERE "organizationId" = :organization_id (or relevant org column)
+            1. Every CTE (WITH clause) must include its own :organization_id filter.
+            2. Every subquery must include its own :organization_id filter.
+            3. The main query must include its own :organization_id filter.
             
-            You MUST add the organization filter correctly to the query for the requested table. Retry the query generation.
+            Common organization ID columns you MUST use for the filter are:
+            - For tables '5' (events) or '8' (footfall): `WHERE "organizationId" = :organization_id`
+            - For `hierarchyCaches` when querying details of the organization itself: `WHERE "id" = :organization_id`
+            - For `hierarchyCaches` when querying locations/branches within the organization: `WHERE "parentId" = :organization_id`
+            
+            You MUST add the correct organization filter to ALL necessary parts of your SQL. Review your previous query and the schema, then retry the query generation.
+            Ensure the parameter `:organization_id` is used in the SQL string, and the `params` dictionary includes `"organization_id": "{session_organization_id}"`.
             """
             logger.info(f"[AgentNode] SQL Security Error: Generating recovery guidance for LLM: {recovery_guidance[:150]}...")
             retry_increment = 1
@@ -846,7 +852,8 @@ def agent_node(state: AgentState, llm_with_structured_output):
     # If retry_increment was set (meaning a SQL security error was processed for recovery THIS TURN)
     # include the new count in the return_dict. Otherwise, omit it so operator.add preserves existing state.
     if retry_increment > 0:
-        return_dict["sql_security_retry_count"] = state.get("sql_security_retry_count", 0) + retry_increment
+        # return_dict["sql_security_retry_count"] = state.get("sql_security_retry_count", 0) + retry_increment
+        return_dict["sql_security_retry_count"] = retry_increment # Return only the increment for operator.add
 
     # If operational calls were identified and a final_structure was NOT set, they remain in return_dict["messages"][0].tool_calls
     # Adjust the logging for retry count to reflect the value that *would be* in the state *after* this potential update.

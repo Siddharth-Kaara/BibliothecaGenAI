@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     SUBQUERY_TIMEOUT_SECONDS: int = Field(default=15, description="Timeout in seconds for individual subqueries in the summary tool.")
     SQL_EXECUTION_TIMEOUT_SECONDS: int = Field(default=30, description="Timeout in seconds for database query execution in SQLExecutionTool.")
     MAX_SQL_RESULT_ROWS: int = 50 # Max rows to return from SQL query tool
-    MAX_SQL_SECURITY_RETRIES: int = 1
+    MAX_SQL_SECURITY_RETRIES: int = 2
     MAX_MISSING_ENTITIES_RETRIES: int = Field(default=1, description="Maximum retries for the agent if it detects discrepancies with missing entities.")
     DEFAULT_HISTORY_LIMIT: int = Field(default=20, description="Default number of messages returned by the /history endpoint.")
     MAX_HISTORY_LIMIT: int = Field(default=100, description="Maximum number of messages that can be requested from the /history endpoint.")
