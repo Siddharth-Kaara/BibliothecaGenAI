@@ -441,6 +441,7 @@ def create_llm_with_tools_and_final_response_structure(organization_id: str):
         current_year=current_year_int,
         # --- ADDED: Ensure context is available even if None initially ---
         missing_entities_context="", 
+        session_organization_id=organization_id # Inject the session's organization_id
     )
 
     # Bind tools for function calling
@@ -563,7 +564,9 @@ def agent_node(state: AgentState, llm_with_structured_output):
         preprocessed_state["messages"] = messages
         return_dict["recovery_guidance"] = recovery_guidance
         # IMPORTANT: Increment the retry count in the state update for this turn
-        return_dict["sql_security_retry_count"] = state.get("sql_security_retry_count", 0) + retry_increment
+        # return_dict["sql_security_retry_count"] = state.get("sql_security_retry_count", 0) + retry_increment
+        # Instead of directly adding to return_dict here, we'll handle it after the try/except block
+        # based on whether retry_increment was set.
     # --- END: Re-integrated Adaptive Error Analysis ---
 
     try:
@@ -840,9 +843,18 @@ def agent_node(state: AgentState, llm_with_structured_output):
         # For now, prioritize providing context in the final response.
         pass # Keep the map as it is in return_dict
 
+    # If retry_increment was set (meaning a SQL security error was processed for recovery THIS TURN)
+    # include the new count in the return_dict. Otherwise, omit it so operator.add preserves existing state.
+    if retry_increment > 0:
+        return_dict["sql_security_retry_count"] = state.get("sql_security_retry_count", 0) + retry_increment
+
     # If operational calls were identified and a final_structure was NOT set, they remain in return_dict["messages"][0].tool_calls
+    # Adjust the logging for retry count to reflect the value that *would be* in the state *after* this potential update.
+    current_state_retry_count = state.get("sql_security_retry_count", 0)
+    log_retry_count = current_state_retry_count + retry_increment if retry_increment > 0 else current_state_retry_count
+
     logger.debug(f"[AgentNode] Exiting agent node. Final Structure Set: {final_structure is not None}. Proceeding Tool Calls in Message History: {len(return_dict['messages'][0].tool_calls) if return_dict['messages'] and isinstance(return_dict['messages'][0], AIMessage) else 0}")
-    logger.debug(f"[AgentNode] Exiting agent node. Final Structure Set: {final_structure is not None}. Retry Count: {return_dict['sql_security_retry_count']}")
+    logger.debug(f"[AgentNode] Exiting agent node. Final Structure Set: {final_structure is not None}. Retry Count (effective for next state): {log_retry_count}")
     # --- Add timing log before return ---
     duration = time.perf_counter() - start_time
     logger.info(f"[AgentNode] Node execution time: {duration:.4f} seconds")

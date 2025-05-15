@@ -233,35 +233,50 @@ async def log_complete_chat_message(
         logger.error(error_msg, exc_info=True)
         await db.rollback()
 
-async def get_messages_for_memory(db: AsyncSession, session_id: uuid.UUID, limit: int = 6) -> List[Tuple[str, str]]:
-    """Retrieves the last N interaction pairs (user message, assistant message) for agent memory.
-    
-    Args:
-        db: The AsyncSession instance.
-        session_id: The session ID to retrieve messages for.
-        limit: The maximum number of *messages* (not pairs) to retrieve. Should be even for pairs.
-
-    Returns:
-        A list of tuples, where each tuple is (user_message_content, assistant_message_content).
-        Returns oldest pairs first.
+async def get_messages_for_memory(
+    db: AsyncSession, 
+    session_id: uuid.UUID, 
+    user_id: uuid.UUID,         # Added for authorization
+    organization_id: str,     # Added for authorization
+    num_pairs: int = 2          # Changed parameter name and default
+) -> Sequence[ChatMessage]:     # Changed return type
     """
-    if limit % 2 != 0:
-        logger.warning(f"Memory limit {limit} is odd; fetching {limit+1} messages to ensure pair completion.")
-        limit += 1
-        
-    stmt = (
-        select(
-            ChatMessage.user_message_content,
-            ChatMessage.assistant_message_content
+    Retrieves the last N completed User/AI interaction pairs as ChatMessage ORM objects
+    for a given session, authorized for the user/org.
+    A pair is defined by a ChatMessage entry where assistant_message_content is not None.
+    The N most recent pairs are returned, ordered oldest first among the selected pairs.
+    """
+    if num_pairs <= 0:
+        return []
+
+    logger.debug(f"Retrieving last {num_pairs} chat message pairs for session {session_id}, user {user_id}, org {organization_id} for agent memory.")
+    try:
+        stmt = (
+            select(ChatMessage) # Select the full ChatMessage ORM object
+            .join(ChatSession, ChatMessage.session_id == ChatSession.session_id) # Join for authorization
+            .where(
+                ChatMessage.session_id == session_id,
+                ChatSession.user_id == user_id,             # Authorization filter
+                ChatSession.organization_id == organization_id, # Authorization filter
+                ChatMessage.assistant_message_content.isnot(None) # Ensure it's a completed pair
+            )
+            .order_by(desc(ChatMessage.created_at)) # Get the most recent pairs first (can also use user_message_timestamp or assistant_message_timestamp)
+            .limit(num_pairs) # Limit to the number of PAIRS
         )
-        .where(ChatMessage.session_id == session_id)
-        .where(ChatMessage.assistant_message_content.isnot(None))
-        .order_by(desc(ChatMessage.user_message_timestamp))
-        .limit(limit // 2)
-    )
-    result = await db.execute(stmt)
-    pairs = [(row.user_message_content, row.assistant_message_content) for row in result.fetchall()]
-    return pairs[::-1] 
+        result = await db.execute(stmt)
+        # messages will be ChatMessage ORM objects, newest first
+        messages: Sequence[ChatMessage] = result.scalars().all() 
+        
+        # Reverse to return them oldest first among the selected pairs
+        logger.debug(f"Retrieved {len(messages)} completed message pairs for session {session_id} for agent memory.")
+        return messages[::-1] 
+
+    except sqlalchemy.exc.SQLAlchemyError as e:
+        logger.error(f"Database error retrieving last {num_pairs} pairs for session {session_id} (memory): {e}", exc_info=True)
+        raise RepositoryError(f"Failed to retrieve last {num_pairs} chat pairs for memory due to a database error.") from e
+    except Exception as e: 
+        logger.error(f"Unexpected error retrieving last {num_pairs} pairs for session {session_id} (memory): {e}", exc_info=True)
+        raise RepositoryError(f"An unexpected error occurred while retrieving chat pairs for memory.") from e
 
 async def get_session_history(
     db: AsyncSession,

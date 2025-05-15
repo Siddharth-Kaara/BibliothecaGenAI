@@ -38,6 +38,7 @@ from app.repositories.chat_repo import (
     FeedbackIntegrityError,
     create_chat_session, # Keep
     log_initial_chat_message, # Keep
+    get_messages_for_memory, # Added import
 )
 # --- End DB Imports ---
 
@@ -132,15 +133,14 @@ async def chat(
         logger.info(f"Processing STATEFUL chat request {request_id} using session {session_id_str_for_logging_and_agent} (Created: {created_session})")
 
         if not created_session:
-            db_history_records = await get_session_history(
+            db_history_records = await get_messages_for_memory(
                 db=db,
-                session_id=session_id_str_for_logging_and_agent,
+                session_id=chat_session.session_id,
                 user_id=user_id,
                 organization_id=organization_id,
-                limit=settings.MAX_STATE_MESSAGES,
-                offset=0
+                num_pairs=2
             )
-            logger.debug(f"Retrieved {len(db_history_records)} message objects from DB for history context, request {request_id}")
+            logger.debug(f"Retrieved {len(db_history_records)} message objects (representing pairs) from DB for history context, request {request_id}")
             agent_chat_history = _format_db_history_for_agent(db_history_records)
 
     except HTTPException as http_exc: # Re-raise specific HTTP exceptions (400, 404)
